@@ -1,18 +1,16 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
 <title>Coach K Sub Planner</title>
-<style>
-body { margin: 0; background: #0f172a; }
-</style>
+<style>body { margin: 0; background: #0f172a; }</style>
+<script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
 </head>
 <body>
 <div id="root"></div>
-<script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
-<script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
-<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
 <script type="text/babel">
 const { useState, useEffect, useRef } = React;
 
@@ -1007,30 +1005,40 @@ function App() {
   // pendingSub shape: { subs: [{ out, in }], reason: string, mandatory: bool }
 
   // ── Alert: vibrate + beep when a sub suggestion appears ───────────────
-  // Reuse a single AudioContext (created on first user tap) to avoid
-  // browser blocks and the overhead of creating one every alert.
+  // Reuse a single AudioContext. Resume it before every beep because
+  // mobile browsers suspend it after inactivity or between games.
   const audioCtxRef = useRef(null);
   const getAudioCtx = () => {
-    if (!audioCtxRef.current) {
+    if (!audioCtxRef.current || audioCtxRef.current.state === "closed") {
       try { audioCtxRef.current = new (window.AudioContext || window.webkitAudioContext)(); }
       catch (e) { /* audio not available */ }
     }
     return audioCtxRef.current;
   };
-  // Warm up the AudioContext on first user tap (required by mobile browsers)
+  // Warm up the AudioContext on any user tap (required by mobile browsers).
+  // Re-listen after each game reset so the context stays alive.
   useEffect(() => {
-    const warmUp = () => { getAudioCtx(); document.removeEventListener("touchstart", warmUp); };
-    document.addEventListener("touchstart", warmUp, { once: true });
-    return () => document.removeEventListener("touchstart", warmUp);
+    const warmUp = () => {
+      const ctx = getAudioCtx();
+      if (ctx && ctx.state === "suspended") ctx.resume();
+    };
+    document.addEventListener("touchstart", warmUp);
+    document.addEventListener("click", warmUp);
+    return () => {
+      document.removeEventListener("touchstart", warmUp);
+      document.removeEventListener("click", warmUp);
+    };
   }, []);
 
   const notifySub = () => {
-    // Vibrate (mobile only, ignored on desktop)
+    // Vibrate (Android only — not supported on iPhone)
     if (navigator.vibrate) navigator.vibrate([300, 100, 300]);
     // Short beep via reusable AudioContext
     try {
       const ctx = getAudioCtx();
       if (ctx) {
+        // Resume if suspended (happens after inactivity / between games)
+        if (ctx.state === "suspended") ctx.resume();
         const osc = ctx.createOscillator();
         const gain = ctx.createGain();
         osc.connect(gain);
