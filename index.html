@@ -286,7 +286,7 @@ function CoachKLogo({ size = 40 }) {
   );
 }
 
-function SubPlanner() {
+function App() {
   const [screen, setScreen] = useState("setup");
   const [halfMins, setHalfMins] = useState(20);
   const [selected, setSelected] = useState(new Set(PLAYERS_DB.map(p => p.jersey)));
@@ -1005,6 +1005,25 @@ function SubPlanner() {
   // rotations so the single bench player doesn't sit forever.
   //
   // pendingSub shape: { subs: [{ out, in }], reason: string, mandatory: bool }
+
+  // ── Alert: vibrate + beep when a sub suggestion appears ───────────────
+  const notifySub = () => {
+    // Vibrate (mobile only, ignored on desktop)
+    if (navigator.vibrate) navigator.vibrate([300, 100, 300]);
+    // Short beep via Web Audio API
+    try {
+      const ctx = new (window.AudioContext || window.webkitAudioContext)();
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
+      osc.connect(gain);
+      gain.connect(ctx.destination);
+      osc.frequency.value = 880;
+      gain.gain.value = 0.3;
+      osc.start();
+      osc.stop(ctx.currentTime + 0.25);
+    } catch (e) { /* audio not available */ }
+  };
+
   useEffect(() => {
     if (!plan || gameOver || showHalftime) {
       if (pendingSub !== null) setPendingSub(null);
@@ -1014,25 +1033,6 @@ function SubPlanner() {
       if (pendingSub !== null) setPendingSub(null);
       return;
     }
-
-    // ── Alert: vibrate + beep when a sub suggestion appears ─────────────
-    const notifySubRef = React.useRef(null);
-    const notifySub = () => {
-      // Vibrate (mobile only, ignored on desktop)
-      if (navigator.vibrate) navigator.vibrate([300, 100, 300]);
-      // Short beep via Web Audio API
-      try {
-        const ctx = new (window.AudioContext || window.webkitAudioContext)();
-        const osc = ctx.createOscillator();
-        const gain = ctx.createGain();
-        osc.connect(gain);
-        gain.connect(ctx.destination);
-        osc.frequency.value = 880;
-        gain.gain.value = 0.3;
-        osc.start();
-        osc.stop(ctx.currentTime + 0.25);
-      } catch (e) { /* audio not available */ }
-    };
 
     const totalSecs = halfMins * 2 * 60;
     const closeStart = totalSecs - CLOSE_BLOCK_SECS;
@@ -2031,8 +2031,7 @@ function SubPlanner() {
   );
 }
 
-
-ReactDOM.createRoot(document.getElementById('root')).render(React.createElement(SubPlanner));
+ReactDOM.createRoot(document.getElementById('root')).render(React.createElement(App));
 </script>
 </body>
 </html>
