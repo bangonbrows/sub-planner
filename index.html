@@ -10,8 +10,8 @@ body { margin: 0; background: #0f172a; }
 </head>
 <body>
 <div id="root"></div>
-<script src="https://unpkg.com/react@18/umd/react.production.min.js" crossorigin></script>
-<script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js" crossorigin></script>
+<script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
 <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
 <script type="text/babel">
 const { useState, useEffect, useRef } = React;
@@ -1007,22 +1007,44 @@ function App() {
   // pendingSub shape: { subs: [{ out, in }], reason: string, mandatory: bool }
 
   // ── Alert: vibrate + beep when a sub suggestion appears ───────────────
+  // Reuse a single AudioContext (created on first user tap) to avoid
+  // browser blocks and the overhead of creating one every alert.
+  const audioCtxRef = useRef(null);
+  const getAudioCtx = () => {
+    if (!audioCtxRef.current) {
+      try { audioCtxRef.current = new (window.AudioContext || window.webkitAudioContext)(); }
+      catch (e) { /* audio not available */ }
+    }
+    return audioCtxRef.current;
+  };
+  // Warm up the AudioContext on first user tap (required by mobile browsers)
+  useEffect(() => {
+    const warmUp = () => { getAudioCtx(); document.removeEventListener("touchstart", warmUp); };
+    document.addEventListener("touchstart", warmUp, { once: true });
+    return () => document.removeEventListener("touchstart", warmUp);
+  }, []);
+
   const notifySub = () => {
     // Vibrate (mobile only, ignored on desktop)
     if (navigator.vibrate) navigator.vibrate([300, 100, 300]);
-    // Short beep via Web Audio API
+    // Short beep via reusable AudioContext
     try {
-      const ctx = new (window.AudioContext || window.webkitAudioContext)();
-      const osc = ctx.createOscillator();
-      const gain = ctx.createGain();
-      osc.connect(gain);
-      gain.connect(ctx.destination);
-      osc.frequency.value = 880;
-      gain.gain.value = 0.3;
-      osc.start();
-      osc.stop(ctx.currentTime + 0.25);
+      const ctx = getAudioCtx();
+      if (ctx) {
+        const osc = ctx.createOscillator();
+        const gain = ctx.createGain();
+        osc.connect(gain);
+        gain.connect(ctx.destination);
+        osc.frequency.value = 880;
+        gain.gain.value = 0.3;
+        osc.start();
+        osc.stop(ctx.currentTime + 0.25);
+      }
     } catch (e) { /* audio not available */ }
   };
+
+  // Track whether a game is currently live (clock has started at least once)
+  const gameIsLive = screen === "game" || (gameSecs > 0 && !gameOver);
 
   useEffect(() => {
     if (!plan || gameOver || showHalftime) {
@@ -1532,7 +1554,7 @@ function App() {
     <div style={{ minHeight: "100vh", backgroundColor: "#0f172a", padding: "16px", fontFamily: "system-ui, sans-serif" }}>
       <div style={{ maxWidth: 400, margin: "0 auto" }}>
         <div style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 16 }}>
-          <button onClick={() => setScreen("setup")}
+          <button onClick={() => setScreen(gameIsLive ? "game" : "setup")}
             style={{ background: "#334155", border: "none", color: "#fff", borderRadius: 10, padding: "8px 14px", cursor: "pointer", fontSize: 14 }}>← Back</button>
           <div style={{ color: "#fff", fontSize: 18, fontWeight: 700 }}>Rotation Plan</div>
         </div>
@@ -1577,12 +1599,28 @@ function App() {
           </div>
         </div>
 
-        <button onClick={handleStartGame}
-          style={{ width: "100%", padding: "16px", borderRadius: 16, border: "none", cursor: "pointer",
-            background: "linear-gradient(135deg,#059669,#10b981)", color: "#fff", fontSize: 17, fontWeight: 700,
-            display: "flex", alignItems: "center", justifyContent: "center", gap: 10 }}>
-          <CoachKLogo size={24} /> Start Game
-        </button>
+        {gameIsLive ? (
+          <>
+            <button onClick={() => setScreen("game")}
+              style={{ width: "100%", padding: "16px", borderRadius: 16, border: "none", cursor: "pointer",
+                background: "linear-gradient(135deg,#1d4ed8,#3b82f6)", color: "#fff", fontSize: 17, fontWeight: 700,
+                display: "flex", alignItems: "center", justifyContent: "center", gap: 10, marginBottom: 8 }}>
+              ← Back to Game
+            </button>
+            <button onClick={() => { if (window.confirm("This will end the current game and lose all data. Are you sure?")) { setScreen("setup"); setGameSecs(0); setRunning(false); } }}
+              style={{ width: "100%", padding: "12px", borderRadius: 12, border: "1px solid #991b1b", cursor: "pointer",
+                background: "transparent", color: "#f87171", fontSize: 14, fontWeight: 600 }}>
+              End Game & New Setup
+            </button>
+          </>
+        ) : (
+          <button onClick={handleStartGame}
+            style={{ width: "100%", padding: "16px", borderRadius: 16, border: "none", cursor: "pointer",
+              background: "linear-gradient(135deg,#059669,#10b981)", color: "#fff", fontSize: 17, fontWeight: 700,
+              display: "flex", alignItems: "center", justifyContent: "center", gap: 10 }}>
+            <CoachKLogo size={24} /> Start Game
+          </button>
+        )}
       </div>
     </div>
   );
