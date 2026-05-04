@@ -12,8 +12,7 @@
 <body>
 <div id="root"></div>
 <script type="text/babel">
-const { useState, useEffect, useRef } = React;
-
+const { useState, useEffect, useRef, useMemo, useId } = React;
 const PLAYERS_DB = [
   { jersey: 4,  name: "Lola",      rating: 2.7, asthma: false, foulProne: false, color: "#4A90E2", pos: ["PF", "C",  "SF"], skills: ["Passing", "Interior", "Perimeter"] },
   { jersey: 8,  name: "Aanya",     rating: 3.1, asthma: false, foulProne: false, color: "#7B68EE", pos: ["SG", "PG", "SF"], skills: ["Scoring", "BallHandle", "Passing"] },
@@ -25,10 +24,6 @@ const PLAYERS_DB = [
   { jersey: 35, name: "Naisha",    rating: 1.6, asthma: false, foulProne: false, color: "#9C27B0", pos: ["PF", "C"],        skills: ["Interior", "Perimeter"] },
   { jersey: 40, name: "Armelle",   rating: 2.1, asthma: false, foulProne: false, color: "#FF5722", pos: ["SG", "SF"],       skills: ["Passing", "Perimeter"] },
 ];
-
-// Max continuous stint in seconds. Halftime resets because each half starts
-// with a fresh stint clock.
-const MAX_STINT_SECS = 8 * 60;
 
 // Minimum skill coverage required on court at all times
 // Skills: Scoring, BallHandle, Passing, Interior, Perimeter
@@ -81,28 +76,143 @@ function violatesWeakestBalance(lineup, weakest3) {
   return onCount === 3 || onCount === 0;
 }
 
-// ── Rule-driven rotation constants ──────────────────────────────────────────
-// No scheduled subs. The engine watches the game and suggests a sub when
-// fairness / stint / skill rules demand one. Coach always taps a button to
-// execute — the banner shows "SUB NOW" but never auto-executes.
+// ── Cadence-first rotation engine ───────────────────────────────────────────
+// Fairness subs fire ONLY at scheduled rotation windows. Mandatory triggers
+// (stint cap, skill violation, all-3-weakest-on-court) stay live every second.
+// 0-weakest-on-court is handled at windows only (not mandatory).
+// Window cadence scales inversely with bench size: fewer bench = more
+// frequent but simpler (1-for-1) subs; more bench = less frequent but
+// bundled (2-3 swap) subs. Total coaching load stays roughly constant.
 const START_BLOCK_SECS   = 4 * 60; // H1: first 4 min — starters locked, no subs
 const CLOSE_BLOCK_SECS   = 4 * 60; // last 4 min of game — starter-restore subs
-const MIN_STINT_BENCH    = 3 * 60; // bench players must play ≥ 3 min before being pulled
-const MIN_STINT_STARTER  = 2 * 60; // starters can be pulled after 2 min (they have closer mins banked)
-const FAIR_STINT_MIN     = 4 * 60; // suggest-trigger: longest on-court stint ≥ 4 min
-const FAIR_BENCH_MIN     = 3 * 60; // suggest-trigger: longest bench stint ≥ 3 min
-const FAIR_GAP_MIN       = 90;     // suggest-trigger: court-time gap ≥ 90 s (cumulative)
-const FAIR_CUM_GAP_HARD  = 2 * 60; // hard cumulative-gap trigger — catches short-stint accumulators
-const LOOKAHEAD_SECS     = 40;     // look 40 s ahead to bundle upcoming triggers
-const BUNDLE_CAP         = 2;      // max subs per suggestion (escape to 3 for mandatory cascade)
+// Closer cleanup threshold is now computed dynamically inside getWindowSchedule()
+// based on config.minStintSecs so that fairness windows too close to the closer
+// block are cancelled — preventing players from being subbed in only to be
+// immediately pulled out by the closer restore.
 
-// Cooldown scales with bench depth — fewer subs available = rotate faster.
-//   4 bench → 150 s, 3 → 150 s, 2 → 100 s, 1 → 70 s
-function cooldownFor(benchCount) {
-  if (benchCount <= 1) return 70;
-  if (benchCount <= 2) return 100;
-  if (benchCount <= 3) return 150;
-  return 150;
+// Returns cadence, bundle cap, stint caps, and elastic window bounds for a
+// given roster size. This is the foundation of the entire rotation system.
+function getRotationConfig(rosterSize) {
+  const benchCount = Math.max(0, rosterSize - 5);
+  if (benchCount <= 1) return {
+    benchCount,
+    cadenceSecs: 135,              // 2:15 normal cadence
+    firstCycleCadenceSecs: 105,    // 1:45 faster first cycle (everyone gets 1 rest)
+    firstCycleCount: 5,            // first 5 windows use fast cadence
+    bundleCap: 1,                  // 1 swap per window
+    hardStintCapSecs: 11 * 60,     // relaxed — only 1 bench player
+    minStintSecs: 90,              // min time on court before pulling
+    windowOpenEarlySecs: 15,
+    windowSoftLateSecs: 30,
+    windowHardLateSecs: 60,
+  };
+  if (benchCount === 2) return {
+    benchCount,
+    cadenceSecs: 150,              // 2:30
+    firstCycleCadenceSecs: 150,
+    firstCycleCount: 0,
+    bundleCap: 2,
+    hardStintCapSecs: 10 * 60,
+    minStintSecs: 2 * 60,
+    windowOpenEarlySecs: 20,
+    windowSoftLateSecs: 45,
+    windowHardLateSecs: 75,
+  };
+  if (benchCount === 3) return {
+    benchCount,
+    cadenceSecs: 180,              // 3:00
+    firstCycleCadenceSecs: 180,
+    firstCycleCount: 0,
+    bundleCap: 2,
+    hardStintCapSecs: 9 * 60,
+    minStintSecs: 150,             // 2:30
+    windowOpenEarlySecs: 25,
+    windowSoftLateSecs: 60,
+    windowHardLateSecs: 90,
+  };
+  // benchCount >= 4
+  return {
+    benchCount,
+    cadenceSecs: 210,              // 3:30
+    firstCycleCadenceSecs: 210,
+    firstCycleCount: 0,
+    bundleCap: 3,                  // max 3 live swaps (4 only at halftime)
+    hardStintCapSecs: 8 * 60,
+    minStintSecs: 3 * 60,
+    windowOpenEarlySecs: 30,
+    windowSoftLateSecs: 75,
+    windowHardLateSecs: 120,
+  };
+}
+
+// Generate rotation window schedule for the full game. Returns an array of
+// window objects with timing bounds. Fairness rotation happens ONLY at these
+// windows. The closer-restore is the final window.
+function getWindowSchedule(rosterSize, halfMins, startBlockSecs, closeBlockSecs) {
+  const config = getRotationConfig(rosterSize);
+  const totalSecs = halfMins * 2 * 60;
+  const halfSecs = halfMins * 60;
+  const closeStart = totalSecs - closeBlockSecs;
+  // Cancel fairness windows that fall within one minimum stint of the closer
+  // block — otherwise players get subbed in then immediately pulled back out.
+  const cleanUpThreshold = closeStart - config.minStintSecs;
+  const windows = [];
+
+  // ── H1 windows: after start lock, before halftime ──
+  // Cancel windows within one minimum stint of halftime to avoid pointless
+  // revolving-door subs right before the break.
+  const h1CleanUpThreshold = halfSecs - config.minStintSecs;
+  let t = startBlockSecs;
+  let count = 0;
+  while (t < h1CleanUpThreshold) {
+    windows.push({
+      targetSecs: t,
+      openSecs: t - config.windowOpenEarlySecs,
+      softLateSecs: t + config.windowSoftLateSecs,
+      hardLateSecs: t + config.windowHardLateSecs,
+      half: 1,
+      isFirstCycle: count < config.firstCycleCount,
+    });
+    const cad = (count < config.firstCycleCount)
+      ? config.firstCycleCadenceSecs
+      : config.cadenceSecs;
+    t += cad;
+    count++;
+  }
+
+  // ── H2 windows: after halftime, before closer ──
+  const firstH2Cad = (config.firstCycleCount > 0)
+    ? config.firstCycleCadenceSecs
+    : config.cadenceSecs;
+  t = halfSecs + firstH2Cad;
+  count = 0;
+  while (t < cleanUpThreshold) {
+    windows.push({
+      targetSecs: t,
+      openSecs: t - config.windowOpenEarlySecs,
+      softLateSecs: t + config.windowSoftLateSecs,
+      hardLateSecs: t + config.windowHardLateSecs,
+      half: 2,
+      isFirstCycle: count < config.firstCycleCount,
+    });
+    const cad = (count < config.firstCycleCount)
+      ? config.firstCycleCadenceSecs
+      : config.cadenceSecs;
+    t += cad;
+    count++;
+  }
+
+  // ── Closer-restore window ──
+  windows.push({
+    targetSecs: closeStart,
+    openSecs: closeStart - 30,
+    softLateSecs: closeStart + 30,
+    hardLateSecs: closeStart + 60,
+    half: 2,
+    isCloser: true,
+  });
+
+  return windows;
 }
 
 function fmt(secs) {
@@ -170,89 +280,11 @@ function generatePlan(players, halfMins, manualStarting5 = null) {
 }
 
 
-// ── Adapt a planned sub event to the current game reality ────────────────────
-// When planned players are fouled out / injured, substitutes a position-matched
-// replacement from the bench so the rotation stays sensible.
-function adaptEvent(event, onCourt, unavailableJerseys, allAvailable, courtTimeFn, startingJerseys = null) {
-  const usedOut = new Set();
-  const usedIn  = new Set();
-  const result  = [];
-
-  // Active bench = not on court, not unavailable
-  const bench = allAvailable.filter(
-    p => !onCourt.includes(p.jersey) && !unavailableJerseys.has(p.jersey)
-  );
-
-  const isCloser = !!event.isCloser;
-  const starterSet = startingJerseys instanceof Set ? startingJerseys : new Set(startingJerseys || []);
-
-  for (const { pOut, pIn } of event.subs) {
-    let actualOut = pOut;
-    let actualIn  = pIn;
-
-    // ── Fix "out" player ─────────────────────────────────────────────────
-    // If the planned pOut is no longer on court (fouled / injured / already
-    // removed earlier this event), pick the on-court player who has played
-    // the most time instead. For a closer event, prefer taking out a
-    // NON-STARTER first so starters stay on for the final buffer.
-    if (!onCourt.includes(pOut.jersey) || usedOut.has(pOut.jersey)) {
-      const altsAll = onCourt
-        .filter(j => !usedOut.has(j) && !usedIn.has(j))
-        .map(j => PLAYERS_DB.find(p => p.jersey === j))
-        .filter(Boolean);
-      const sortByMostPlayed = (a, b) => courtTimeFn(b.jersey) - courtTimeFn(a.jersey);
-      let alts;
-      if (isCloser && starterSet.size > 0) {
-        const nonStartersOn = altsAll.filter(p => !starterSet.has(p.jersey)).sort(sortByMostPlayed);
-        const startersOn    = altsAll.filter(p =>  starterSet.has(p.jersey)).sort(sortByMostPlayed);
-        alts = nonStartersOn.length > 0 ? nonStartersOn : startersOn;
-      } else {
-        alts = [...altsAll].sort(sortByMostPlayed);
-      }
-      actualOut = alts[0] || null;
-    }
-
-    // ── Fix "in" player ──────────────────────────────────────────────────
-    // If the planned pIn is unavailable, already on court, or already used
-    // this event, find the best position-matched bench player. For a closer
-    // event, PREFER a starter off court (the whole point of the closer is
-    // starter restoration).
-    const inUnavailable =
-      unavailableJerseys.has(pIn.jersey) ||
-      onCourt.includes(pIn.jersey) ||
-      usedIn.has(pIn.jersey);
-
-    if (inUnavailable) {
-      const available = bench.filter(p => !usedIn.has(p.jersey));
-      if (isCloser && starterSet.size > 0) {
-        const startersOff = available.filter(p => starterSet.has(p.jersey))
-          .sort((a, b) => b.rating - a.rating);
-        actualIn = startersOff[0] || null;
-      }
-      // Fallback chain: same primary position → any shared position → highest rating
-      if (!actualIn || usedIn.has(actualIn.jersey) || onCourt.includes(actualIn.jersey)) {
-        actualIn =
-          available.find(p => p.pos[0] === pIn.pos[0]) ||
-          available.find(p => p.pos.some(pos => pIn.pos.includes(pos))) ||
-          [...available].sort((a, b) => b.rating - a.rating)[0] ||
-          null;
-      }
-    }
-
-    if (actualOut && actualIn && actualOut.jersey !== actualIn.jersey) {
-      result.push({ pOut: actualOut, pIn: actualIn });
-      usedOut.add(actualOut.jersey);
-      usedIn.add(actualIn.jersey);
-    }
-  }
-
-  return result;
-}
-
 // ─────────────────────────────────────────────────────────────────────────────
 // Coach K logo — basketball + bold K monogram + whistle accent for the coaching theme
 function CoachKLogo({ size = 40 }) {
-  const uid = `ckBall-${size}`; // unique gradient id per instance
+  const rawId = useId();
+  const uid = rawId.replace(/:/g, "_"); // useId returns colons; SVG ids need safe chars
   return (
     <svg width={size} height={size} viewBox="0 0 100 100" style={{ display: "block", flexShrink: 0 }}>
       <defs>
@@ -297,7 +329,6 @@ function App() {
   const [onCourt, setOnCourt] = useState([]);
   const [accumulated, setAccumulated] = useState({});
   const [stintStart, setStintStart] = useState({});
-  const [doneEvents, setDoneEvents] = useState(new Set());
   const [halftimeDone, setHalftimeDone] = useState(false);
   const [showHalftime, setShowHalftime] = useState(false);
 
@@ -317,9 +348,6 @@ function App() {
   // Sub log — all actual subs that happened during the game
   const [subLog, setSubLog] = useState([]);
 
-  // Dynamically-generated sub events (legacy; unused under rule engine but
-  // retained so persisted saves still hydrate without errors).
-  const [extraEvents, setExtraEvents] = useState([]);
 
   // ── Rule engine state ─────────────────────────────────────────────────────
   // lastSubTime: game seconds when the most recent sub happened (manual or
@@ -328,9 +356,21 @@ function App() {
   // pendingSub: when the rule evaluator has identified a sub the coach should
   // make, this holds { out, in, reason, mandatory }. Null = rotation stable.
   const [pendingSub, setPendingSub] = useState(null);
+  // handledWindows: set of roster-aware window keys that have been confirmed/skipped.
+  // Keys are "rosterSize:targetSecs" so a roster change (injury/foul-out)
+  // doesn't collide with old schedule's handled entries.
+  // Reset at game start and halftime.
+  const [handledWindows, setHandledWindows] = useState(new Set());
+  const wKey = (roster, tgt) => `${roster}:${tgt}`;
+
+  // restedThisHalf: tracks which jerseys have had at least one rest this half.
+  // Critical for 6-player carousel to avoid yo-yo subs (pulling the just-entered
+  // bench player straight back off because they're the weakest).
+  const [restedThisHalf, setRestedThisHalf] = useState(new Set());
+
   // offSince: for bench players, the game-seconds when they most recently left
   // the court (or game-start for players who began on the bench). Used for
-  // "longest bench stint" fairness trigger.
+  // bench-stint tracking.
   const [offSince, setOffSince] = useState({});
 
   // Injury accounting — for each injured jersey, records the game clock at injury
@@ -346,10 +386,25 @@ function App() {
   const [fouloutInfo, setFouloutInfo] = useState({});
 
   const timerRef = useRef(null);
+  const clockBaseRef = useRef({ wallMs: 0, secs: 0 }); // timestamp-based clock anchor
+
+  // Action lock — prevents double-tap race conditions on destructive actions.
+  // A single ref guards confirm sub, manual sub out, emergency in, start 2nd
+  // half, mark injury, and mark foul-out. Cleared after React has flushed.
+  const actionLockRef = useRef(false);
+  const withActionLock = (fn) => {
+    if (actionLockRef.current) return;
+    actionLockRef.current = true;
+    try {
+      fn();
+    } finally {
+      setTimeout(() => { actionLockRef.current = false; }, 300);
+    }
+  };
 
   // ── PERSISTENCE ─────────────────────────────────────────────────────────────
   // Save / restore full game state across browser refresh, tab close, mobile memory flush, etc.
-  const STORAGE_KEY = "coachk-subplanner-v1";
+  const STORAGE_KEY = "coachk-subplanner-v9";
   const hydratedRef = useRef(false); // blocks save effect until after restore
   const [hasSavedGame, setHasSavedGame] = useState(false); // whether restore found a live game
   const [confirmDiscard, setConfirmDiscard] = useState(false); // two-tap confirm for discard button
@@ -359,29 +414,40 @@ function App() {
       const raw = typeof localStorage !== "undefined" ? localStorage.getItem(STORAGE_KEY) : null;
       if (raw) {
         const s = JSON.parse(raw);
+
+        // Validate critical fields before restoring — corrupted storage can
+        // put the app into impossible states (negative gameSecs, unknown
+        // jersey numbers on court, etc.)
+        const validJerseys = new Set(PLAYERS_DB.map(p => p.jersey));
+        const sanitizeJerseyArray = (arr) =>
+          Array.isArray(arr) ? arr.filter(j => validJerseys.has(j)) : [];
+        const sanitizeNumSecs = (v) =>
+          typeof v === "number" && v >= 0 && isFinite(v) ? v : 0;
+
         // A saved game is only meaningful if we got past setup
         if (s.plan && s.screen && s.screen !== "setup") setHasSavedGame(true);
         if (s.screen) setScreen(s.screen);
-        if (typeof s.halfMins === "number") setHalfMins(s.halfMins);
-        if (Array.isArray(s.selected)) setSelected(new Set(s.selected));
-        if (Array.isArray(s.starters)) setStarters(new Set(s.starters));
+        if (typeof s.halfMins === "number" && s.halfMins > 0) setHalfMins(s.halfMins);
+        if (Array.isArray(s.selected)) setSelected(new Set(sanitizeJerseyArray(s.selected)));
+        if (Array.isArray(s.starters)) setStarters(new Set(sanitizeJerseyArray(s.starters)));
         if (s.plan) setPlan(s.plan);
-        if (typeof s.gameSecs === "number") setGameSecs(s.gameSecs);
-        if (Array.isArray(s.onCourt)) setOnCourt(s.onCourt);
-        if (s.accumulated) setAccumulated(s.accumulated);
-        if (s.stintStart) setStintStart(s.stintStart);
-        if (Array.isArray(s.doneEvents)) setDoneEvents(new Set(s.doneEvents));
+        if (typeof s.gameSecs === "number") setGameSecs(sanitizeNumSecs(s.gameSecs));
+        if (Array.isArray(s.onCourt)) setOnCourt(sanitizeJerseyArray(s.onCourt));
+        if (s.accumulated && typeof s.accumulated === "object") setAccumulated(s.accumulated);
+        if (s.stintStart && typeof s.stintStart === "object") setStintStart(s.stintStart);
         if (typeof s.halftimeDone === "boolean") setHalftimeDone(s.halftimeDone);
-        if (s.fouls) setFouls(s.fouls);
-        if (Array.isArray(s.fouledOut)) setFouledOut(new Set(s.fouledOut));
-        if (Array.isArray(s.injured)) setInjured(new Set(s.injured));
-        if (s.adjustedTargetMins) setAdjustedTargetMins(s.adjustedTargetMins);
+        if (s.fouls && typeof s.fouls === "object") setFouls(s.fouls);
+        if (Array.isArray(s.fouledOut)) setFouledOut(new Set(sanitizeJerseyArray(s.fouledOut)));
+        if (Array.isArray(s.injured)) setInjured(new Set(sanitizeJerseyArray(s.injured)));
+        if (s.adjustedTargetMins && typeof s.adjustedTargetMins === "object") setAdjustedTargetMins(s.adjustedTargetMins);
         if (Array.isArray(s.subLog)) setSubLog(s.subLog);
-        if (Array.isArray(s.extraEvents)) setExtraEvents(s.extraEvents);
         if (s.injuryInfo) setInjuryInfo(s.injuryInfo);
         if (s.fouloutInfo) setFouloutInfo(s.fouloutInfo);
-        if (typeof s.lastSubTime === "number") setLastSubTime(s.lastSubTime);
+        if (typeof s.lastSubTime === "number") setLastSubTime(sanitizeNumSecs(s.lastSubTime));
         if (s.offSince) setOffSince(s.offSince);
+        if (Array.isArray(s.handledWindows)) setHandledWindows(new Set(s.handledWindows));
+        if (Array.isArray(s.restedThisHalf)) setRestedThisHalf(new Set(s.restedThisHalf));
+        if (typeof s.replacingJersey === "number" && validJerseys.has(s.replacingJersey)) setReplacingJersey(s.replacingJersey);
         // pendingSub is NOT persisted — always recomputed from current state
         // Always start paused — never auto-resume the clock after a refresh
       }
@@ -391,24 +457,27 @@ function App() {
 
   useEffect(() => {
     if (!hydratedRef.current) return; // don't overwrite saved state during initial restore
+    // Save every tick — state is small, reliability beats battery savings.
     try {
       const snapshot = {
         screen, halfMins,
         selected: [...selected], starters: [...starters],
         plan,
         gameSecs, onCourt, accumulated, stintStart,
-        doneEvents: [...doneEvents],
         halftimeDone,
         fouls,
         fouledOut: [...fouledOut], injured: [...injured],
-        adjustedTargetMins, subLog, extraEvents, injuryInfo, fouloutInfo,
+        adjustedTargetMins, subLog, injuryInfo, fouloutInfo,
         lastSubTime, offSince,
+        handledWindows: [...handledWindows],
+        restedThisHalf: [...restedThisHalf],
+        replacingJersey,
       };
       localStorage.setItem(STORAGE_KEY, JSON.stringify(snapshot));
     } catch (e) { /* quota or serialization issue */ }
   }, [screen, halfMins, selected, starters, plan, gameSecs, onCourt, accumulated, stintStart,
-      doneEvents, halftimeDone, fouls, fouledOut, injured, adjustedTargetMins, subLog, extraEvents, injuryInfo, fouloutInfo,
-      lastSubTime, offSince]);
+      halftimeDone, fouls, fouledOut, injured, adjustedTargetMins, subLog, injuryInfo, fouloutInfo,
+      lastSubTime, offSince, handledWindows, restedThisHalf, replacingJersey]);
 
   function discardSavedGame() {
     try { localStorage.removeItem(STORAGE_KEY); } catch (e) {}
@@ -418,34 +487,43 @@ function App() {
     setStarters(new Set());
     setGameSecs(0); setRunning(false);
     setOnCourt([]); setAccumulated({}); setStintStart({});
-    setDoneEvents(new Set());
     setHalftimeDone(false); setShowHalftime(false);
     setFouls({}); setFouledOut(new Set()); setInjured(new Set());
-    setAdjustedTargetMins({}); setSubLog([]); setExtraEvents([]);
+    setAdjustedTargetMins({}); setSubLog([]);
     setInjuryInfo({});
     setFouloutInfo({});
     setLastSubTime(-120);
     setPendingSub(null);
     setOffSince({});
+    setHandledWindows(new Set());
+    setRestedThisHalf(new Set());
+    setReplacingJersey(null);
     setHasSavedGame(false);
   }
 
   useEffect(() => {
     if (running) {
-      timerRef.current = setInterval(() => setGameSecs(s => s + 1), 1000);
+      // Anchor: record wall-clock time and current gameSecs when play starts.
+      // Subsequent ticks compute elapsed from this anchor, preventing drift.
+      clockBaseRef.current = { wallMs: Date.now(), secs: gameSecs };
+      timerRef.current = setInterval(() => {
+        const base = clockBaseRef.current; // read dynamically so ±10s updates are picked up
+        const elapsed = Math.floor((Date.now() - base.wallMs) / 1000);
+        setGameSecs(base.secs + elapsed);
+      }, 250); // poll 4×/sec for responsive UI, but only advances on whole seconds
     } else {
       clearInterval(timerRef.current);
     }
     return () => clearInterval(timerRef.current);
-  }, [running]);
+  }, [running]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  // Halftime detection
+  // Halftime detection — triggers even when paused (e.g. coach taps +10s past boundary)
   useEffect(() => {
-    if (running && !halftimeDone && gameSecs >= halfMins * 60) {
+    if (!halftimeDone && gameSecs >= halfMins * 60) {
       setRunning(false);
       setShowHalftime(true);
     }
-  }, [gameSecs, running, halftimeDone, halfMins]);
+  }, [gameSecs, halftimeDone, halfMins]);
 
   // Full-time detection — clamp the clock, stop the timer, and bank final stints
   // so accumulated court-time for everyone on court is accurate.
@@ -470,13 +548,26 @@ function App() {
     }
   }, [gameSecs, halfMins, running, onCourt, stintStart]);
 
-  const available = PLAYERS_DB.filter(p => selected.has(p.jersey));
+  const available = useMemo(() => PLAYERS_DB.filter(p => selected.has(p.jersey)), [selected]);
   const totalGameSecs = halfMins * 2 * 60;
+  // Clock adjustment helper — updates both gameSecs AND the timestamp anchor
+  // so the running interval doesn't snap the clock back to its old position.
+  const setClockSecs = (nextSecs) => {
+    const clamped = Math.max(0, Math.min(totalGameSecs, nextSecs));
+    setGameSecs(clamped);
+    if (running) {
+      clockBaseRef.current = { wallMs: Date.now(), secs: clamped };
+    }
+  };
   const half = gameSecs < halfMins * 60 ? 1 : 2;
   const timeInHalf = half === 1 ? gameSecs : gameSecs - halfMins * 60;
   const gameOver = gameSecs >= totalGameSecs;
 
-  const unavailableJerseys = new Set([...fouledOut, ...injured]);
+  const unavailableJerseys = useMemo(() => new Set([...fouledOut, ...injured]), [fouledOut, injured]);
+  const activeWeakest3 = useMemo(
+    () => weakestThreeJerseys(available.filter(p => !unavailableJerseys.has(p.jersey))),
+    [available, unavailableJerseys]
+  );
 
   function togglePlayer(jersey) {
     setSelected(prev => {
@@ -524,7 +615,6 @@ function App() {
     setOffSince(off);
     setGameSecs(0);
     setRunning(false);
-    setDoneEvents(new Set());
     setHalftimeDone(false);
     setShowHalftime(false);
     setFouledOut(new Set());
@@ -535,51 +625,39 @@ function App() {
     setReplacingJersey(null);
     setAdjustedTargetMins({ ...plan.targetMins });
     setSubLog([]);
-    setExtraEvents([]);
-    setLastSubTime(-120); // first sub can fire as soon as rules allow
+    setLastSubTime(-120);
     setPendingSub(null);
+    setHandledWindows(new Set());
+    // Seed carousel: bench players have already "rested" relative to starters,
+    // so mark them to prevent the first-cycle carousel from pulling them right
+    // back off after they enter (especially critical for 6-player / 1-bench).
+    const initialBench = available
+      .filter(p => !courtJerseys.includes(p.jersey))
+      .map(p => p.jersey);
+    setRestedThisHalf(new Set(initialBench));
     setScreen("game");
   }
 
-  function handleStartSecondHalf() {
-    // H2 lineup policy: pick the 5 players with the MOST H1 BENCH TIME
-    // (equivalently: least H1 court time). Enforce skill minimums and the
-    // weakest-three balance rule. No starter-restart lock.
-    const now = halfMins * 60; // halftime boundary
-    const unavailable = jersey => fouledOut.has(jersey) || injured.has(jersey);
+  // Shared H2 lineup computation — used by both the halftime overlay preview
+  // and handleStartSecondHalf so the coach sees the actual lineup before tapping.
+  function computeSecondHalfLineup() {
+    const now = halfMins * 60;
+    const unavail = jersey => fouledOut.has(jersey) || injured.has(jersey);
 
-    // Flush stints first so courtTime reflects end-of-H1 totals
-    setAccumulated(prev => {
-      const next = { ...prev };
-      Object.keys(stintStart).forEach(j => {
-        next[j] = (next[j] || 0) + (now - (stintStart[j] ?? now));
-      });
-      return next;
-    });
-
-    // Compute end-of-H1 court time per player. "Most under" here is simply
-    // "least played" — we want the players who sat the most during H1.
+    // Compute end-of-H1 court time per player inline (no state flush needed).
     const endOfH1Court = (jersey) =>
       (accumulated[jersey] || 0) +
       (stintStart[jersey] !== undefined ? now - stintStart[jersey] : 0);
-    // Kept as "underBy" for the existing skill-topup / weakest-3 code below
-    // (positive = more bench time = better pick). Using negative court time as
-    // a proxy, which preserves ordering and sign-semantics.
     const underBy = (jersey) => -endOfH1Court(jersey);
 
-    // Rank available (non-unavailable) players by most bench time first
     const pool = available
-      .filter(p => !unavailable(p.jersey))
+      .filter(p => !unavail(p.jersey))
       .sort((a, b) => underBy(b.jersey) - underBy(a.jersey));
 
-    // Greedy build: take the most-under-pace players 5-at-a-time, enforcing
-    // skill minimums, then check the weakest-pair. If we end up with both
-    // weakest on court, try one swap with the next bench player.
-    let courtJerseys = pool.slice(0, 5).map(p => p.jersey);
     let courtObjs = pool.slice(0, 5);
+    let courtJerseys = courtObjs.map(p => p.jersey);
 
-    // Skill top-up: if we don't meet minimums, swap in bench players who have
-    // the missing skill for the lowest-ranked on-court player without it.
+    // Skill top-up
     for (const { skill, min } of SKILL_MINIMUMS) {
       while (courtObjs.filter(p => p.skills.includes(skill)).length < min) {
         const bench = pool.filter(p => !courtJerseys.includes(p.jersey));
@@ -587,25 +665,22 @@ function App() {
         if (!candidate) break;
         const outP = [...courtObjs]
           .filter(p => !p.skills.includes(skill))
-          .sort((a, b) => underBy(a.jersey) - underBy(b.jersey))[0]; // least-under goes out
+          .sort((a, b) => underBy(a.jersey) - underBy(b.jersey))[0];
         if (!outP) break;
         courtObjs = courtObjs.filter(p => p.jersey !== outP.jersey).concat([candidate]);
         courtJerseys = courtObjs.map(p => p.jersey);
       }
     }
 
-    // Weakest-three soft check: if all 3 are on court, swap the least-under-pace
-    // one for the best bench player that keeps skill minimums. Leaves 2 of the
-    // weakest 3 on court, which is allowed.
-    //
-    // EXEMPTION: if any of the trio on court is >= 2 min under pace, allow all
-    // 3 to stay on at H2 start. This prevents weaker players (e.g. Naisha)
-    // from hitting a hard ceiling at halftime when they're genuinely behind
-    // their fair-share pace. The dynamic generator carries the same exemption.
-    const weakest3 = weakestThreeJerseys(available);
+    // Weakest-three balance
+    const activeForWeak = available.filter(p => !unavail(p.jersey));
+    const weakest3 = weakestThreeJerseys(activeForWeak);
     const H2_UNDER_PACE_EXEMPT_SECS = 2 * 60;
-    // Symmetric rule: if 0 of weakest-3 on court (all 3 on bench), swap in the
-    // most-under-pace weak player by removing the least-under-pace strong.
+    // Fair share: each player should have played this much court time by halftime
+    const fairShareAtHalf = pool.length > 0 ? (5 * now) / pool.length : 0;
+    const underPace = (jersey) => fairShareAtHalf - endOfH1Court(jersey);
+
+    // Symmetric rule: if 0 of weakest-3 on court, swap one in
     if (weakest3.length === 3) {
       const setOnH2 = new Set(courtJerseys);
       const weakOnCount = weakest3.filter(j => setOnH2.has(j)).length;
@@ -616,7 +691,7 @@ function App() {
         for (const swapIn of weakBench) {
           const strongOn = [...courtObjs]
             .filter(p => !weakest3.includes(p.jersey))
-            .sort((a, b) => underBy(a.jersey) - underBy(b.jersey)); // least under goes out
+            .sort((a, b) => underBy(a.jersey) - underBy(b.jersey));
           let placed = false;
           for (const swapOut of strongOn) {
             const newOn = courtObjs.filter(p => p.jersey !== swapOut.jersey).concat([swapIn]);
@@ -631,13 +706,15 @@ function App() {
         }
       }
     }
+
+    // If all 3 weakest on court, swap least-under-pace one out (unless exemption applies)
     if (violatesWeakestThree(courtObjs, weakest3)) {
       const trioOnCourt = courtObjs
         .filter(p => weakest3.includes(p.jersey))
         .sort((a, b) => underBy(a.jersey) - underBy(b.jersey));
-      const anyTrioUnder = trioOnCourt.some(p => underBy(p.jersey) >= H2_UNDER_PACE_EXEMPT_SECS);
+      const anyTrioUnder = trioOnCourt.some(p => underPace(p.jersey) >= H2_UNDER_PACE_EXEMPT_SECS);
       if (!anyTrioUnder) {
-        const swapOut = trioOnCourt[0]; // the one LEAST under pace leaves
+        const swapOut = trioOnCourt[0];
         const bench = pool.filter(p => !courtJerseys.includes(p.jersey) && !weakest3.includes(p.jersey));
         const swapIn = bench.find(cand => {
           const newOn = courtObjs.filter(p => p.jersey !== swapOut.jersey).concat([cand]);
@@ -650,13 +727,30 @@ function App() {
       }
     }
 
+    return { courtObjs, courtJerseys };
+  }
+
+  function handleStartSecondHalf() {
+    withActionLock(() => {
+    const now = halfMins * 60;
+    const unavail = jersey => fouledOut.has(jersey) || injured.has(jersey);
+
+    // Flush stints so courtTime reflects end-of-H1 totals
+    setAccumulated(prev => {
+      const next = { ...prev };
+      Object.keys(stintStart).forEach(j => {
+        next[j] = (next[j] || 0) + (now - (stintStart[j] ?? now));
+      });
+      return next;
+    });
+
+    const { courtJerseys } = computeSecondHalfLineup();
+
     const stint = {};
     courtJerseys.forEach(j => { stint[j] = now; });
-    // For anyone on the bench at H2 tip-off, reset their bench-stint clock to
-    // the halftime boundary so fairness triggers measure H2-only bench time.
     const off = {};
     available.forEach(p => {
-      if (!courtJerseys.includes(p.jersey) && !unavailable(p.jersey)) off[p.jersey] = now;
+      if (!courtJerseys.includes(p.jersey) && !unavail(p.jersey)) off[p.jersey] = now;
     });
     setStintStart(stint);
     setOffSince(off);
@@ -665,8 +759,15 @@ function App() {
     setHalftimeDone(true);
     setShowHalftime(false);
     setRunning(false);
-    setLastSubTime(now - 120); // fresh cooldown — rules can fire immediately in H2
+    setLastSubTime(now - 120);
     setPendingSub(null);
+    setHandledWindows(new Set());
+    // Seed carousel for H2: bench players start as "rested"
+    const h2Bench = available
+      .filter(p => !courtJerseys.includes(p.jersey) && !unavail(p.jersey))
+      .map(p => p.jersey);
+    setRestedThisHalf(new Set(h2Bench));
+    }); // withActionLock
   }
 
   function courtTime(jersey) {
@@ -675,7 +776,21 @@ function App() {
     return base;
   }
 
-  function doSubs(subList, eventId, extraEventIds = []) {
+  function doSubs(subList) {
+    // Double-tap guard: validate each sub against current court state
+    const courtSet = new Set(onCourt);
+    const safeSubs = [];
+    for (const sub of subList) {
+      if (!courtSet.has(sub.outJersey)) continue; // already off
+      if (courtSet.has(sub.inJersey)) continue;   // already on
+      if (unavailableJerseys.has(sub.inJersey)) continue; // injured/fouled out since suggestion
+      courtSet.delete(sub.outJersey);
+      courtSet.add(sub.inJersey);
+      safeSubs.push(sub);
+    }
+    if (safeSubs.length === 0) return 0;
+    subList = safeSubs;
+
     const now = gameSecs;
     setAccumulated(prev => {
       const next = { ...prev };
@@ -708,16 +823,14 @@ function App() {
       });
       return next;
     });
-    if (eventId !== undefined || extraEventIds.length > 0) {
-      setDoneEvents(prev => {
-        const n = new Set(prev);
-        if (eventId !== undefined) n.add(eventId);
-        extraEventIds.forEach(id => n.add(id));
-        return n;
-      });
-    }
     setActiveMenu(null);
     setBenchMenu(null);
+    // Track which players have rested this half (for 6-player carousel)
+    setRestedThisHalf(prev => {
+      const next = new Set(prev);
+      subList.forEach(({ outJersey }) => next.add(outJersey));
+      return next;
+    });
     // Rule engine: sub resets cooldown, clears pending suggestion.
     setLastSubTime(now);
     setPendingSub(null);
@@ -731,6 +844,7 @@ function App() {
       })),
     };
     setSubLog(prev => [...prev, logEntry]);
+    return subList.length;
   }
 
   // (Legacy redistributeMinutes helper removed — markFouledOut / markInjured
@@ -742,6 +856,8 @@ function App() {
   // and split it across active teammates, freeze player's target at played time,
   // and store a fouloutInfo record so Undo can do a time-aware partial clawback.
   function markFouledOut(jersey) {
+    if (fouledOut.has(jersey) || injured.has(jersey)) return;
+    withActionLock(() => {
     setActiveMenu(null);
     setBenchMenu(null);
 
@@ -792,6 +908,7 @@ function App() {
       setStintStart(prev => { const n = { ...prev }; delete n[jersey]; return n; });
       setReplacingJersey(jersey);
     }
+    }); // withActionLock
   }
 
   // Mark player injured.
@@ -800,6 +917,8 @@ function App() {
   // not this one). Record the redistribution so we can partially reverse it when
   // / if the player returns.
   function markInjured(jersey) {
+    if (injured.has(jersey) || fouledOut.has(jersey)) return;
+    withActionLock(() => {
     setActiveMenu(null);
     setBenchMenu(null);
 
@@ -861,36 +980,68 @@ function App() {
       setStintStart(prev => { const n = { ...prev }; delete n[jersey]; return n; });
       setReplacingJersey(jersey);
     }
+    }); // withActionLock
+  }
+
+  // Mark the currently active rotation window (if any) as handled.
+  // Called after manual/emergency subs so the window doesn't reappear
+  // after the 45s quiet period expires.
+  function markActiveWindowHandled() {
+    const rosterForCadence = available.length - fouledOut.size - injured.size;
+    if (rosterForCadence <= 5) return;
+    const schedule = getWindowSchedule(rosterForCadence, halfMins, START_BLOCK_SECS, CLOSE_BLOCK_SECS);
+    const activeWindow = schedule.find(w =>
+      gameSecs >= w.openSecs && gameSecs <= w.hardLateSecs &&
+      !w.isCloser && !handledWindows.has(wKey(rosterForCadence, w.targetSecs))
+    );
+    if (activeWindow) {
+      setHandledWindows(prev => new Set([...prev, wKey(rosterForCadence, activeWindow.targetSecs)]));
+    }
   }
 
   // Manual sub out — take a player off court and open replacement picker
   function manualSubOut(jersey) {
     if (!onCourt.includes(jersey)) return;
-    const now = gameSecs;
-    setAccumulated(prev => ({
-      ...prev,
-      [jersey]: (prev[jersey] || 0) + (now - (stintStart[jersey] ?? now)),
-    }));
-    setStintStart(prev => { const n = { ...prev }; delete n[jersey]; return n; });
-    setOffSince(prev => ({ ...prev, [jersey]: now }));
-    setOnCourt(prev => prev.filter(j => j !== jersey));
-    setActiveMenu(null);
-    setBenchMenu(null);
-    setReplacingJersey(jersey);
-    // Manual sub resets the cooldown and clears any pending suggestion.
-    setLastSubTime(now);
-    setPendingSub(null);
+    withActionLock(() => {
+      const now = gameSecs;
+      setAccumulated(prev => ({
+        ...prev,
+        [jersey]: (prev[jersey] || 0) + (now - (stintStart[jersey] ?? now)),
+      }));
+      setStintStart(prev => { const n = { ...prev }; delete n[jersey]; return n; });
+      setOffSince(prev => ({ ...prev, [jersey]: now }));
+      setOnCourt(prev => prev.filter(j => j !== jersey));
+      setActiveMenu(null);
+      setBenchMenu(null);
+      setReplacingJersey(jersey);
+      // Manual sub resets the cooldown, clears pending, marks active window,
+      // and adds the player to carousel memory.
+      setLastSubTime(now);
+      setPendingSub(null);
+      markActiveWindowHandled();
+      setRestedThisHalf(prev => { const next = new Set(prev); next.add(jersey); return next; });
+    });
   }
 
   // Foul add / remove
   function addFoul(jersey) {
     const cur = fouls[jersey] || 0;
     if (cur >= 5) return;
-    const next = cur + 1;
-    setFouls(prev => ({ ...prev, [jersey]: next }));
-    if (next >= 5) {
-      // Auto foul-out; use a small timeout so state settles first
-      setTimeout(() => markFouledOut(jersey), 0);
+    if (cur === 4) {
+      // 5th foul — ask BEFORE mutating any state
+      const p = PLAYERS_DB.find(pl => pl.jersey === jersey);
+      const name = p ? `#${p.jersey} ${p.name}` : `#${jersey}`;
+      if (window.confirm(`5th foul for ${name}. Foul out this player?`)) {
+        setFouls(prev => ({ ...prev, [jersey]: Math.max(prev[jersey] || 0, 5) }));
+        setTimeout(() => markFouledOut(jersey), 0);
+      }
+    } else {
+      // Use functional updater to avoid stale closure under rapid taps
+      setFouls(prev => {
+        const c = prev[jersey] || 0;
+        if (c >= 4) return prev; // 5th foul handled above with confirm
+        return { ...prev, [jersey]: c + 1 };
+      });
     }
   }
   function removeFoul(jersey) {
@@ -907,35 +1058,40 @@ function App() {
   // yet consumed by teammates. Pull that back per teammate (unused/N each) and
   // give it to the returning player so they don't need a huge catch-up stint.
   function clearInjury(jersey) {
-    const info = injuryInfo[jersey];
-    setInjured(prev => { const n = new Set(prev); n.delete(jersey); return n; });
-    // Returning player goes to bench: start their bench-stint clock now.
-    setOffSince(prev => ({ ...prev, [jersey]: gameSecs }));
+    if (!injured.has(jersey)) return;
+    withActionLock(() => {
+      const info = injuryInfo[jersey];
+      setInjured(prev => { const n = new Set(prev); n.delete(jersey); return n; });
+      // Returning player has been resting — add to carousel memory
+      setRestedThisHalf(prev => { const next = new Set(prev); next.add(jersey); return next; });
+      // Returning player goes to bench: start their bench-stint clock now.
+      setOffSince(prev => ({ ...prev, [jersey]: gameSecs }));
 
-    if (!info || info.remainingMins <= 0 || info.others.length === 0) {
-      setInjuryInfo(prev => { const n = { ...prev }; delete n[jersey]; return n; });
-      return;
-    }
+      if (!info || info.remainingMins <= 0 || info.others.length === 0) {
+        setInjuryInfo(prev => { const n = { ...prev }; delete n[jersey]; return n; });
+        return;
+      }
 
-    const elapsedMins = Math.max(0, (gameSecs - info.startSecs) / 60);
-    const unusedMins = Math.max(0, info.remainingMins - elapsedMins);
-    const N = info.others.length;
-    const pullBackPerOther = unusedMins / N;
+      const elapsedMins = Math.max(0, (gameSecs - info.startSecs) / 60);
+      const unusedMins = Math.max(0, info.remainingMins - elapsedMins);
+      const N = info.others.length;
+      const pullBackPerOther = unusedMins / N;
 
-    if (unusedMins > 0) {
-      setAdjustedTargetMins(prev => {
-        const next = { ...prev };
-        // Give the unused chunk back to the returning player
-        next[jersey] = (next[jersey] || 0) + unusedMins;
-        // Pull the same share back from each teammate who received it
-        info.others.forEach(j => {
-          next[j] = Math.max(0, (next[j] || 0) - pullBackPerOther);
+      if (unusedMins > 0) {
+        setAdjustedTargetMins(prev => {
+          const next = { ...prev };
+          // Give the unused chunk back to the returning player
+          next[jersey] = (next[jersey] || 0) + unusedMins;
+          // Pull the same share back from each teammate who received it
+          info.others.forEach(j => {
+            next[j] = Math.max(0, (next[j] || 0) - pullBackPerOther);
+          });
+          return next;
         });
-        return next;
-      });
-    }
+      }
 
-    setInjuryInfo(prev => { const n = { ...prev }; delete n[jersey]; return n; });
+      setInjuryInfo(prev => { const n = { ...prev }; delete n[jersey]; return n; });
+    });
   }
 
   // Undo foul-out — restore player to bench, drop foul count to 4, and roll back
@@ -943,50 +1099,65 @@ function App() {
   // the injury Return path). If the player has been out for most of their share
   // already, little or nothing is clawed back — teammates keep what they earned.
   function undoFoulOut(jersey) {
-    const info = fouloutInfo[jersey];
+    if (!fouledOut.has(jersey)) return;
+    withActionLock(() => {
+      const info = fouloutInfo[jersey];
 
-    setFouledOut(prev => { const n = new Set(prev); n.delete(jersey); return n; });
-    setFouls(prev => ({ ...prev, [jersey]: 4 }));
-    setOffSince(prev => ({ ...prev, [jersey]: gameSecs }));
+      setFouledOut(prev => { const n = new Set(prev); n.delete(jersey); return n; });
+      // Returning player has been resting — add to carousel memory
+      setRestedThisHalf(prev => { const next = new Set(prev); next.add(jersey); return next; });
+      setFouls(prev => ({ ...prev, [jersey]: 4 }));
+      setOffSince(prev => ({ ...prev, [jersey]: gameSecs }));
 
-    if (!info || info.remainingMins <= 0 || info.others.length === 0) {
-      setFouloutInfo(prev => { const n = { ...prev }; delete n[jersey]; return n; });
-      return;
-    }
+      if (!info || info.remainingMins <= 0 || info.others.length === 0) {
+        setFouloutInfo(prev => { const n = { ...prev }; delete n[jersey]; return n; });
+        return;
+      }
 
-    const elapsedMins = Math.max(0, (gameSecs - info.startSecs) / 60);
-    const unusedMins = Math.max(0, info.remainingMins - elapsedMins);
-    const N = info.others.length;
-    const pullBackPerOther = unusedMins / N;
+      const elapsedMins = Math.max(0, (gameSecs - info.startSecs) / 60);
+      const unusedMins = Math.max(0, info.remainingMins - elapsedMins);
+      const N = info.others.length;
+      const pullBackPerOther = unusedMins / N;
 
-    if (unusedMins > 0) {
-      setAdjustedTargetMins(prev => {
-        const next = { ...prev };
-        next[jersey] = (next[jersey] || 0) + unusedMins;
-        info.others.forEach(j => {
-          next[j] = Math.max(0, (next[j] || 0) - pullBackPerOther);
+      if (unusedMins > 0) {
+        setAdjustedTargetMins(prev => {
+          const next = { ...prev };
+          next[jersey] = (next[jersey] || 0) + unusedMins;
+          info.others.forEach(j => {
+            next[j] = Math.max(0, (next[j] || 0) - pullBackPerOther);
+          });
+          return next;
         });
-        return next;
-      });
-    }
+      }
 
-    setFouloutInfo(prev => { const n = { ...prev }; delete n[jersey]; return n; });
+      setFouloutInfo(prev => { const n = { ...prev }; delete n[jersey]; return n; });
+    });
   }
 
   // Bring someone on as emergency replacement
   function doEmergencyIn(inJersey) {
-    const now = gameSecs;
-    setStintStart(prev => ({ ...prev, [inJersey]: now }));
-    setOffSince(prev => { const n = { ...prev }; delete n[inJersey]; return n; });
-    setOnCourt(prev => [...prev, inJersey]);
-    setSubLog(prev => [...prev, {
-      time: now, half, timeInHalf,
-      subs: [{ out: pObj(replacingJersey), in: pObj(inJersey) }],
-      emergency: true,
-    }]);
-    setReplacingJersey(null);
-    setLastSubTime(now);
-    setPendingSub(null);
+    if (inJersey === replacingJersey) return; // can't replace yourself
+    if (onCourt.includes(inJersey)) return;
+    if (onCourt.length >= 5) return;
+    if (unavailableJerseys.has(inJersey)) return;
+    withActionLock(() => {
+      const now = gameSecs;
+      setStintStart(prev => ({ ...prev, [inJersey]: now }));
+      setOffSince(prev => { const n = { ...prev }; delete n[inJersey]; return n; });
+      setOnCourt(prev => [...prev, inJersey]);
+      setSubLog(prev => [...prev, {
+        time: now, half, timeInHalf,
+        subs: [{ out: pObj(replacingJersey), in: pObj(inJersey) }],
+        emergency: true,
+      }]);
+      setReplacingJersey(null);
+      setLastSubTime(now);
+      setPendingSub(null);
+      markActiveWindowHandled();
+      // Carousel memory: the incoming player just rested on the bench, so mark
+      // them in restedThisHalf to prevent the engine from yo-yoing them right off.
+      setRestedThisHalf(prev => { const next = new Set(prev); next.add(inJersey); return next; });
+    });
   }
 
   // Current events list (plan + dynamically-appended events), sorted by time
@@ -1054,6 +1225,16 @@ function App() {
   // Track whether a game is currently live (clock has started at least once)
   const gameIsLive = screen === "game" || (gameSecs > 0 && !gameOver);
 
+  // ── CADENCE-FIRST ROTATION ENGINE ──────────────────────────────────────────
+  // Architecture:
+  //   1. Mandatory triggers (always live, every second): hard stint cap, skill
+  //      violation, weakest-3 balance → fire immediately.
+  //   2. Window-based fairness rotation: subs fire ONLY at scheduled rotation
+  //      windows. Cadence scales inversely with bench size.
+  //   3. Closer-restore: dedicated window near end of game.
+  //
+  // This replaces the old continuous-trigger engine. The coach sees fewer,
+  // more predictable stoppages while maintaining fairness.
   useEffect(() => {
     if (!plan || gameOver || showHalftime) {
       if (pendingSub !== null) setPendingSub(null);
@@ -1063,10 +1244,17 @@ function App() {
       if (pendingSub !== null) setPendingSub(null);
       return;
     }
+    // Suppress while the emergency replacement overlay is open — the coach
+    // is already handling a player-off-court event, don't stack suggestions.
+    if (replacingJersey != null) {
+      if (pendingSub !== null) setPendingSub(null);
+      return;
+    }
 
-    const totalSecs = halfMins * 2 * 60;
-    const closeStart = totalSecs - CLOSE_BLOCK_SECS;
-    const inCloseBlock = gameSecs >= closeStart;
+    // For cadence: exclude both fouled-out AND injured (reflects actual bench depth NOW)
+    const rosterForCadence = available.length - fouledOut.size - injured.size;
+
+    const config = rosterForCadence > 5 ? getRotationConfig(rosterForCadence) : getRotationConfig(6); // fallback config for mandatory checks
     const inStartBlock = half === 1 && gameSecs < START_BLOCK_SECS;
 
     const onCourtPlayers = onCourt
@@ -1075,42 +1263,30 @@ function App() {
     const benchAvail = available.filter(p =>
       !onCourt.includes(p.jersey) && !unavailableJerseys.has(p.jersey));
 
-    if (onCourtPlayers.length < 5 || benchAvail.length === 0) {
+    // Even with no bench, check if we're short-handed (fewer than 5 on court)
+    if (onCourtPlayers.length === 0) {
       if (pendingSub !== null) setPendingSub(null);
       return;
     }
 
     const benchCount = benchAvail.length;
-    const cd = cooldownFor(benchCount);
+    const activePlayers = available.filter(p => !unavailableJerseys.has(p.jersey));
+    const weakest3 = weakestThreeJerseys(activePlayers);
+    const starterJerseys = new Set((plan?.starting || []).map(p => p.jersey));
 
-    // Time helpers — accept an optional offset (for lookahead projection).
-    const stintLen = (j, offset) => {
-      const t = (offset != null ? offset : gameSecs);
-      return stintStart[j] != null ? t - stintStart[j] : 0;
-    };
-    const benchLen = (j, offset) => {
-      const t = (offset != null ? offset : gameSecs);
-      const since = offSince[j];
-      return typeof since === "number" ? Math.max(0, t - since) : 0;
-    };
+    // ── Time helpers ──────────────────────────────────────────────────────
+    const stintLen = (j) => stintStart[j] != null ? gameSecs - stintStart[j] : 0;
     const courtSecsOf = (j) => {
       const base = accumulated[j] || 0;
       return stintStart[j] != null ? base + (gameSecs - stintStart[j]) : base;
     };
-
-    const weakest3 = weakestThreeJerseys(available);
-
-    // ── Budget-aware minutes: starters have CLOSE_BLOCK_SECS banked for the
-    // closer, so treat their accumulated time as higher. This makes the engine
-    // pull starters OFF first (they look over-served) and bring bench players
-    // ON first (they look under-served) during the middle window. ────────────
-    const starterJerseys = new Set((plan?.starting || []).map(p => p.jersey));
+    // Budget-aware: starters have CLOSE_BLOCK_SECS banked for the closer.
     const effectiveCourtSecs = (j) => {
       const base = courtSecsOf(j);
       return starterJerseys.has(j) ? base + CLOSE_BLOCK_SECS : base;
     };
 
-    // Legality helpers — take simulated court array.
+    // ── Legality helpers ─────────────────────────────────────────────────
     const legalSkillSim = (court, pOut, pIn) => {
       const newOn = court.filter(p => p.jersey !== pOut.jersey).concat([pIn]);
       return meetsSkillRequirements(newOn);
@@ -1122,119 +1298,197 @@ function App() {
     const pickInSim = (court, pOut, bench) => {
       return bench.find(pIn => legalStrictSim(court, pOut, pIn))
         || bench.find(pIn => legalSkillSim(court, pOut, pIn))
-        || bench[0];
+        || null; // never fall back to an illegal sub
+    };
+    // Search all OUT/IN combinations to find the best legal pair.
+    // outCandidates should be pre-sorted by priority (longest stint, lowest rating, etc).
+    // benchSorted should be pre-sorted by least effective court time.
+    const findLegalPair = (court, outCandidates, benchSorted) => {
+      // First pass: strict legality (skill + weakest balance)
+      for (const out of outCandidates) {
+        const inP = benchSorted.find(pIn => legalStrictSim(court, out, pIn));
+        if (inP) return { out, in: inP };
+      }
+      // Second pass: skill-only legality
+      for (const out of outCandidates) {
+        const inP = benchSorted.find(pIn => legalSkillSim(court, out, pIn));
+        if (inP) return { out, in: inP };
+      }
+      return null;
     };
 
     // Compare two pendingSub objects to avoid useless re-renders.
     const subsEq = (a, b) => {
       if (!a || !b) return false;
       if (a.mandatory !== b.mandatory || a.reason !== b.reason) return false;
+      if (a.windowTarget !== b.windowTarget || a.windowSoftLate !== b.windowSoftLate || a.windowRoster !== b.windowRoster) return false;
       if (a.subs.length !== b.subs.length) return false;
       return a.subs.every((s, i) =>
-        s.out.jersey === b.subs[i].out.jersey && s.in.jersey === b.subs[i].in.jersey);
+        s.out?.jersey === b.subs[i].out?.jersey && s.in.jersey === b.subs[i].in.jersey);
     };
 
-    // ── Trigger detector — returns { mandatory, fair } for a given court/bench
-    // at a projected time offset. Used both for "now" and for lookahead. ──────
-    const detectTriggers = (court, bench, t) => {
-      const overStint = court.filter(p => stintLen(p.jersey, t) >= MAX_STINT_SECS);
-      const skillVio = !meetsSkillRequirements(court);
-      const weakVio = violatesWeakestBalance(court, weakest3);
-      const mand = overStint.length > 0 || skillVio || weakVio;
-
-      const maxSt = Math.max(0, ...court.map(p => stintLen(p.jersey, t)));
-      const maxBn = Math.max(0, ...bench.map(p => benchLen(p.jersey, t)));
-      const maxCt = Math.max(0, ...court.map(p => effectiveCourtSecs(p.jersey)));
-      const minCtBench = bench.length
-        ? Math.min(...bench.map(p => effectiveCourtSecs(p.jersey)))
-        : 0;
-      const gap = maxCt - minCtBench;
-      const f = (maxSt >= FAIR_STINT_MIN && maxBn >= FAIR_BENCH_MIN && gap >= FAIR_GAP_MIN)
-             || (gap >= FAIR_CUM_GAP_HARD && maxBn >= 2 * 60);
-
-      return {
-        mandatory: mand,
-        fair: f,
-        overStint,
-        skillVio,
-        weakVio,
+    // ── 0. SHORT-HANDED REPAIR: add player when fewer than 5 on court ───
+    if (!inStartBlock && onCourtPlayers.length < 5 && benchAvail.length > 0) {
+      // Prefer players that fix a skill violation, then by least court time
+      const courtNow = [...onCourtPlayers];
+      const hasSkillVio = !meetsSkillRequirements(courtNow);
+      const sorted = [...benchAvail].sort((a, b) => {
+        if (hasSkillVio) {
+          const aFixes = meetsSkillRequirements([...courtNow, a]);
+          const bFixes = meetsSkillRequirements([...courtNow, b]);
+          if (aFixes !== bFixes) return aFixes ? -1 : 1;
+        }
+        return effectiveCourtSecs(a.jersey) - effectiveCourtSecs(b.jersey);
+      });
+      const inP = sorted[0];
+      const next = {
+        subs: [{ out: null, in: inP }],
+        reason: "⚠ Add player — fewer than 5 on court",
+        mandatory: true,
+        addOnly: true,
       };
-    };
+      if (!subsEq(pendingSub, next)) { setPendingSub(next); notifySub(); }
+      return;
+    }
 
-    // ── Pick OUT from a court array given trigger state ───────────────────────
-    // `skip` = jerseys to never pick (usedOut ∪ usedIn — a player subbed IN
-    // during this same bundle must not be immediately pulled back OUT).
-    const pickOut = (court, trig, skip, t) => {
-      const eligibleOverStint = trig.overStint.filter(p => !skip.has(p.jersey));
-      if (eligibleOverStint.length > 0) {
-        const out = [...eligibleOverStint].sort((a, b) => stintLen(b.jersey, t) - stintLen(a.jersey, t))[0];
-        return { out, reason: "8-min stint cap" };
-      }
-      if (trig.weakVio) {
-        const simSet = new Set(court.map(p => p.jersey));
-        const weakOnCount = weakest3.filter(j => simSet.has(j)).length;
-        if (weakOnCount === 3) {
-          const out = [...court]
-            .filter(p => weakest3.includes(p.jersey) && !skip.has(p.jersey))
-            .sort((a, b) => stintLen(b.jersey, t) - stintLen(a.jersey, t))[0];
-          return out ? { out, reason: "Dev balance (3 on court)" } : null;
-        } else {
-          const out = [...court]
-            .filter(p => !weakest3.includes(p.jersey) && !skip.has(p.jersey))
-            .sort((a, b) => stintLen(b.jersey, t) - stintLen(a.jersey, t))[0];
-          return out ? { out, reason: "Dev balance (0 on court)" } : null;
+    // ── 1. MANDATORY TRIGGERS (always live, every second) ────────────────
+    // Note: only all-3-weakest-ON-court is mandatory (too many weak at once).
+    // 0-on-court (all weak on bench) is a fairness issue handled at windows.
+    if (!inStartBlock) {
+      // Exempt starters from hard stint cap during (and 60s before) the closer
+      // block — the closer restore is supposed to keep them on court to finish.
+      const totalGameSecs = halfMins * 2 * 60;
+      const closeStart = totalGameSecs - CLOSE_BLOCK_SECS;
+      const nearOrInClose = half === 2 && gameSecs >= closeStart - 60;
+      const overStint = onCourtPlayers.filter(p => {
+        if (nearOrInClose && starterJerseys.has(p.jersey)) return false;
+        return stintLen(p.jersey) >= config.hardStintCapSecs;
+      });
+      const skillVio = !meetsSkillRequirements(onCourtPlayers);
+      const weakVio = violatesWeakestThree(onCourtPlayers, weakest3);
+
+      if (overStint.length > 0 || skillVio || weakVio) {
+        let simCourt = [...onCourtPlayers];
+        let simBench = [...benchAvail];
+        const subPairs = [];
+        const usedOut = new Set();
+        const usedIn = new Set();
+
+        for (let pass = 0; pass < Math.min(3, benchCount); pass++) {
+          const osNow = simCourt.filter(p => {
+            if (nearOrInClose && starterJerseys.has(p.jersey)) return false;
+            return stintLen(p.jersey) >= config.hardStintCapSecs && !usedOut.has(p.jersey);
+          });
+          const svNow = !meetsSkillRequirements(simCourt);
+          const wvNow = violatesWeakestThree(simCourt, weakest3);
+          if (osNow.length === 0 && !svNow && !wvNow) break;
+
+          const skip = new Set([...usedOut, ...usedIn]);
+          let out = null, reason = "";
+
+          if (osNow.length > 0) {
+            out = [...osNow].sort((a, b) => stintLen(b.jersey) - stintLen(a.jersey))[0];
+            reason = `Stint cap (${fmt(config.hardStintCapSecs)})`;
+          } else if (wvNow) {
+            // All 3 weakest are on court — pull the longest-stint one off
+            out = [...simCourt]
+              .filter(p => weakest3.includes(p.jersey) && !skip.has(p.jersey))
+              .sort((a, b) => stintLen(b.jersey) - stintLen(a.jersey))[0];
+            reason = "Dev balance (3 weakest on court)";
+          } else if (svNow) {
+            out = [...simCourt]
+              .filter(p => !skip.has(p.jersey))
+              .sort((a, b) => a.rating - b.rating)[0];
+            reason = "Skill minimums";
+          }
+
+          if (!out) break;
+          const excluded = new Set([...usedIn, ...usedOut]);
+          const freeBench = simBench.filter(p => !excluded.has(p.jersey));
+          const sorted = [...freeBench].sort((a, b) => effectiveCourtSecs(a.jersey) - effectiveCourtSecs(b.jersey));
+          let inP = pickInSim(simCourt, out, sorted);
+          if (!inP) {
+            // Out-first failed — restrict fallback to candidates that fix the trigger.
+            // For stint cap: must remove an over-stint player.
+            // For dev balance: must remove a weakest-3 player.
+            // For skill: any court player is fair game.
+            let outCandidates;
+            if (osNow.length > 0) {
+              outCandidates = osNow.filter(p => !skip.has(p.jersey));
+            } else if (wvNow) {
+              outCandidates = simCourt.filter(p =>
+                weakest3.includes(p.jersey) && !skip.has(p.jersey));
+            } else {
+              outCandidates = simCourt.filter(p => !skip.has(p.jersey));
+            }
+            const pair = findLegalPair(simCourt, outCandidates, sorted);
+            if (!pair) break;
+            out = pair.out;
+            inP = pair.in;
+          }
+
+          subPairs.push({ out, in: inP, reason });
+          usedOut.add(out.jersey);
+          usedIn.add(inP.jersey);
+          simCourt = simCourt.filter(p => p.jersey !== out.jersey).concat([inP]);
+          simBench = simBench.filter(p => p.jersey !== inP.jersey).concat([out]);
+        }
+
+        if (subPairs.length > 0) {
+          const reasons = [...new Set(subPairs.map(s => s.reason))];
+          const next = { subs: subPairs, reason: "⚠ " + reasons.join(" + "), mandatory: true };
+          if (!subsEq(pendingSub, next)) { setPendingSub(next); notifySub(); }
+          return;
         }
       }
-      if (trig.skillVio) {
-        const out = [...court]
-          .filter(p => !skip.has(p.jersey))
-          .sort((a, b) => a.rating - b.rating)[0];
-        return out ? { out, reason: "Skill minimums" } : null;
-      }
-      // Fairness: pull the most-played player who has met their min stint.
-      // Starters (2 min) can be pulled sooner than bench players (3 min).
-      // Use effectiveCourtSecs so starters look over-served and get pulled first.
-      const eligible = court.filter(p => {
-        if (skip.has(p.jersey)) return false;
-        const minStint = starterJerseys.has(p.jersey) ? MIN_STINT_STARTER : MIN_STINT_BENCH;
-        return stintLen(p.jersey, t) >= minStint;
-      });
-      if (eligible.length === 0) return null;
-      const out = [...eligible].sort((a, b) => effectiveCourtSecs(b.jersey) - effectiveCourtSecs(a.jersey))[0];
-      return { out, reason: "Fair rotation" };
-    };
+    }
 
-    // ── Pick IN from bench given context ─────────────────────────────────────
-    const pickInFromBench = (court, bench, outP, trig, usedIn, isFair, usedOut) => {
-      const excluded = new Set([...usedIn, ...usedOut]);
-      const simSet = new Set(court.map(p => p.jersey));
-      const weakOnCount = weakest3.filter(j => simSet.has(j)).length;
-      let sorted;
-      if (trig.weakVio && weakOnCount === 0) {
-        const weakB = bench.filter(p => weakest3.includes(p.jersey) && !excluded.has(p.jersey))
-          .sort((a, b) => benchLen(b.jersey) - benchLen(a.jersey));
-        const strongB = bench.filter(p => !weakest3.includes(p.jersey) && !excluded.has(p.jersey))
-          .sort((a, b) => benchLen(b.jersey) - benchLen(a.jersey));
-        sorted = [...weakB, ...strongB];
-      } else if (isFair) {
-        // Use effectiveCourtSecs so bench players (no banked closer minutes)
-        // appear under-served and get brought on before starters.
-        sorted = [...bench].filter(p => !excluded.has(p.jersey))
-          .sort((a, b) => effectiveCourtSecs(a.jersey) - effectiveCourtSecs(b.jersey));
-      } else {
-        sorted = [...bench].filter(p => !excluded.has(p.jersey))
-          .sort((a, b) => benchLen(b.jersey) - benchLen(a.jersey));
-      }
-      return pickInSim(court, outP, sorted);
-    };
+    // ── START BLOCK (H1 only): no subs ──────────────────────────────────
+    if (inStartBlock) {
+      if (pendingSub !== null) setPendingSub(null);
+      return;
+    }
 
-    // ── CLOSE BLOCK: starter-restore (may bundle multiple) ──────────────────
-    if (inCloseBlock) {
-      const starterJerseys = new Set((plan?.starting || []).map(p => p.jersey));
+    // ── NO BENCH: skip fairness windows (mandatory checks already ran above) ─
+    if (benchAvail.length === 0 || rosterForCadence <= 5) {
+      if (pendingSub !== null) setPendingSub(null);
+      return;
+    }
+
+    // ── QUIET PERIOD after recent sub ─────────────────────────────────
+    // Suppress window-based suggestions for 45s after any manual/confirmed sub
+    // to prevent double-prompting the coach. Mandatory triggers above still fire.
+    const QUIET_PERIOD_SECS = 45;
+    if (gameSecs - lastSubTime < QUIET_PERIOD_SECS) {
+      if (pendingSub !== null && !pendingSub.mandatory) setPendingSub(null);
+      return;
+    }
+
+    // ── 2. WINDOW-BASED ROTATION ────────────────────────────────────────
+    const schedule = getWindowSchedule(rosterForCadence, halfMins, START_BLOCK_SECS, CLOSE_BLOCK_SECS);
+
+    // Find the current active window: first unhandled window whose time range
+    // includes gameSecs. Expired windows (past hardLateSecs) are simply skipped.
+    const activeWindow = schedule.find(w =>
+      gameSecs >= w.openSecs &&
+      gameSecs <= w.hardLateSecs &&
+      !handledWindows.has(wKey(rosterForCadence, w.targetSecs))
+    );
+
+    if (!activeWindow) {
+      // No active window — rotation stable
+      if (pendingSub !== null) setPendingSub(null);
+      return;
+    }
+
+    // ── 3. CLOSER-RESTORE WINDOW ────────────────────────────────────────
+    if (activeWindow.isCloser) {
       let simCourt = [...onCourtPlayers];
       let simBench = [...benchAvail];
       const pairs = [];
-      const closerMax = Math.min(BUNDLE_CAP, benchCount);
+      // Closer is a special event — allow ALL non-starters to be swapped off,
+      // not limited by normal bundleCap. Ensures all available starters return.
+      const closerMax = benchCount;
       for (let pass = 0; pass < closerMax && simBench.length > 0; pass++) {
         const nonStartersOn = simCourt.filter(p => !starterJerseys.has(p.jersey));
         const startersOff = simBench.filter(p => starterJerseys.has(p.jersey));
@@ -1248,132 +1502,154 @@ function App() {
         simBench = simBench.filter(p => p.jersey !== inP.jersey).concat([out]);
       }
       if (pairs.length === 0) {
+        // Starters already on court — auto-handle window
+        if (!handledWindows.has(wKey(rosterForCadence, activeWindow.targetSecs))) {
+          setHandledWindows(prev => new Set([...prev, wKey(rosterForCadence, activeWindow.targetSecs)]));
+        }
         if (pendingSub !== null) setPendingSub(null);
         return;
       }
-      const next = { subs: pairs, reason: "Closer: restore starters", mandatory: true };
+      // Check if any starters are unavailable (fouled out / injured)
+      const unavailableStarters = (plan?.starting || []).filter(p => unavailableJerseys.has(p.jersey));
+      const reason = unavailableStarters.length > 0
+        ? `Closer: partial restore (${unavailableStarters.map(p => `#${p.jersey}`).join(", ")} unavailable)`
+        : "Closer: restore starters";
+      const next = {
+        subs: pairs,
+        reason,
+        mandatory: true,
+        windowTarget: activeWindow.targetSecs,
+        windowSoftLate: activeWindow.softLateSecs,
+        windowRoster: rosterForCadence,
+      };
       if (!subsEq(pendingSub, next)) { setPendingSub(next); notifySub(); }
       return;
     }
 
-    // ── START BLOCK (H1 only): no subs ──────────────────────────────────────
-    if (inStartBlock) {
-      if (pendingSub !== null) setPendingSub(null);
-      return;
-    }
-
-    // ── Cooldown ────────────────────────────────────────────────────────────
-    const sinceLastSub = gameSecs - lastSubTime;
-
-    // ── Detect triggers NOW ─────────────────────────────────────────────────
-    const trigNow = detectTriggers(onCourtPlayers, benchAvail, gameSecs);
-
-    if (!trigNow.mandatory && !trigNow.fair) {
-      // Nothing firing now — but check lookahead: would anything fire within
-      // LOOKAHEAD_SECS? If so, we still don't fire yet (wait until it actually
-      // triggers). Only clear pendingSub.
-      if (pendingSub !== null) setPendingSub(null);
-      return;
-    }
-
-    // Fairness triggers respect cooldown; mandatory overrides.
-    if (!trigNow.mandatory && sinceLastSub < cd) {
-      if (pendingSub !== null) setPendingSub(null);
-      return;
-    }
-
-    // ── Bundle loop with lookahead ──────────────────────────────────────────
-    // Bundle cap: BUNDLE_CAP (2) subs per suggestion. A 3rd sub is allowed
-    // ONLY if the sim court still has a mandatory violation after 2 swaps
-    // (e.g., pulling 2 players broke a skill minimum or weak balance).
-    // Never exceeds benchCount (can't sub more than are sitting).
+    // ── 4. FAIRNESS ROTATION WINDOW ─────────────────────────────────────
     let simCourt = [...onCourtPlayers];
     let simBench = [...benchAvail];
     const subPairs = [];
-    const reasons = [];
-    let anyMandatory = false;
     const usedOut = new Set();
     const usedIn = new Set();
-    const hardMax = Math.min(BUNDLE_CAP + 1, benchCount); // absolute ceiling (3 or bench)
+    const isFirstCycle = activeWindow.isFirstCycle;
 
-    for (let pass = 0; pass < hardMax; pass++) {
-      // Enforce bundle cap: after BUNDLE_CAP subs, only continue for mandatory
-      if (pass >= BUNDLE_CAP) {
-        const freeBenchCheck = simBench.filter(p => !usedIn.has(p.jersey));
-        if (freeBenchCheck.length === 0) break;
-        const trigCheck = detectTriggers(simCourt, freeBenchCheck, gameSecs);
-        if (!trigCheck.mandatory) break; // at cap and no mandatory — stop
-      }
-      const freeBench = simBench.filter(p => !usedIn.has(p.jersey));
+    // 85% floor-risk projection: don't bench a player if they can't recover
+    // to 85% of fair-share minutes given remaining game time. Only matters in
+    // H2 or late H1 when time is actually tight.
+    const totalGS = halfMins * 2 * 60;
+    const remainingGameSecs = totalGS - gameSecs;
+    const fairShareSecs = (5 * totalGS) / rosterForCadence;
+    const floorSecs = 0.85 * fairShareSecs;
+    const floorRiskApplies = remainingGameSecs < totalGS * 0.55; // kicks in past 45% of game
+
+    for (let pass = 0; pass < Math.min(config.bundleCap, benchCount); pass++) {
+      const freeBench = simBench.filter(p => !usedIn.has(p.jersey) && !usedOut.has(p.jersey));
       if (freeBench.length === 0) break;
 
-      // Detect triggers at current time on sim court
-      const trig = detectTriggers(simCourt, freeBench, gameSecs);
-      let isMand = trig.mandatory;
-      let isFair = trig.fair;
-      let trigToUse = trig;
-      let useTime = gameSecs;
+      const skip = new Set([...usedOut, ...usedIn]);
+      // Pick OUT — eligible players who've met minimum stint
+      let eligible = simCourt.filter(p => {
+        if (skip.has(p.jersey)) return false;
+        return stintLen(p.jersey) >= config.minStintSecs;
+      });
 
-      if (pass === 0) {
-        // First pass: must have an actual trigger
-        if (!isMand && !isFair) break;
-      } else if (!isMand) {
-        // Subsequent pass: no immediate mandatory trigger.
-        // Check lookahead — would a trigger fire within LOOKAHEAD_SECS?
-        const futureTime = gameSecs + LOOKAHEAD_SECS;
-        const trigFuture = detectTriggers(simCourt, freeBench, futureTime);
-        if (trigFuture.mandatory || trigFuture.fair) {
-          // Yes — bundle it now instead of making the coach wait.
-          trigToUse = trigFuture;
-          useTime = futureTime;
-          isMand = trigFuture.mandatory;
-          isFair = trigFuture.fair;
-        } else {
-          break; // nothing coming soon, stop bundling
-        }
+      // Floor-risk guard: exclude players who can't reach 85% of fair-share
+      // if benched now. Projected max = current court time + (remaining - cadence),
+      // since they'd sit at least one full cadence cycle before returning.
+      if (floorRiskApplies && eligible.length > 1) {
+        const safe = eligible.filter(p => {
+          const projected = courtSecsOf(p.jersey) + Math.max(0, remainingGameSecs - config.cadenceSecs);
+          return projected >= floorSecs;
+        });
+        // Only apply if we still have someone to sub out
+        if (safe.length > 0) eligible = safe;
       }
 
-      if (isMand) anyMandatory = true;
+      if (eligible.length === 0) break;
 
-      // Pick OUT — skip anyone already used as OUT *or* IN in this bundle
-      const skip = new Set([...usedOut, ...usedIn]);
-      const outResult = pickOut(simCourt, trigToUse, skip, useTime);
-      if (!outResult) break;
-      const { out, reason } = outResult;
+      let out;
+      if (isFirstCycle) {
+        // Priority-rest carousel: only pick players who haven't rested yet
+        // this half. This prevents the yo-yo bug where the just-entered bench
+        // player gets pulled right back off (common with 6 players / 1 bench).
+        const unrested = eligible.filter(p => !restedThisHalf.has(p.jersey));
+        const pool = unrested.length > 0 ? unrested : eligible;
+        // Within the pool, sub out weaker players first so strongest play longest
+        out = [...pool].sort((a, b) => a.rating - b.rating)[0];
+      } else {
+        // Normal fairness: sub out player with most effective court time
+        out = [...eligible].sort((a, b) => effectiveCourtSecs(b.jersey) - effectiveCourtSecs(a.jersey))[0];
+      }
 
-      // Pick IN
-      const inP = pickInFromBench(simCourt, freeBench, out, trigToUse, usedIn, reason === "Fair rotation", usedOut);
-      if (!inP) break;
+      // Pick IN — least effective court time (bench players look under-served)
+      const excluded = new Set([...usedIn, ...usedOut]);
+      const simSet = new Set(simCourt.map(p => p.jersey));
+      const weakOnCount = weakest3.filter(j => simSet.has(j)).length;
+      let sorted;
+      if (weakOnCount === 0 && weakest3.length === 3) {
+        // All weak on bench — prefer bringing one in
+        const weakB = freeBench.filter(p => weakest3.includes(p.jersey))
+          .sort((a, b) => effectiveCourtSecs(a.jersey) - effectiveCourtSecs(b.jersey));
+        const strongB = freeBench.filter(p => !weakest3.includes(p.jersey))
+          .sort((a, b) => effectiveCourtSecs(a.jersey) - effectiveCourtSecs(b.jersey));
+        sorted = [...weakB, ...strongB];
+      } else {
+        sorted = [...freeBench]
+          .sort((a, b) => effectiveCourtSecs(a.jersey) - effectiveCourtSecs(b.jersey));
+      }
+
+      let inP = pickInSim(simCourt, out, sorted);
+      if (!inP) {
+        // Out-first failed — search all eligible pairs
+        const pair = findLegalPair(simCourt, eligible, sorted);
+        if (!pair) break;
+        out = pair.out;
+        inP = pair.in;
+      }
 
       subPairs.push({ out, in: inP });
-      reasons.push(reason);
       usedOut.add(out.jersey);
       usedIn.add(inP.jersey);
-
-      // Update sim state
       simCourt = simCourt.filter(p => p.jersey !== out.jersey).concat([inP]);
       simBench = simBench.filter(p => p.jersey !== inP.jersey).concat([out]);
     }
 
     if (subPairs.length === 0) {
+      // Window active but no eligible sub (min stint not met, or balanced).
+      // Don't auto-handle if we're still in the early-open phase — a player
+      // may become eligible by the target time. Only auto-handle once past
+      // the target time.
+      if (gameSecs >= activeWindow.targetSecs) {
+        const k = wKey(rosterForCadence, activeWindow.targetSecs);
+        if (!handledWindows.has(k)) {
+          setHandledWindows(prev => new Set([...prev, k]));
+        }
+      }
       if (pendingSub !== null) setPendingSub(null);
       return;
     }
 
     const next = {
       subs: subPairs,
-      reason: [...new Set(reasons)].join(" + "),
-      mandatory: anyMandatory,
+      reason: `Rotation${isFirstCycle ? " (first cycle)" : ""}`,
+      mandatory: false,
+      windowTarget: activeWindow.targetSecs,
+      windowSoftLate: activeWindow.softLateSecs,
+      windowRoster: rosterForCadence,
     };
     if (!subsEq(pendingSub, next)) {
+      // Only beep/vibrate when window is due or overdue, not when just opening
+      const shouldAlert = gameSecs >= activeWindow.targetSecs;
       setPendingSub(next);
-      notifySub();
+      if (shouldAlert) notifySub();
     }
-  }, [plan, gameSecs, half, halfMins, onCourt, available, stintStart, accumulated, offSince, lastSubTime,
-      unavailableJerseys, showHalftime, gameOver, screen, pendingSub]);
+  }, [plan, gameSecs, half, halfMins, onCourt, available, stintStart, accumulated, offSince,
+      unavailableJerseys, showHalftime, gameOver, screen, pendingSub, handledWindows, fouledOut,
+      lastSubTime, restedThisHalf, replacingJersey]);
 
   const benchPlayers = available.filter(
-    p => !onCourt.includes(p.jersey) && !unavailableJerseys.has(p.jersey)
+    p => !onCourt.includes(p.jersey) && !unavailableJerseys.has(p.jersey) && p.jersey !== replacingJersey
   );
 
   // ── DYNAMIC MINUTES DISTRIBUTION ───────────────────────────────────────────
@@ -1546,13 +1822,41 @@ function App() {
           })}
         </div>
 
-        <button onClick={handleGeneratePlan} disabled={starters.size !== 5}
-          style={{ width: "100%", padding: "16px", borderRadius: 16, border: "none",
-            cursor: starters.size === 5 ? "pointer" : "not-allowed",
-            background: starters.size === 5 ? "linear-gradient(135deg,#1d4ed8,#7c3aed)" : "#334155",
-            color: "#fff", fontSize: 17, fontWeight: 700 }}>
-          {starters.size === 5 ? "Generate Rotation Plan →" : `Select ${5 - starters.size} more player${5 - starters.size !== 1 ? "s" : ""}`}
-        </button>
+        {(() => {
+          const starterObjs = available.filter(p => starters.has(p.jersey));
+          const skillsOk = starters.size === 5 && meetsSkillRequirements(starterObjs);
+          const missingSkills = starters.size === 5 && !skillsOk
+            ? SKILL_MINIMUMS.filter(({ skill, min }) =>
+                starterObjs.filter(p => p.skills.includes(skill)).length < min
+              ).map(({ skill }) => skill)
+            : [];
+          const w3 = weakestThreeJerseys(available);
+          const devBalanceWarn = starters.size === 5 && w3.length >= 3 && violatesWeakestThree(starterObjs, w3);
+          const canGenerate = starters.size === 5 && skillsOk;
+          return (
+            <>
+              {missingSkills.length > 0 && (
+                <div style={{ background: "#7f1d1d", borderRadius: 10, padding: "8px 12px", marginBottom: 8, color: "#fca5a5", fontSize: 12, fontWeight: 600 }}>
+                  ⚠️ Starting 5 needs: {missingSkills.join(", ")}
+                </div>
+              )}
+              {devBalanceWarn && (
+                <div style={{ background: "#78350f", borderRadius: 10, padding: "8px 12px", marginBottom: 8, color: "#fcd34d", fontSize: 12, fontWeight: 600 }}>
+                  ⚠️ All 3 developing players in the starting 5 — engine can't fix this during the 4-min start lock
+                </div>
+              )}
+              <button onClick={handleGeneratePlan} disabled={!canGenerate}
+                style={{ width: "100%", padding: "16px", borderRadius: 16, border: "none",
+                  cursor: canGenerate ? "pointer" : "not-allowed",
+                  background: canGenerate ? "linear-gradient(135deg,#1d4ed8,#7c3aed)" : "#334155",
+                  color: "#fff", fontSize: 17, fontWeight: 700 }}>
+                {starters.size !== 5
+                  ? `Select ${5 - starters.size} more player${5 - starters.size !== 1 ? "s" : ""}`
+                  : canGenerate ? "Generate Rotation Plan →" : "Fix skill gaps above ↑"}
+              </button>
+            </>
+          );
+        })()}
       </div>
     </div>
   );
@@ -1595,16 +1899,39 @@ function App() {
         {/* Rule-driven rotation note — no pre-scheduled events */}
         <div style={{ background: "#1e293b", borderRadius: 16, padding: 16, marginBottom: 12 }}>
           <div style={{ color: "#94a3b8", fontSize: 12, fontWeight: 700, letterSpacing: 1, marginBottom: 10 }}>ROTATION</div>
-          <div style={{ color: "#cbd5e1", fontSize: 13, lineHeight: 1.5 }}>
-            Rule-driven — subs are decided live in game.
-            <br />
-            <span style={{ color: "#64748b", fontSize: 12 }}>
-              Starters locked {fmt(START_BLOCK_SECS)}, closers restored last {fmt(CLOSE_BLOCK_SECS)}.
-              Mandatory triggers: 8-min stint, skill min, dev balance.
-              Fair triggers: stint ≥ {fmt(FAIR_STINT_MIN)} + bench ≥ {fmt(FAIR_BENCH_MIN)} + gap ≥ {FAIR_GAP_MIN}s.
-              Starters: min stint {fmt(MIN_STINT_STARTER)}, bench players: min stint {fmt(MIN_STINT_BENCH)}.
-            </span>
-          </div>
+          {(() => {
+            const activeRosterSize = gameIsLive
+              ? available.length - fouledOut.size - injured.size
+              : available.length;
+            const config = getRotationConfig(activeRosterSize);
+            const schedule = activeRosterSize > 5
+              ? getWindowSchedule(activeRosterSize, halfMins, START_BLOCK_SECS, CLOSE_BLOCK_SECS)
+              : [];
+            const rotationWindows = schedule.filter(w => !w.isCloser);
+            if (activeRosterSize <= 5) return (
+              <div style={{ color: "#cbd5e1", fontSize: 13, lineHeight: 1.5 }}>
+                No bench — all {activeRosterSize} players on court full time.
+                <br />
+                <span style={{ color: "#64748b", fontSize: 12 }}>
+                  No rotation windows. Mandatory checks (stint cap, skill, weakest-3) still active.
+                </span>
+              </div>
+            );
+            return (
+              <div style={{ color: "#cbd5e1", fontSize: 13, lineHeight: 1.5 }}>
+                Window-based — subs at scheduled intervals.
+                <br />
+                <span style={{ color: "#64748b", fontSize: 12 }}>
+                  {activeRosterSize} players → {config.benchCount} bench → cadence every {fmt(config.cadenceSecs)}.
+                  {config.firstCycleCount > 0 && ` First cycle faster (${fmt(config.firstCycleCadenceSecs)}).`}
+                  {" "}Bundle: up to {config.bundleCap} swap{config.bundleCap > 1 ? "s" : ""} per window.
+                  {" "}Stint cap: {fmt(config.hardStintCapSecs)}.
+                  {" "}Starters locked {fmt(START_BLOCK_SECS)}, closers last {fmt(CLOSE_BLOCK_SECS)}.
+                  {" "}{rotationWindows.length} rotation windows + closer.
+                </span>
+              </div>
+            );
+          })()}
         </div>
 
         {gameIsLive ? (
@@ -1615,7 +1942,7 @@ function App() {
                 display: "flex", alignItems: "center", justifyContent: "center", gap: 10, marginBottom: 8 }}>
               ← Back to Game
             </button>
-            <button onClick={() => { if (window.confirm("This will end the current game and lose all data. Are you sure?")) { setScreen("setup"); setGameSecs(0); setRunning(false); } }}
+            <button onClick={() => { if (window.confirm("This will end the current game and lose all data. Are you sure?")) { discardSavedGame(); } }}
               style={{ width: "100%", padding: "12px", borderRadius: 12, border: "1px solid #991b1b", cursor: "pointer",
                 background: "transparent", color: "#f87171", fontSize: 14, fontWeight: 600 }}>
               End Game & New Setup
@@ -1639,7 +1966,7 @@ function App() {
 
   return (
     <div style={{ minHeight: "100vh", backgroundColor: "#0f172a", padding: "12px", fontFamily: "system-ui, sans-serif" }}
-      onClick={() => activeMenu && setActiveMenu(null)}>
+      onClick={() => { if (activeMenu) setActiveMenu(null); if (benchMenu) setBenchMenu(null); }}>
       <div style={{ maxWidth: 400, margin: "0 auto" }}>
 
         {/* HALFTIME OVERLAY */}
@@ -1650,18 +1977,10 @@ function App() {
                 <CoachKLogo size={64} />
               </div>
               <div style={{ color: "#fbbf24", fontSize: 22, fontWeight: 800, marginBottom: 8 }}>HALFTIME</div>
-              <div style={{ color: "#94a3b8", fontSize: 14, marginBottom: 24 }}>Available starters return for 2nd half (bench fills any gaps)</div>
+              <div style={{ color: "#94a3b8", fontSize: 14, marginBottom: 24 }}>Players who sat most in H1 start the 2nd half</div>
               <div style={{ display: "flex", flexWrap: "wrap", gap: 8, justifyContent: "center", marginBottom: 24 }}>
                 {(() => {
-                  // Preview the actual H2 starting 5 (filters unavailable, fills from bench)
-                  const unavailable = j => fouledOut.has(j) || injured.has(j);
-                  let court = plan.starting.filter(p => !unavailable(p.jersey));
-                  if (court.length < 5) {
-                    const bench = available
-                      .filter(p => !court.some(c => c.jersey === p.jersey) && !unavailable(p.jersey))
-                      .sort((a, b) => b.rating - a.rating);
-                    while (court.length < 5 && bench.length) court.push(bench.shift());
-                  }
+                  const { courtObjs: court } = computeSecondHalfLineup();
                   return court.map(p => (
                     <div key={p.jersey} style={{ background: p.color + "44", border: `1px solid ${p.color}`, borderRadius: 8, padding: "4px 10px", color: "#fff", fontSize: 13, fontWeight: 600 }}>
                       #{p.jersey} {p.name}
@@ -1694,10 +2013,17 @@ function App() {
                   <div style={{ color: "#fff", fontSize: 15, fontWeight: 600 }}>{p.name}</div>
                 </div>
               ))}
-              <button onClick={() => setReplacingJersey(null)}
-                style={{ width: "100%", marginTop: 8, background: "#334155", border: "none", color: "#94a3b8", borderRadius: 10, padding: "10px", cursor: "pointer", fontSize: 14 }}>
-                Continue short (no replacement)
-              </button>
+              {benchPlayers.length === 0 ? (
+                <button onClick={() => setReplacingJersey(null)}
+                  style={{ width: "100%", marginTop: 8, background: "#334155", border: "none", color: "#94a3b8", borderRadius: 10, padding: "10px", cursor: "pointer", fontSize: 14 }}>
+                  Play with {onCourt.length} — no bench available
+                </button>
+              ) : (
+                <button onClick={() => { if (window.confirm(`${benchPlayers.length} bench player${benchPlayers.length > 1 ? "s" : ""} available. Play short-handed anyway?`)) setReplacingJersey(null); }}
+                  style={{ width: "100%", marginTop: 8, background: "transparent", border: "1px solid #991b1b", color: "#f87171", borderRadius: 10, padding: "10px", cursor: "pointer", fontSize: 13 }}>
+                  Play with {onCourt.length} despite available bench
+                </button>
+              )}
             </div>
           </div>
         )}
@@ -1712,7 +2038,7 @@ function App() {
           <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
             {!gameOver && !showHalftime && (
               <>
-                <button onClick={() => setGameSecs(s => Math.max(0, s - 10))}
+                <button onClick={() => setClockSecs(Math.max(halftimeDone ? halfMins * 60 : 0, gameSecs - 10))}
                   title="Rewind 10s"
                   style={{ padding: "8px 10px", borderRadius: 10, border: "1px solid #1e40af", cursor: "pointer", background: "#1e3a8a", color: "#dbeafe", fontSize: 12, fontWeight: 700 }}>−10s</button>
                 <button onClick={() => setRunning(r => !r)}
@@ -1720,7 +2046,7 @@ function App() {
                     background: running ? "#ef4444" : "#16a34a", color: "#fff" }}>
                   {running ? "⏸" : "▶"}
                 </button>
-                <button onClick={() => setGameSecs(s => Math.min(totalGameSecs, s + 10))}
+                <button onClick={() => setClockSecs(Math.min(totalGameSecs, gameSecs + 10))}
                   title="Forward 10s"
                   style={{ padding: "8px 10px", borderRadius: 10, border: "1px solid #1e40af", cursor: "pointer", background: "#1e3a8a", color: "#dbeafe", fontSize: 12, fontWeight: 700 }}>+10s</button>
               </>
@@ -1730,51 +2056,159 @@ function App() {
           </div>
         </div>
 
-        {/* SUB SUGGESTION — rule-driven; may bundle multiple subs */}
-        {pendingSub && !gameOver && (
-          <div style={{ background: pendingSub.mandatory ? "#7f1d1d" : "#164e63", borderRadius: 12, padding: "10px 14px", marginBottom: 10 }}>
-            <div style={{ color: pendingSub.mandatory ? "#fca5a5" : "#67e8f9", fontSize: 12, fontWeight: 700, marginBottom: 4 }}>
-              {pendingSub.mandatory
-                ? (pendingSub.subs.length > 1 ? `🔴 ${pendingSub.subs.length} SUBS NOW — required` : "🔴 SUB NOW — required")
-                : "🔴 SUB NOW"}
-            </div>
-            <div style={{ color: "#fff", fontSize: 13, marginBottom: 6 }}>
-              {pendingSub.reason}
-            </div>
-            {pendingSub.subs.map((s, i) => (
-              <div key={i} style={{ color: "#cbd5e1", fontSize: 12, marginBottom: 2 }}>
-                <span style={{ color: "#f87171" }}>OUT #{s.out.jersey} {s.out.name}</span>
-                <span style={{ color: "#64748b" }}> ({s.out.pos[0]})</span>
-                <span style={{ color: "#94a3b8" }}> → </span>
-                <span style={{ color: "#4ade80" }}>IN #{s.in.jersey} {s.in.name}</span>
-                <span style={{ color: "#64748b" }}> ({s.in.pos[0]})</span>
+        {/* SUB SUGGESTION — window-based with urgency levels */}
+        {pendingSub && !gameOver && (() => {
+          // Compute urgency from window timing
+          const wt = pendingSub.windowTarget;
+          const wsl = pendingSub.windowSoftLate;
+          const urgency = pendingSub.mandatory ? "mandatory"
+            : wt == null ? "mandatory"
+            : gameSecs >= wsl ? "overdue"
+            : gameSecs >= wt ? "due"
+            : "open";
+          const bgColor = urgency === "mandatory" || urgency === "overdue" ? "#7f1d1d"
+            : urgency === "due" ? "#164e63"
+            : "#1e3a5f";
+          const labelColor = urgency === "mandatory" || urgency === "overdue" ? "#fca5a5"
+            : urgency === "due" ? "#67e8f9"
+            : "#93c5fd";
+          const label = urgency === "mandatory"
+            ? (pendingSub.subs.length > 1 ? `🔴 ${pendingSub.subs.length} SUBS — required` : "🔴 SUB — required")
+            : urgency === "overdue"
+            ? "🔴 SUB OVERDUE — make change now"
+            : urgency === "due"
+            ? "🟡 SUB WINDOW — change at next dead ball"
+            : "🔵 WINDOW OPEN — sub when ready";
+          const btnBg = urgency === "mandatory" || urgency === "overdue" ? "#dc2626"
+            : urgency === "due" ? "#0284c7"
+            : "#1d4ed8";
+          return (
+            <div style={{ background: bgColor, borderRadius: 12, padding: "10px 14px", marginBottom: 10,
+              border: urgency === "overdue" ? "2px solid #ef4444" : "none" }}>
+              <div style={{ color: labelColor, fontSize: 12, fontWeight: 700, marginBottom: 4 }}>
+                {label}
               </div>
-            ))}
-            <button
-              onClick={() => {
-                doSubs(pendingSub.subs.map(s => ({ outJersey: s.out.jersey, inJersey: s.in.jersey })));
-                setPendingSub(null);
-              }}
-              style={{ marginTop: 8, width: "100%", padding: "10px", borderRadius: 10, border: "none", cursor: "pointer",
-                background: pendingSub.mandatory ? "#dc2626" : "#0284c7", color: "#fff", fontWeight: 700, fontSize: 14 }}>
-              {pendingSub.subs.length > 1
-                ? `✓ Confirm ${pendingSub.subs.length} Subs`
-                : "✓ Confirm Sub"}
-            </button>
-          </div>
-        )}
-        {!pendingSub && !gameOver && screen === "game" && plan && !showHalftime && (
-          <div style={{ background: "#042f2e", border: "1px solid #14b8a6", borderRadius: 12, padding: "8px 14px", marginBottom: 10, color: "#5eead4", fontSize: 12, fontWeight: 700 }}>
-            ✓ Rotation stable — no sub needed
-          </div>
-        )}
+              <div style={{ color: "#fff", fontSize: 13, marginBottom: 6 }}>
+                {pendingSub.reason}
+              </div>
+              {pendingSub.subs.map((s, i) => (
+                <div key={i} style={{ color: "#cbd5e1", fontSize: 12, marginBottom: 2 }}>
+                  {s.out ? (
+                    <>
+                      <span style={{ color: "#f87171" }}>OUT #{s.out.jersey} {s.out.name}</span>
+                      <span style={{ color: "#64748b" }}> ({s.out.pos[0]})</span>
+                      <span style={{ color: "#94a3b8" }}> → </span>
+                    </>
+                  ) : null}
+                  <span style={{ color: "#4ade80" }}>{s.out ? "IN" : "➕ ADD"} #{s.in.jersey} {s.in.name}</span>
+                  <span style={{ color: "#64748b" }}> ({s.in.pos[0]})</span>
+                </div>
+              ))}
+              <div style={{ display: "flex", gap: 8, marginTop: 8 }}>
+                <button
+                  onClick={() => withActionLock(() => {
+                    if (pendingSub.addOnly) {
+                      // Add-only: bring player onto court without removing anyone
+                      const inJersey = pendingSub.subs[0].in.jersey;
+                      if (onCourt.includes(inJersey) || onCourt.length >= 5) return;
+                      if (unavailableJerseys.has(inJersey)) return; // injured/fouled out since suggestion
+                      const now = gameSecs;
+                      setStintStart(prev => ({ ...prev, [inJersey]: now }));
+                      setOffSince(prev => { const n = { ...prev }; delete n[inJersey]; return n; });
+                      setOnCourt(prev => [...prev, inJersey]);
+                      setSubLog(prev => [...prev, {
+                        time: now, half, timeInHalf,
+                        subs: [{ out: null, in: pObj(inJersey) }],
+                      }]);
+                      setLastSubTime(now);
+                      setPendingSub(null);
+                      setRestedThisHalf(prev => { const next = new Set(prev); next.add(inJersey); return next; });
+                      markActiveWindowHandled();
+                    } else {
+                      const applied = doSubs(pendingSub.subs.map(s => ({ outJersey: s.out.jersey, inJersey: s.in.jersey })));
+                      if (applied > 0) {
+                        if (pendingSub.windowTarget != null && pendingSub.windowRoster != null) {
+                          const k = wKey(pendingSub.windowRoster, pendingSub.windowTarget);
+                          setHandledWindows(prev => new Set([...prev, k]));
+                        }
+                        // For mandatory subs without a windowTarget, still mark the
+                        // active rotation window so it doesn't reappear after quiet period.
+                        if (pendingSub.windowTarget == null && !pendingSub.reason?.startsWith("Closer")) {
+                          markActiveWindowHandled();
+                        }
+                      }
+                      setPendingSub(null);
+                    }
+                  })}
+                  style={{ flex: 1, padding: "10px", borderRadius: 10, border: "none", cursor: "pointer",
+                    background: btnBg, color: "#fff", fontWeight: 700, fontSize: 14 }}>
+                  {pendingSub.addOnly
+                    ? "✓ Add Player"
+                    : pendingSub.subs.length > 1
+                      ? `✓ Confirm ${pendingSub.subs.length} Subs`
+                      : "✓ Confirm Sub"}
+                </button>
+                {!pendingSub.mandatory && pendingSub.windowTarget != null && (
+                  <button
+                    onClick={() => withActionLock(() => {
+                      // Log the skipped window in the sub log
+                      setSubLog(prev => [...prev, {
+                        time: gameSecs,
+                        half,
+                        timeInHalf,
+                        skipped: true,
+                        reason: pendingSub.reason,
+                        windowTarget: pendingSub.windowTarget,
+                        suggestedSubs: pendingSub.subs.map(s => ({
+                          outJersey: s.out.jersey, outName: s.out.name,
+                          inJersey: s.in.jersey, inName: s.in.name,
+                        })),
+                      }]);
+                      if (pendingSub.windowRoster != null) {
+                        setHandledWindows(prev => new Set([...prev, wKey(pendingSub.windowRoster, pendingSub.windowTarget)]));
+                      }
+                      setPendingSub(null);
+                    })}
+                    style={{ padding: "10px 14px", borderRadius: 10, border: "1px solid #475569", cursor: "pointer",
+                      background: "#334155", color: "#94a3b8", fontWeight: 600, fontSize: 13 }}>
+                    Skip
+                  </button>
+                )}
+              </div>
+            </div>
+          );
+        })()}
+        {!pendingSub && !gameOver && screen === "game" && plan && !showHalftime && (() => {
+          // Show next window countdown
+          const activeRosterSize = available.length - fouledOut.size - injured.size;
+          const schedule = activeRosterSize > 5
+            ? getWindowSchedule(activeRosterSize, halfMins, START_BLOCK_SECS, CLOSE_BLOCK_SECS)
+            : [];
+          const nextWindow = schedule.find(w =>
+            gameSecs < w.openSecs && !handledWindows.has(wKey(activeRosterSize, w.targetSecs))
+          );
+          const countdown = nextWindow ? nextWindow.targetSecs - gameSecs : null;
+          return (
+            <div style={{ background: "#042f2e", border: "1px solid #14b8a6", borderRadius: 12, padding: "8px 14px", marginBottom: 10,
+              display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+              <span style={{ color: "#5eead4", fontSize: 12, fontWeight: 700 }}>
+                ✓ Rotation stable
+              </span>
+              {countdown != null && countdown > 0 && (
+                <span style={{ color: "#2dd4bf", fontSize: 11, fontWeight: 600 }}>
+                  next window {fmt(countdown)}
+                </span>
+              )}
+            </div>
+          );
+        })()}
 
         {/* ON COURT */}
         <div style={{ background: "#1e293b", borderRadius: 14, padding: 12, marginBottom: 10 }}>
           <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8 }}>
             <div style={{ color: "#4ade80", fontSize: 11, fontWeight: 700, letterSpacing: 1 }}>ON COURT ({onCourt.length})</div>
             {(() => {
-              const w3 = weakestThreeJerseys(available);
+              const w3 = activeWeakest3;
               if (w3.length < 3) return null;
               const courtObjs = onCourt.map(j => PLAYERS_DB.find(p => p.jersey === j)).filter(Boolean);
               const onCount = courtObjs.filter(p => w3.includes(p.jersey)).length;
@@ -1843,7 +2277,7 @@ function App() {
                     <div>{mins}:{secs.toString().padStart(2,"0")}</div>
                     <div style={{ color: "#64748b", fontSize: 10 }}>
                       /{target}m
-                      {Math.abs(ou) >= 20 && (
+                      {Math.abs(ou) >= 30 && (
                         <span style={{ marginLeft: 4, color: ou > 0 ? "#f87171" : "#4ade80", fontWeight: 700 }}>
                           {ou > 0 ? "+" : ""}{(ou / 60).toFixed(1)}m
                         </span>
@@ -1928,7 +2362,7 @@ function App() {
                         /{target}m
                         {Math.abs(ou) >= 30 && (
                           <span style={{ marginLeft: 4, color: ou > 0 ? "#f87171" : "#4ade80", fontWeight: 700 }}>
-                            {ou > 0 ? "+" : ""}{Math.round(ou / 60)}m
+                            {ou > 0 ? "+" : ""}{(ou / 60).toFixed(1)}m
                           </span>
                         )}
                       </div>
@@ -2033,7 +2467,7 @@ function App() {
                   color: entry.skipped ? "#94a3b8" : entry.emergency ? "#fb923c" : "#fbbf24",
                   fontSize: 11, fontWeight: 700, marginBottom: 3,
                 }}>
-                  {entry.skipped ? "⏭ SKIPPED" : entry.emergency ? "⚠️ EMERGENCY" : "🔄 SUB"} · H{entry.half} @ {fmt(entry.timeInHalf)}
+                  {entry.skipped ? "⏭ SKIPPED" : entry.emergency ? "⚠️ EMERGENCY" : entry.subs.some(s => !s.out) ? "➕ ADD" : "🔄 SUB"} · H{entry.half} @ {fmt(entry.timeInHalf)}
                 </div>
                 {entry.skipped ? (
                   <div style={{ fontSize: 12, color: "#64748b", fontStyle: "italic" }}>
@@ -2041,9 +2475,13 @@ function App() {
                   </div>
                 ) : entry.subs.map((s, j) => (
                   <div key={j} style={{ fontSize: 12, color: "#cbd5e1" }}>
-                    <span style={{ color: "#f87171" }}>OUT {s.out?.name ?? "?"}</span>
-                    <span style={{ color: "#64748b" }}> → </span>
-                    <span style={{ color: "#4ade80" }}>IN {s.in?.name ?? "?"}</span>
+                    {s.out ? (
+                      <>
+                        <span style={{ color: "#f87171" }}>OUT {s.out.name}</span>
+                        <span style={{ color: "#64748b" }}> → </span>
+                      </>
+                    ) : null}
+                    <span style={{ color: "#4ade80" }}>{s.out ? "IN" : "➕ ADD"} {s.in?.name ?? "?"}</span>
                   </div>
                 ))}
               </div>
@@ -2067,7 +2505,7 @@ function App() {
                 </div>
               );
             })}
-            <button onClick={() => setScreen("setup")} style={{ marginTop: 16, width: "100%", padding: "12px", borderRadius: 12, border: "none", background: "#1d4ed8", color: "#fff", fontSize: 15, fontWeight: 700, cursor: "pointer" }}>
+            <button onClick={discardSavedGame} style={{ marginTop: 16, width: "100%", padding: "12px", borderRadius: 12, border: "none", background: "#1d4ed8", color: "#fff", fontSize: 15, fontWeight: 700, cursor: "pointer" }}>
               New Game
             </button>
           </div>
@@ -2077,7 +2515,9 @@ function App() {
   );
 }
 
-ReactDOM.createRoot(document.getElementById('root')).render(React.createElement(App));
+
+const root = ReactDOM.createRoot(document.getElementById("root"));
+root.render(React.createElement(App));
 </script>
 </body>
 </html>
