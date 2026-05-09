@@ -2,17 +2,22 @@
 <html lang="en">
 <head>
 <meta charset="UTF-8" />
-<meta name="viewport" content="width=device-width, initial-scale=1.0" />
-<title>Coach K Sub Planner</title>
-<style>body { margin: 0; background: #0f172a; }</style>
-<script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
-<script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+<title>SubPlanner V3</title>
+<script src="https://unpkg.com/react@18/umd/react.production.min.js" crossorigin></script>
+<script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js" crossorigin></script>
 <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { background: #0f172a; overflow-x: hidden; }
+  #root { min-height: 100vh; }
+</style>
 </head>
 <body>
 <div id="root"></div>
 <script type="text/babel">
 const { useState, useEffect, useRef, useMemo, useId } = React;
+
 const PLAYERS_DB = [
   { jersey: 4,  name: "Lola",      rating: 2.7, asthma: false, foulProne: false, color: "#4A90E2", pos: ["PF", "C",  "SF"], skills: ["Passing", "Interior", "Perimeter"] },
   { jersey: 8,  name: "Aanya",     rating: 3.1, asthma: false, foulProne: false, color: "#7B68EE", pos: ["SG", "PG", "SF"], skills: ["Scoring", "BallHandle", "Passing"] },
@@ -248,35 +253,569 @@ function pickStarting5(players) {
   return on;
 }
 
-function generatePlan(players, halfMins, manualStarting5 = null) {
+// ── V3 PLAN-FIRST ROTATION GENERATOR ──────────────────────────────────────
+// Replaces the reactive cadence engine. Generates a full rotation grid before
+// tip-off. The live engine just follows the plan; reactive logic is demoted
+// to emergency-only (injury, foul-out, fewer than 5).
+
+const PLAN_MODES = {
+  balanced:    { fairnessWeight: 100, roleWeight: 30, devBoost: 0 },
+  competitive: { fairnessWeight: 50,  roleWeight: 90, devBoost: -20 },
+  development: { fairnessWeight: 110, roleWeight: 15, devBoost: 25 },
+};
+
+// Hard rules: lineup MUST satisfy these or the block is illegal
+function satisfiesHardRules(lineup) {
+  const has = skill => lineup.some(p => p.skills.includes(skill));
+  return has("BallHandle") && has("Passing");
+}
+
+// Soft rules: prefer but can bend. Returns array of warning strings.
+function checkSoftRules(lineup) {
+  const warnings = [];
+  if (!lineup.some(p => p.skills.includes("Scoring"))) warnings.push("No scorer");
+  if (!lineup.some(p => p.skills.includes("Interior"))) warnings.push("No interior");
+  if (!lineup.some(p => p.skills.includes("Perimeter"))) warnings.push("No perimeter D");
+  return warnings;
+}
+
+// Assign target minutes per player based on roster size and mode.
+// Returns { jersey: targetMins }. Uses clean block-compatible numbers.
+function assignTargetMinutes(players, starters, mode, halfMins) {
   const n = players.length;
-  if (n === 0) return { starting: [], h1Events: [], h2Events: [], targetMins: {} };
+  const totalCourtMins = 5 * halfMins * 2;
+  const starterSet = new Set(starters.map(p => p.jersey));
+
   if (n <= 5) {
+    return Object.fromEntries(players.map(p => [p.jersey, halfMins * 2]));
+  }
+
+  // Calculate high/low targets that divide cleanly into 2-min blocks
+  // totalCourtMins = highCount * highTarget + lowCount * lowTarget
+  // highCount + lowCount = n, all on court = 5 per minute
+  const slotsPerPlayer = totalCourtMins / n; // e.g. 22.22 for 9 players
+  const highTarget = Math.ceil(slotsPerPlayer / 2) * 2; // round up to even
+  const lowTarget = highTarget - 2; // always 2 less (one block difference)
+
+  // How many players get the high target?
+  // highCount * highTarget + (n - highCount) * lowTarget = totalCourtMins
+  // highCount * (highTarget - lowTarget) = totalCourtMins - n * lowTarget
+  const highCount = Math.round((totalCourtMins - n * lowTarget) / (highTarget - lowTarget));
+  const lowCount = n - highCount;
+
+  // Decide who gets high vs low based on mode
+  const sorted = [...players].sort((a, b) => {
+    const aStarter = starterSet.has(a.jersey) ? 1 : 0;
+    const bStarter = starterSet.has(b.jersey) ? 1 : 0;
+    if (mode === "competitive") {
+      return (b.rating + bStarter * 2) - (a.rating + aStarter * 2);
+    } else if (mode === "development") {
+      // Development players get boosted
+      const aDev = a.rating <= 2.5 ? 5 : 0;
+      const bDev = b.rating <= 2.5 ? 5 : 0;
+      return (b.rating + bStarter + bDev) - (a.rating + aStarter + aDev);
+    }
+    // Balanced: starters get high target
+    return (bStarter * 10 + b.rating) - (aStarter * 10 + a.rating);
+  });
+
+  const targets = {};
+  sorted.forEach((p, i) => {
+    targets[p.jersey] = i < highCount ? highTarget : lowTarget;
+  });
+  return targets;
+}
+
+// Build the segment timeline: array of { id, half, startSecs, endSecs, locked }
+function buildSegments(rosterSize, halfMins) {
+  const segments = [];
+  const halfSecs = halfMins * 60;
+  const blockSecs = 120; // 2-min internal granularity
+
+  for (let h = 1; h <= 2; h++) {
+    const baseOffset = (h - 1) * halfSecs;
+    let t = 0;
+    while (t < halfSecs) {
+      const startSecs = baseOffset + t;
+      const endSecs = baseOffset + Math.min(t + blockSecs, halfSecs);
+      const isStart = t < START_BLOCK_SECS;
+      const isClose = (baseOffset + halfSecs - t) <= CLOSE_BLOCK_SECS && h === 2;
+      const isH1Close = t >= (halfSecs - CLOSE_BLOCK_SECS) && h === 1;
+      segments.push({
+        id: `H${h}-${String(Math.floor(t/60)).padStart(2,"0")}-${String(Math.floor(Math.min(t+blockSecs,halfSecs)/60)).padStart(2,"0")}`,
+        half: h,
+        startSecs,
+        endSecs,
+        durationSecs: endSecs - startSecs,
+        locked: isStart || isClose || isH1Close,
+        lockReason: isStart ? "start-block" : (isClose || isH1Close) ? "close-block" : null,
+        onCourt: [],
+        warnings: [],
+      });
+      t += blockSecs;
+    }
+  }
+  return segments;
+}
+
+// Generate all C(n, 5) combinations of 5 players from roster
+function combinations(arr, k) {
+  if (k === 0) return [[]];
+  if (arr.length < k) return [];
+  const results = [];
+  function _combine(start, combo) {
+    if (combo.length === k) { results.push([...combo]); return; }
+    for (let i = start; i <= arr.length - (k - combo.length); i++) {
+      combo.push(arr[i]);
+      _combine(i + 1, combo);
+      combo.pop();
+    }
+  }
+  _combine(0, []);
+  return results;
+}
+
+// Score a candidate lineup for a segment during plan generation.
+function scoreLineup(lineup, segment, plan, targetMinutes, minutesUsed, mode, prevLineup, starterSet) {
+  const weights = PLAN_MODES[mode] || PLAN_MODES.balanced;
+  let score = 0;
+
+  // Fairness: prefer players who are furthest below their remaining target
+  for (const p of lineup) {
+    const remaining = (targetMinutes[p.jersey] || 0) - (minutesUsed[p.jersey] || 0);
+    score += remaining * weights.fairnessWeight;
+  }
+
+  // Role weight
+  if (mode === "competitive") {
+    score += lineup.reduce((s, p) => s + p.rating, 0) * weights.roleWeight;
+  }
+  if (mode === "development") {
+    const devCount = lineup.filter(p => p.rating <= 2.5).length;
+    score += devCount * weights.devBoost;
+  }
+
+  // Stint continuity: penalise heavily to discourage excessive stoppages
+  // These must outweigh fairness pulls (fairnessWeight * remaining) to keep lineups stable
+  if (prevLineup && prevLineup.length === 5) {
+    const prevSet = new Set(prevLineup.map(p => p.jersey));
+    const changes = lineup.filter(p => !prevSet.has(p.jersey)).length;
+    if (changes === 0) score -= 100; // no change = wasted window
+    if (changes > 0) score -= 200;   // base stoppage cost per change event
+    if (changes >= 3) score -= 300;  // heavy penalty for 3+ swaps at once
+    if (changes >= 4) score -= 500;  // extreme penalty for 4+ swaps at once
+  }
+
+  // Max consecutive blocks: penalise if any player has been on for many blocks straight
+  // (checked via minutesUsed growth — rough proxy)
+
+  // Soft skill bonus
+  const softWarnings = checkSoftRules(lineup);
+  score += (3 - softWarnings.length) * 10;
+
+  // Starter anchor bonus: prefer at least 1 starter in non-locked blocks
+  const starterCount = lineup.filter(p => starterSet.has(p.jersey)).length;
+  if (starterCount >= 1) score += 15;
+
+  return score;
+}
+
+// ── MAIN PLAN GENERATOR ─────────────────────────────────────────────────
+function generateRotationPlan(players, starters, halfMins, mode = "balanced") {
+  const n = players.length;
+  if (n === 0) return null;
+  if (n <= 5) {
+    const seg = buildSegments(n, halfMins);
+    seg.forEach(s => { s.onCourt = players.map(p => p.jersey); s.locked = true; });
     return {
-      starting: manualStarting5 || players,
-      h1Events: [],
-      h2Events: [],
-      targetMins: Object.fromEntries(players.map(p => [p.jersey, halfMins * 2])),
+      mode,
+      starters: players.map(p => p.jersey),
+      targetMinutes: Object.fromEntries(players.map(p => [p.jersey, halfMins * 2])),
+      segments: seg,
+      validation: { valid: true, spreadMins: 0, stoppages: 0, warnings: [] },
     };
   }
 
-  const totalSecs = halfMins * 2 * 60;
+  const starterSet = new Set(starters.map(p => p.jersey));
+  const targetMinutes = assignTargetMinutes(players, starters, mode, halfMins);
+  const segments = buildSegments(n, halfMins);
+  const minutesUsed = {};
+  players.forEach(p => { minutesUsed[p.jersey] = 0; });
 
-  // Target seconds per player: equal fair share for everyone.
-  const fairSecs = (5 * totalSecs) / n;
-  const targetSecs = {};
-  players.forEach(p => { targetSecs[p.jersey] = Math.round(fairSecs); });
+  // For 6 players: carousel mode
+  if (n === 6) {
+    return generateCarouselPlan(players, starters, halfMins, mode, targetMinutes, segments);
+  }
 
-  const starting5 = manualStarting5 || pickStarting5(players);
+  // Pre-compute all legal lineups (C(n,5), filter by hard rules)
+  const allLineups = combinations(players, 5).filter(satisfiesHardRules);
 
-  const targetMins = Object.fromEntries(
-    Object.entries(targetSecs).map(([j, s]) => [j, Math.round(s / 6) / 10])
-  );
+  // Step 1: Lock bookend blocks with starters
+  const starterLineup = starters.slice(0, 5);
+  const starterJerseys = starterLineup.map(p => p.jersey);
+  for (const seg of segments) {
+    if (seg.locked) {
+      seg.onCourt = starterJerseys;
+      const dur = seg.durationSecs / 60;
+      for (const j of starterJerseys) minutesUsed[j] = (minutesUsed[j] || 0) + dur;
+    }
+  }
 
-  // Rule-driven engine: no pre-computed sub events. h1Events / h2Events kept
-  // as empty arrays so the existing persistence / plan-screen code still
-  // renders without errors.
-  return { starting: starting5, h1Events: [], h2Events: [], targetMins };
+  // Step 2: Greedy fill for unlocked segments
+  let prevLineup = starterLineup;
+  for (const seg of segments) {
+    if (seg.locked) {
+      prevLineup = players.filter(p => seg.onCourt.includes(p.jersey));
+      continue;
+    }
+
+    let bestLineup = null;
+    let bestScore = -Infinity;
+    for (const lineup of allLineups) {
+      const s = scoreLineup(lineup, seg, segments, targetMinutes, minutesUsed, mode, prevLineup, starterSet);
+      if (s > bestScore) { bestScore = s; bestLineup = lineup; }
+    }
+
+    if (bestLineup) {
+      seg.onCourt = bestLineup.map(p => p.jersey);
+      seg.warnings = checkSoftRules(bestLineup);
+      const dur = seg.durationSecs / 60;
+      for (const p of bestLineup) minutesUsed[p.jersey] = (minutesUsed[p.jersey] || 0) + dur;
+      prevLineup = bestLineup;
+    } else {
+      // Fallback: use previous lineup
+      seg.onCourt = prevLineup.map(p => p.jersey);
+      const dur = seg.durationSecs / 60;
+      for (const p of prevLineup) minutesUsed[p.jersey] = (minutesUsed[p.jersey] || 0) + dur;
+    }
+  }
+
+  // Step 3: Repair pass — swap over/under players to reduce spread
+  for (let iter = 0; iter < 200; iter++) {
+    let worstOver = null, worstOverDelta = 0;
+    let worstUnder = null, worstUnderDelta = 0;
+    for (const p of players) {
+      const delta = (minutesUsed[p.jersey] || 0) - (targetMinutes[p.jersey] || 0);
+      if (delta > worstOverDelta) { worstOver = p; worstOverDelta = delta; }
+      if (delta < worstUnderDelta) { worstUnder = p; worstUnderDelta = delta; }
+    }
+    if (!worstOver || !worstUnder) break;
+    if (worstOverDelta - worstUnderDelta <= 2) break; // spread is acceptable
+
+    // Find a segment where we can swap worstOver for worstUnder
+    let swapped = false;
+    for (const seg of segments) {
+      if (seg.locked) continue;
+      const has = seg.onCourt.includes(worstOver.jersey);
+      const missing = !seg.onCourt.includes(worstUnder.jersey);
+      if (!has || !missing) continue;
+      // Try the swap
+      const newLineup = seg.onCourt.map(j => j === worstOver.jersey ? worstUnder.jersey : j);
+      const newPlayers = newLineup.map(j => players.find(p => p.jersey === j));
+      if (!satisfiesHardRules(newPlayers)) continue;
+      // Apply swap
+      const dur = seg.durationSecs / 60;
+      minutesUsed[worstOver.jersey] -= dur;
+      minutesUsed[worstUnder.jersey] += dur;
+      seg.onCourt = newLineup;
+      seg.warnings = checkSoftRules(newPlayers);
+      swapped = true;
+      break;
+    }
+    if (!swapped) break;
+  }
+
+  // Step 4: Validate
+  const totals = {};
+  players.forEach(p => { totals[p.jersey] = 0; });
+  for (const seg of segments) {
+    const dur = seg.durationSecs / 60;
+    for (const j of seg.onCourt) totals[j] = (totals[j] || 0) + dur;
+  }
+  const vals = Object.values(totals);
+  const spread = Math.round((Math.max(...vals) - Math.min(...vals)) * 10) / 10;
+  // Count stoppages (lineup changes between consecutive segments)
+  let stoppages = 0;
+  for (let i = 1; i < segments.length; i++) {
+    if (segments[i].half !== segments[i-1].half) continue; // halftime doesn't count
+    const prev = new Set(segments[i-1].onCourt);
+    const changes = segments[i].onCourt.filter(j => !prev.has(j)).length;
+    if (changes > 0) stoppages++;
+  }
+
+  const warnings = [];
+  for (const seg of segments) {
+    if (seg.warnings.length > 0) warnings.push({ segId: seg.id, warnings: seg.warnings });
+  }
+
+  return {
+    mode,
+    starters: starterJerseys,
+    targetMinutes,
+    actualMinutes: totals,
+    segments,
+    validation: { valid: true, spreadMins: spread, stoppages, warnings },
+  };
+}
+
+// 6-player carousel: one bench player rotates every 2 minutes
+function generateCarouselPlan(players, starters, halfMins, mode, targetMinutes, segments) {
+  const starterJerseys = starters.map(p => p.jersey);
+  const benchPlayer = players.find(p => !starterJerseys.includes(p.jersey));
+  if (!benchPlayer) {
+    // All 6 are starters somehow — just play everyone
+    segments.forEach(s => { s.onCourt = players.slice(0, 5).map(p => p.jersey); });
+    return { mode, starters: starterJerseys, targetMinutes,
+      actualMinutes: Object.fromEntries(players.map(p => [p.jersey, halfMins * 2])),
+      segments, validation: { valid: true, spreadMins: 0, stoppages: 0, warnings: [] } };
+  }
+
+  // Build rest order: weakest sits first, strongest sits last
+  const restOrder = [...players].sort((a, b) => a.rating - b.rating).map(p => p.jersey);
+
+  // Lock bookend blocks with starters
+  const bookendSegs = segments.filter(s => s.locked);
+  const middleSegs = segments.filter(s => !s.locked);
+  bookendSegs.forEach(s => { s.onCourt = starterJerseys; });
+
+  // Carousel through middle segments
+  let restIdx = 0;
+  for (const seg of middleSegs) {
+    const resting = restOrder[restIdx % restOrder.length];
+    seg.onCourt = players.filter(p => p.jersey !== resting).map(p => p.jersey).slice(0, 5);
+    restIdx++;
+  }
+
+  // Calculate actuals
+  const totals = {};
+  players.forEach(p => { totals[p.jersey] = 0; });
+  for (const seg of segments) {
+    const dur = seg.durationSecs / 60;
+    for (const j of seg.onCourt) totals[j] = (totals[j] || 0) + dur;
+  }
+  const vals = Object.values(totals);
+  const spread = Math.round((Math.max(...vals) - Math.min(...vals)) * 10) / 10;
+  let stoppages = 0;
+  for (let i = 1; i < segments.length; i++) {
+    if (segments[i].half !== segments[i-1].half) continue;
+    const prev = new Set(segments[i-1].onCourt);
+    if (segments[i].onCourt.some(j => !prev.has(j))) stoppages++;
+  }
+
+  return {
+    mode, starters: starterJerseys, targetMinutes, actualMinutes: totals, segments,
+    validation: { valid: true, spreadMins: spread, stoppages, warnings: [] },
+  };
+}
+
+// ── REROUTE: rebuild future plan after mid-game changes ─────────────────
+function reroutePlan(currentPlan, gameSecs, activePlayers, actualMinutesPlayed, reason, halfMins, actualOnCourt, targetMinutesOverride) {
+  const totalGameSecs = halfMins * 2 * 60;
+  const segments = currentPlan.segments;
+
+  // Freeze completed segments
+  const frozen = segments.filter(s => s.endSecs <= gameSecs);
+  const future = segments.filter(s => s.startSecs > gameSecs); // strictly > to avoid boundary duplication
+
+  // If no future segments, nothing to do
+  if (future.length === 0 && !segments.some(s => s.startSecs <= gameSecs && s.endSecs > gameSecs)) return currentPlan;
+
+  // Snap to next 2-min boundary for clean regeneration
+  const nextBoundary = Math.ceil(gameSecs / 120) * 120;
+  const futureFresh = future.filter(s => s.startSecs >= nextBoundary);
+
+  // Build transition segment from ACTUAL on-court lineup, not old plan segment.
+  // This ensures the injured/fouled-out player is never in the transition.
+  const activeJerseySet = new Set(activePlayers.map(p => p.jersey));
+  const transitionOnCourt = actualOnCourt
+    ? actualOnCourt.filter(j => activeJerseySet.has(j))
+    : (segments.find(s => s.startSecs <= gameSecs && s.endSecs > gameSecs)?.onCourt || []).filter(j => activeJerseySet.has(j));
+  const transition = nextBoundary > gameSecs ? {
+    id: `transition-${gameSecs}`,
+    half: gameSecs < halfMins * 60 ? 1 : 2,
+    startSecs: gameSecs,
+    endSecs: nextBoundary,
+    durationSecs: nextBoundary - gameSecs,
+    onCourt: transitionOnCourt,
+    locked: true,
+    lockReason: "actual-transition",
+    warnings: [],
+  } : null;
+
+  // Calculate remaining targets
+  const remainingCourtSecs = 5 * (totalGameSecs - gameSecs);
+  const remainingCourtMins = remainingCourtSecs / 60;
+  const remainingTargets = {};
+  for (const p of activePlayers) {
+    const played = actualMinutesPlayed[p.jersey] || 0;
+    const original = (targetMinutesOverride && targetMinutesOverride[p.jersey] != null)
+      ? targetMinutesOverride[p.jersey]
+      : currentPlan.targetMinutes[p.jersey];
+    if (original != null) {
+      remainingTargets[p.jersey] = Math.max(0, original - played);
+    } else {
+      // Late arrival: proportional share of remaining
+      remainingTargets[p.jersey] = remainingCourtMins / activePlayers.length;
+    }
+  }
+
+  // Rebuild future segments
+  const starterSet = new Set(currentPlan.starters);
+  const futureStarters = activePlayers.filter(p => starterSet.has(p.jersey));
+  // For future locked (close) blocks, use available starters or best available
+  const closers = futureStarters.length >= 5
+    ? futureStarters.slice(0, 5)
+    : [...futureStarters, ...activePlayers.filter(p => !starterSet.has(p.jersey))].slice(0, 5);
+
+  // Handle fewer than 5 active players — everyone plays every future minute
+  if (activePlayers.length < 5) {
+    const allJerseys = activePlayers.map(p => p.jersey);
+    for (const seg of futureFresh) {
+      seg.onCourt = allJerseys;
+      seg.warnings = [`Only ${activePlayers.length} active players`];
+    }
+    const totals = {};
+    activePlayers.forEach(p => { totals[p.jersey] = actualMinutesPlayed[p.jersey] || 0; });
+    for (const seg of futureFresh) {
+      const dur = seg.durationSecs / 60;
+      for (const j of seg.onCourt) totals[j] = (totals[j] || 0) + dur;
+    }
+    return {
+      ...currentPlan,
+      segments: [...frozen, ...(transition ? [transition] : []), ...futureFresh],
+      actualMinutes: totals,
+      rerouteReason: reason,
+      rerouteAtSecs: gameSecs,
+    };
+  }
+
+  // Exactly 5 active players — they all play every future minute
+  if (activePlayers.length === 5) {
+    const allJerseys = activePlayers.map(p => p.jersey);
+    for (const seg of futureFresh) {
+      seg.onCourt = allJerseys;
+      seg.warnings = [];
+    }
+    const totals = {};
+    activePlayers.forEach(p => { totals[p.jersey] = actualMinutesPlayed[p.jersey] || 0; });
+    for (const seg of futureFresh) {
+      const dur = seg.durationSecs / 60;
+      for (const j of seg.onCourt) totals[j] = (totals[j] || 0) + dur;
+    }
+    return {
+      ...currentPlan,
+      segments: [...frozen, ...(transition ? [transition] : []), ...futureFresh],
+      actualMinutes: totals,
+      rerouteReason: reason,
+      rerouteAtSecs: gameSecs,
+    };
+  }
+
+  const allLineups = combinations(activePlayers, 5).filter(satisfiesHardRules);
+  const minutesUsed = {};
+  activePlayers.forEach(p => { minutesUsed[p.jersey] = 0; });
+
+  let prevLineup = null;
+  for (const seg of futureFresh) {
+    if (seg.locked && (seg.lockReason === "close-block" || seg.lockReason === "start-block")) {
+      // Preserve bookend lineup: closers for close-block, starters for start-block
+      const bookendPlayers = seg.lockReason === "close-block" ? closers : futureStarters.length >= 5 ? futureStarters.slice(0, 5) : closers;
+      if (bookendPlayers.length > 0) {
+        seg.onCourt = bookendPlayers.map(p => p.jersey);
+      }
+      const dur = seg.durationSecs / 60;
+      for (const j of seg.onCourt) minutesUsed[j] = (minutesUsed[j] || 0) + dur;
+      prevLineup = bookendPlayers.length > 0 ? bookendPlayers : prevLineup;
+      continue;
+    }
+
+    let bestLineup = null;
+    let bestScore = -Infinity;
+    for (const lineup of allLineups) {
+      let score = 0;
+      for (const p of lineup) {
+        score += ((remainingTargets[p.jersey] || 0) - (minutesUsed[p.jersey] || 0)) * 100;
+      }
+      if (prevLineup) {
+        const prevSet = new Set(prevLineup.map(p => p.jersey));
+        const changes = lineup.filter(p => !prevSet.has(p.jersey)).length;
+        if (changes === 0) score -= 100;
+        if (changes > 0) score -= 200;
+        if (changes >= 3) score -= 300;
+        if (changes >= 4) score -= 500;
+      }
+      if (score > bestScore) { bestScore = score; bestLineup = lineup; }
+    }
+
+    if (bestLineup) {
+      seg.onCourt = bestLineup.map(p => p.jersey);
+      seg.warnings = checkSoftRules(bestLineup);
+      const dur = seg.durationSecs / 60;
+      for (const p of bestLineup) minutesUsed[p.jersey] = (minutesUsed[p.jersey] || 0) + dur;
+      prevLineup = bestLineup;
+    }
+    // Unlock previously locked non-close segments for flexibility
+    if (seg.locked && seg.lockReason !== "close-block" && seg.lockReason !== "start-block") seg.locked = false;
+  }
+
+  // Repair pass
+  for (let iter = 0; iter < 100; iter++) {
+    let worstOver = null, worstOverDelta = 0;
+    let worstUnder = null, worstUnderDelta = 0;
+    for (const p of activePlayers) {
+      const delta = (minutesUsed[p.jersey] || 0) - (remainingTargets[p.jersey] || 0);
+      if (delta > worstOverDelta) { worstOver = p; worstOverDelta = delta; }
+      if (delta < worstUnderDelta) { worstUnder = p; worstUnderDelta = delta; }
+    }
+    if (!worstOver || !worstUnder || worstOverDelta - worstUnderDelta <= 2) break;
+    let swapped = false;
+    for (const seg of futureFresh) {
+      if (seg.locked) continue;
+      if (!seg.onCourt.includes(worstOver.jersey) || seg.onCourt.includes(worstUnder.jersey)) continue;
+      const newLineup = seg.onCourt.map(j => j === worstOver.jersey ? worstUnder.jersey : j);
+      const newPlayers = newLineup.map(j => activePlayers.find(p => p.jersey === j));
+      if (!satisfiesHardRules(newPlayers)) continue;
+      const dur = seg.durationSecs / 60;
+      minutesUsed[worstOver.jersey] -= dur;
+      minutesUsed[worstUnder.jersey] += dur;
+      seg.onCourt = newLineup;
+      seg.warnings = checkSoftRules(newPlayers);
+      swapped = true;
+      break;
+    }
+    if (!swapped) break;
+  }
+
+  // Recalc actual totals
+  const totals = {};
+  activePlayers.forEach(p => { totals[p.jersey] = actualMinutesPlayed[p.jersey] || 0; });
+  for (const seg of futureFresh) {
+    const dur = seg.durationSecs / 60;
+    for (const j of seg.onCourt) totals[j] = (totals[j] || 0) + dur;
+  }
+
+  return {
+    ...currentPlan,
+    segments: [...frozen, ...(transition ? [transition] : []), ...futureFresh],
+    actualMinutes: totals,
+    rerouteReason: reason,
+    rerouteAtSecs: gameSecs,
+  };
+}
+
+// Legacy wrapper so existing code still works during transition
+function generatePlan(players, halfMins, manualStarting5 = null) {
+  const starters = manualStarting5 || pickStarting5(players);
+  const plan = generateRotationPlan(players, starters, halfMins, "balanced");
+  if (!plan) return { starting: [], h1Events: [], h2Events: [], targetMins: {} };
+  return {
+    starting: players.filter(p => plan.starters.includes(p.jersey)),
+    h1Events: [],
+    h2Events: [],
+    targetMins: Object.fromEntries(
+      Object.entries(plan.targetMinutes).map(([j, m]) => [j, Math.round(m * 10) / 10])
+    ),
+  };
 }
 
 
@@ -322,6 +861,147 @@ function App() {
   const [selected, setSelected] = useState(new Set(PLAYERS_DB.map(p => p.jersey)));
   const [starters, setStarters] = useState(new Set());
   const [plan, setPlan] = useState(null);
+  const [planMode, setPlanMode] = useState("balanced"); // balanced | competitive | development
+  const [rotationPlan, setRotationPlan] = useState(null); // V3 plan-first rotation grid
+  const [rerouteBanner, setRerouteBanner] = useState(null); // auto-dismiss reroute notification
+
+  // Editable grid state — grid[minuteIdx][playerIdx] = true/false
+  // Initialized from rotationPlan segments when plan screen opens
+  const [editableGrid, setEditableGrid] = useState(null);
+  const [gridPaintMode, setGridPaintMode] = useState(true);
+  const gridPainting = useRef(false);
+  const gridPaintValue = useRef(true);
+  // Stable player ordering for grid columns (set when grid is initialized)
+  const [gridPlayerOrder, setGridPlayerOrder] = useState([]);
+  // Column swap: first tap selects, second tap swaps
+  const [swapSelectedIdx, setSwapSelectedIdx] = useState(null);
+
+  // Planned timeouts — set of game minutes where coach wants a timeout reminder
+  const [plannedTimeouts, setPlannedTimeouts] = useState(new Set());
+  const [timeoutRemindersOn, setTimeoutRemindersOn] = useState(true);
+  const [dismissedTimeouts, setDismissedTimeouts] = useState(new Set());
+
+  // ── ROTATION TEMPLATES ──────────────────────────────────────────────────────
+  // Stored in localStorage. Each template: { name, playerCount, halfMins, grid (2D bool array) }
+  const TEMPLATES_KEY = "coachk_rotation_templates";
+  // Sanitize templates from localStorage to prevent corrupt data
+  function sanitizeTemplates(raw) {
+    if (!Array.isArray(raw)) return [];
+    return raw.filter(t =>
+      t &&
+      typeof t.name === "string" &&
+      Number.isFinite(t.playerCount) &&
+      Array.isArray(t.grid) &&
+      t.grid.every(row => Array.isArray(row))
+    );
+  }
+  const [savedTemplates, setSavedTemplates] = useState(() => {
+    try {
+      const raw = localStorage.getItem(TEMPLATES_KEY);
+      return raw ? sanitizeTemplates(JSON.parse(raw)) : [];
+    } catch { return []; }
+  });
+  const [templateNameInput, setTemplateNameInput] = useState("");
+  const [showSaveDialog, setShowSaveDialog] = useState(false);
+  const [showLoadDialog, setShowLoadDialog] = useState(false);
+  const [templateToast, setTemplateToast] = useState(null);
+
+  function persistTemplates(templates) {
+    setSavedTemplates(templates);
+    try { localStorage.setItem(TEMPLATES_KEY, JSON.stringify(templates)); } catch {}
+  }
+
+  function saveTemplate(name) {
+    if (!editableGrid || gridPlayerOrder.length === 0 || !name.trim()) return;
+    const playerCount = gridPlayerOrder.length;
+    const entry = {
+      id: Date.now(),
+      name: name.trim(),
+      playerCount,
+      halfMins,
+      grid: editableGrid,
+      playerOrder: gridPlayerOrder.map(p => p.jersey),
+      attendanceSignature: gridPlayerOrder.map(p => p.jersey).sort((a, b) => a - b).join("-"),
+      createdAt: new Date().toISOString(),
+    };
+    // Replace if same name + playerCount + attendanceSignature exists, otherwise add
+    const existing = savedTemplates.filter(t => !(t.name === entry.name && t.playerCount === playerCount && t.attendanceSignature === entry.attendanceSignature));
+    persistTemplates([...existing, entry]);
+    setShowSaveDialog(false);
+    setTemplateNameInput("");
+    showToast(`Saved "${entry.name}" (${playerCount} players)`);
+  }
+
+  function loadTemplate(template) {
+    if (!template || !template.grid) return;
+    const totalMins = halfMins * 2;
+    const playerCount = gridPlayerOrder.length;
+
+    // If template has a saved playerOrder, remap columns to match current gridPlayerOrder
+    let grid = template.grid;
+    if (Array.isArray(template.playerOrder) && template.playerOrder.length > 0) {
+      const templateOrder = template.playerOrder; // jersey array from when template was saved
+      const currentOrder = gridPlayerOrder.map(p => p.jersey);
+      // Build mapping: templateColIdx -> currentColIdx
+      const colMap = templateOrder.map(tj => currentOrder.indexOf(tj));
+      grid = grid.map(row => {
+        const newRow = new Array(playerCount).fill(false);
+        for (let ti = 0; ti < templateOrder.length; ti++) {
+          const ci = colMap[ti];
+          if (ci >= 0 && ci < playerCount && ti < row.length) {
+            newRow[ci] = row[ti];
+          }
+        }
+        return newRow;
+      });
+    }
+
+    // Template grid might be for different halfMins — scale if needed
+    if (grid.length !== totalMins) {
+      const scaled = [];
+      for (let m = 0; m < totalMins; m++) {
+        scaled[m] = m < grid.length ? grid[m].slice(0, playerCount) : new Array(playerCount).fill(false);
+      }
+      grid = scaled;
+    }
+    // If player count differs, pad/truncate columns
+    if (grid[0] && grid[0].length !== playerCount) {
+      grid = grid.map(row => {
+        const newRow = new Array(playerCount).fill(false);
+        for (let i = 0; i < Math.min(row.length, playerCount); i++) newRow[i] = row[i];
+        return newRow;
+      });
+    }
+    setEditableGrid(grid);
+    setShowLoadDialog(false);
+    showToast(`Loaded "${template.name}"`);
+  }
+
+  function deleteTemplate(id) {
+    persistTemplates(savedTemplates.filter(t => t.id !== id));
+    showToast("Template deleted");
+  }
+
+  function showToast(msg) {
+    setTemplateToast(msg);
+    setTimeout(() => setTemplateToast(null), 3000);
+  }
+
+  // Get templates matching current attendance (player count + exact roster)
+  function currentAttendanceSignature() {
+    return gridPlayerOrder.map(p => p.jersey).sort((a, b) => a - b).join("-");
+  }
+  function getMatchingTemplates() {
+    const playerCount = gridPlayerOrder.length;
+    const sig = currentAttendanceSignature();
+    return savedTemplates.filter(t => {
+      if (t.playerCount !== playerCount) return false;
+      // Require attendance signature — legacy templates without one skip auto-matching
+      if (!t.attendanceSignature) return false;
+      if (t.attendanceSignature !== sig) return false;
+      return true;
+    });
+  }
 
   // Live state
   const [gameSecs, setGameSecs] = useState(0);
@@ -373,6 +1053,24 @@ function App() {
   // bench-stint tracking.
   const [offSince, setOffSince] = useState({});
 
+  // ── SCORE & TIMEOUT TRACKING ────────────────────────────────────────────────
+  const [scoreUs, setScoreUs] = useState(0);
+  const [scoreOpponent, setScoreOpponent] = useState(0);
+  const [timeoutsUs, setTimeoutsUs] = useState(0);      // timeouts USED (not remaining)
+  const [timeoutsOpponent, setTimeoutsOpponent] = useState(0);
+
+  // ── UNDO STACK ──────────────────────────────────────────────────────────────
+  // Snapshots state before each destructive action. Max 5 deep.
+  const [undoStack, setUndoStack] = useState([]);
+  const [showWhySub, setShowWhySub] = useState(false); // toggle for "Why this sub?" disclosure
+  const [showScorePanel, setShowScorePanel] = useState(() => {
+    try { const v = localStorage.getItem("coachk-settings-scorePanel"); return v === null ? true : v === "true"; } catch { return true; }
+  }); // toggle for score/timeout panel
+  const [showPossessionArrow, setShowPossessionArrow] = useState(() => {
+    try { const v = localStorage.getItem("coachk-settings-possArrow"); return v === "true"; } catch { return false; }
+  }); // toggle for possession arrow
+  const [possessionLeft, setPossessionLeft] = useState(true); // current arrow direction
+
   // Injury accounting — for each injured jersey, records the game clock at injury
   // time and how many minutes of the injured player's remaining target were
   // redistributed to each active teammate. On return we pull back the unused
@@ -401,6 +1099,87 @@ function App() {
       setTimeout(() => { actionLockRef.current = false; }, 300);
     }
   };
+
+  // ── UNDO INFRASTRUCTURE ──────────────────────────────────────────────────────
+  // Capture all mutable game state into a plain object. Called BEFORE each
+  // destructive action so performUndo can restore the previous state.
+  function pushUndo(label) {
+    setUndoStack(prev => [...prev.slice(-4), {
+      label,
+      snapshot: {
+        gameSecs, running, onCourt: [...onCourt],
+        accumulated: { ...accumulated }, stintStart: { ...stintStart },
+        offSince: { ...offSince },
+        fouls: { ...fouls },
+        fouledOut: new Set(fouledOut), injured: new Set(injured),
+        adjustedTargetMins: { ...adjustedTargetMins },
+        subLog: [...subLog],
+        injuryInfo: { ...injuryInfo }, fouloutInfo: { ...fouloutInfo },
+        handledWindows: new Set(handledWindows),
+        restedThisHalf: new Set(restedThisHalf),
+        replacingJersey, pendingSub, lastSubTime,
+        halftimeDone, showHalftime,
+        scoreUs, scoreOpponent, timeoutsUs, timeoutsOpponent, possessionLeft,
+        // V3 plan-first state
+        rotationPlan: rotationPlan ? JSON.parse(JSON.stringify(rotationPlan)) : null,
+        editableGrid: editableGrid ? editableGrid.map(row => [...row]) : null,
+        gridPlayerOrderJerseys: gridPlayerOrder.map(p => p.jersey),
+        plannedTimeouts: new Set(plannedTimeouts),
+        dismissedTimeouts: new Set(dismissedTimeouts),
+        lastExecutedSegId,
+        planDelayUntilSecs,
+        delayedSegId,
+      },
+    }]);
+  }
+
+  function performUndo() {
+    if (undoStack.length === 0) return;
+    const { snapshot: s } = undoStack[undoStack.length - 1];
+    setUndoStack(prev => prev.slice(0, -1));
+    setGameSecs(s.gameSecs);
+    setRunning(s.running);
+    setOnCourt(s.onCourt);
+    setAccumulated(s.accumulated);
+    setStintStart(s.stintStart);
+    setOffSince(s.offSince);
+    setFouls(s.fouls);
+    setFouledOut(s.fouledOut);
+    setInjured(s.injured);
+    setAdjustedTargetMins(s.adjustedTargetMins);
+    setSubLog(s.subLog);
+    setInjuryInfo(s.injuryInfo);
+    setFouloutInfo(s.fouloutInfo);
+    setHandledWindows(s.handledWindows);
+    setRestedThisHalf(s.restedThisHalf);
+    setReplacingJersey(s.replacingJersey);
+    setPendingSub(s.pendingSub);
+    setLastSubTime(s.lastSubTime);
+    setHalftimeDone(s.halftimeDone);
+    setShowHalftime(s.showHalftime);
+    setScoreUs(s.scoreUs);
+    setScoreOpponent(s.scoreOpponent);
+    setTimeoutsUs(s.timeoutsUs);
+    setTimeoutsOpponent(s.timeoutsOpponent);
+    if (typeof s.possessionLeft === "boolean") setPossessionLeft(s.possessionLeft);
+    setActiveMenu(null);
+    setBenchMenu(null);
+    // V3 plan-first state restore
+    if (s.rotationPlan !== undefined) setRotationPlan(s.rotationPlan);
+    if (s.editableGrid !== undefined) setEditableGrid(s.editableGrid);
+    if (Array.isArray(s.gridPlayerOrderJerseys)) {
+      const order = s.gridPlayerOrderJerseys.map(j => PLAYERS_DB.find(p => p.jersey === j)).filter(Boolean);
+      if (order.length > 0) setGridPlayerOrder(order);
+    }
+    if (s.plannedTimeouts) setPlannedTimeouts(s.plannedTimeouts);
+    if (s.dismissedTimeouts) setDismissedTimeouts(s.dismissedTimeouts);
+    if (s.lastExecutedSegId !== undefined) setLastExecutedSegId(s.lastExecutedSegId);
+    if (s.planDelayUntilSecs !== undefined) setPlanDelayUntilSecs(s.planDelayUntilSecs);
+    if (s.delayedSegId !== undefined) setDelayedSegId(s.delayedSegId);
+    if (s.running) {
+      clockBaseRef.current = { wallMs: Date.now(), secs: s.gameSecs };
+    }
+  }
 
   // ── PERSISTENCE ─────────────────────────────────────────────────────────────
   // Save / restore full game state across browser refresh, tab close, mobile memory flush, etc.
@@ -443,12 +1222,37 @@ function App() {
         if (Array.isArray(s.subLog)) setSubLog(s.subLog);
         if (s.injuryInfo) setInjuryInfo(s.injuryInfo);
         if (s.fouloutInfo) setFouloutInfo(s.fouloutInfo);
-        if (typeof s.lastSubTime === "number") setLastSubTime(sanitizeNumSecs(s.lastSubTime));
+        if (typeof s.lastSubTime === "number") setLastSubTime(s.lastSubTime);
         if (s.offSince) setOffSince(s.offSince);
         if (Array.isArray(s.handledWindows)) setHandledWindows(new Set(s.handledWindows));
         if (Array.isArray(s.restedThisHalf)) setRestedThisHalf(new Set(s.restedThisHalf));
         if (typeof s.replacingJersey === "number" && validJerseys.has(s.replacingJersey)) setReplacingJersey(s.replacingJersey);
+        // Plan mode restore
+        if (typeof s.planMode === "string" && PLAN_MODES[s.planMode]) setPlanMode(s.planMode);
+        // Possession arrow restore
+        if (typeof s.possessionLeft === "boolean") setPossessionLeft(s.possessionLeft);
+        // Score & timeout restore
+        if (typeof s.scoreUs === "number") setScoreUs(s.scoreUs);
+        if (typeof s.scoreOpponent === "number") setScoreOpponent(s.scoreOpponent);
+        if (typeof s.timeoutsUs === "number") setTimeoutsUs(s.timeoutsUs);
+        if (typeof s.timeoutsOpponent === "number") setTimeoutsOpponent(s.timeoutsOpponent);
+        // V3 plan-first state restore
+        if (s.rotationPlan) setRotationPlan(s.rotationPlan);
+        if (Array.isArray(s.gridPlayerOrderJerseys)) {
+          const order = s.gridPlayerOrderJerseys
+            .map(j => PLAYERS_DB.find(p => p.jersey === j))
+            .filter(Boolean);
+          if (order.length > 0) setGridPlayerOrder(order);
+        }
+        if (Array.isArray(s.editableGrid)) setEditableGrid(s.editableGrid);
+        if (Array.isArray(s.plannedTimeouts)) setPlannedTimeouts(new Set(s.plannedTimeouts));
+        if (Array.isArray(s.dismissedTimeouts)) setDismissedTimeouts(new Set(s.dismissedTimeouts));
+        if (typeof s.timeoutRemindersOn === "boolean") setTimeoutRemindersOn(s.timeoutRemindersOn);
+        if (typeof s.lastExecutedSegId === "string") setLastExecutedSegId(s.lastExecutedSegId);
+        if (typeof s.planDelayUntilSecs === "number") setPlanDelayUntilSecs(s.planDelayUntilSecs);
+        if (typeof s.delayedSegId === "string") setDelayedSegId(s.delayedSegId);
         // pendingSub is NOT persisted — always recomputed from current state
+        // undoStack is NOT persisted — starts fresh on reload
         // Always start paused — never auto-resume the clock after a refresh
       }
     } catch (e) { /* ignore corrupted storage */ }
@@ -462,7 +1266,7 @@ function App() {
       const snapshot = {
         screen, halfMins,
         selected: [...selected], starters: [...starters],
-        plan,
+        plan, planMode,
         gameSecs, onCourt, accumulated, stintStart,
         halftimeDone,
         fouls,
@@ -472,12 +1276,27 @@ function App() {
         handledWindows: [...handledWindows],
         restedThisHalf: [...restedThisHalf],
         replacingJersey,
+        scoreUs, scoreOpponent, timeoutsUs, timeoutsOpponent,
+        possessionLeft,
+        // V3 plan-first state
+        rotationPlan: rotationPlan || null,
+        gridPlayerOrderJerseys: gridPlayerOrder.map(p => p.jersey),
+        editableGrid: editableGrid || null,
+        plannedTimeouts: [...plannedTimeouts],
+        dismissedTimeouts: [...dismissedTimeouts],
+        timeoutRemindersOn,
+        lastExecutedSegId: lastExecutedSegId || null,
+        planDelayUntilSecs: planDelayUntilSecs ?? null,
+        delayedSegId: delayedSegId || null,
       };
       localStorage.setItem(STORAGE_KEY, JSON.stringify(snapshot));
     } catch (e) { /* quota or serialization issue */ }
-  }, [screen, halfMins, selected, starters, plan, gameSecs, onCourt, accumulated, stintStart,
+  }, [screen, halfMins, selected, starters, plan, planMode, gameSecs, onCourt, accumulated, stintStart,
       halftimeDone, fouls, fouledOut, injured, adjustedTargetMins, subLog, injuryInfo, fouloutInfo,
-      lastSubTime, offSince, handledWindows, restedThisHalf, replacingJersey]);
+      lastSubTime, offSince, handledWindows, restedThisHalf, replacingJersey,
+      scoreUs, scoreOpponent, timeoutsUs, timeoutsOpponent, possessionLeft,
+      rotationPlan, gridPlayerOrder, editableGrid, plannedTimeouts, dismissedTimeouts,
+      timeoutRemindersOn, lastExecutedSegId, planDelayUntilSecs, delayedSegId]);
 
   function discardSavedGame() {
     try { localStorage.removeItem(STORAGE_KEY); } catch (e) {}
@@ -499,7 +1318,26 @@ function App() {
     setRestedThisHalf(new Set());
     setReplacingJersey(null);
     setHasSavedGame(false);
+    setScoreUs(0); setScoreOpponent(0);
+    setTimeoutsUs(0); setTimeoutsOpponent(0);
+    setUndoStack([]);
+    setShowWhySub(false);
+    // V3 plan-first state reset
+    setRotationPlan(null);
+    setEditableGrid(null);
+    setGridPlayerOrder([]);
+    setSwapSelectedIdx(null);
+    setPlannedTimeouts(new Set());
+    setDismissedTimeouts(new Set());
+    setLastExecutedSegId(null);
+    setPlanDelayUntilSecs(null);
+    setDelayedSegId(null);
+    setRerouteBanner(null);
   }
+
+  // Persist settings toggles independently of game state
+  useEffect(() => { try { localStorage.setItem("coachk-settings-scorePanel", String(showScorePanel)); } catch {} }, [showScorePanel]);
+  useEffect(() => { try { localStorage.setItem("coachk-settings-possArrow", String(showPossessionArrow)); } catch {} }, [showPossessionArrow]);
 
   useEffect(() => {
     if (running) {
@@ -592,16 +1430,195 @@ function App() {
     });
   }
 
+  // Build editable grid from rotation plan segments.
+  // Grid is per-minute granularity (each row = 1 game minute).
+  // grid[minuteIdx][playerIdx] = boolean (on court).
+  function buildEditableGridFromPlan(rp, players) {
+    const totalMins = halfMins * 2;
+    const grid = [];
+    // Sort players: starters first by rating desc, then bench by rating desc
+    const order = [...players].sort((a, b) => {
+      const aS = rp.starters.includes(a.jersey) ? 0 : 1;
+      const bS = rp.starters.includes(b.jersey) ? 0 : 1;
+      if (aS !== bS) return aS - bS;
+      return b.rating - a.rating;
+    });
+    for (let m = 0; m < totalMins; m++) {
+      const gameSec = m * 60; // start of this minute
+      // Find which segment covers this minute
+      const seg = rp.segments.find(s => gameSec >= s.startSecs && gameSec < s.endSecs);
+      const onCourt = seg ? new Set(seg.onCourt) : new Set();
+      grid[m] = order.map(p => onCourt.has(p.jersey));
+    }
+    return { grid, order };
+  }
+
+  // Sync editable grid back into rotationPlan segments.
+  // Generates 1-minute segments from the grid, then merges adjacent identical rows
+  // into larger segments. This preserves minute-level edits instead of only reading
+  // the first minute of each old segment.
+  // Returns the synced plan (also sets state) so callers can use it synchronously.
+  function syncGridToPlan() {
+    if (!editableGrid || !rotationPlan || gridPlayerOrder.length === 0) return null;
+    const rp = { ...rotationPlan };
+    const totalMins = halfMins * 2;
+
+    // Build fresh 1-minute segments from grid, then merge adjacent identical lineups
+    const rawSegs = [];
+    for (let m = 0; m < Math.min(editableGrid.length, totalMins); m++) {
+      const row = editableGrid[m];
+      const onCourt = gridPlayerOrder
+        .filter((p, idx) => row[idx])
+        .map(p => p.jersey);
+      const h = m < halfMins ? 1 : 2;
+      rawSegs.push({ startSecs: m * 60, endSecs: (m + 1) * 60, onCourt, half: h });
+    }
+
+    // Merge adjacent segments with identical lineups within the same half
+    const merged = [];
+    for (const seg of rawSegs) {
+      const prev = merged[merged.length - 1];
+      if (prev && prev.half === seg.half &&
+          prev.onCourt.length === seg.onCourt.length &&
+          prev.onCourt.every((j, i) => j === seg.onCourt[i])) {
+        prev.endSecs = seg.endSecs;
+        prev.durationSecs = prev.endSecs - prev.startSecs;
+      } else {
+        merged.push({
+          id: `grid-${seg.half}-${seg.startSecs}`,
+          half: seg.half,
+          startSecs: seg.startSecs,
+          endSecs: seg.endSecs,
+          durationSecs: seg.endSecs - seg.startSecs,
+          onCourt: seg.onCourt,
+          locked: seg.startSecs < 4 * 60
+            || (seg.startSecs >= (halfMins - 4) * 60 && seg.startSecs < halfMins * 60)
+            || (seg.startSecs >= halfMins * 60 && seg.startSecs < (halfMins + 4) * 60)
+            || seg.startSecs >= (totalMins - 4) * 60,
+          lockReason: (seg.startSecs < 4 * 60 || (seg.startSecs >= halfMins * 60 && seg.startSecs < (halfMins + 4) * 60))
+            ? "start-block"
+            : ((seg.startSecs >= (halfMins - 4) * 60 && seg.startSecs < halfMins * 60) || seg.startSecs >= (totalMins - 4) * 60)
+              ? "close-block"
+              : undefined,
+          warnings: [],
+        });
+      }
+    }
+
+    // Recalc validation
+    const totals = {};
+    gridPlayerOrder.forEach(p => { totals[p.jersey] = 0; });
+    for (const seg of merged) {
+      const dur = seg.durationSecs / 60;
+      for (const j of seg.onCourt) totals[j] = (totals[j] || 0) + dur;
+    }
+    const vals = Object.values(totals);
+    const spread = vals.length > 0 ? Math.round((Math.max(...vals) - Math.min(...vals)) * 10) / 10 : 0;
+    let stoppages = 0;
+    for (let i = 1; i < merged.length; i++) {
+      if (merged[i].half !== merged[i-1].half) continue;
+      const prev = new Set(merged[i-1].onCourt);
+      if (merged[i].onCourt.some(j => !prev.has(j))) stoppages++;
+    }
+    rp.segments = merged;
+    rp.actualMinutes = totals;
+    rp.validation = { ...rp.validation, spreadMins: spread, stoppages };
+    setRotationPlan(rp);
+    // Also update adjusted target display
+    setAdjustedTargetMins(prev => {
+      const next = { ...prev };
+      gridPlayerOrder.forEach(p => { next[p.jersey] = rp.targetMinutes[p.jersey]; });
+      return next;
+    });
+    return rp;
+  }
+
   function handleGeneratePlan() {
     const manualStarting5 = available.filter(p => starters.has(p.jersey));
+    // Generate V3 rotation plan (needed for targets, starters info, etc.)
+    const rp = generateRotationPlan(available, manualStarting5, halfMins, planMode);
+    setRotationPlan(rp);
+
+    // Build player order (starters first by rating, bench by rating)
+    const order = [...available].sort((a, b) => {
+      const aS = rp.starters.includes(a.jersey) ? 0 : 1;
+      const bS = rp.starters.includes(b.jersey) ? 0 : 1;
+      if (aS !== bS) return aS - bS;
+      return b.rating - a.rating;
+    });
+    setGridPlayerOrder(order);
+
+    // Check for saved template matching this exact roster (attendance signature)
+    const sig = order.map(p => p.jersey).sort((a, b) => a - b).join("-");
+    const matching = savedTemplates.filter(t => {
+      if (t.playerCount !== available.length) return false;
+      if (!t.attendanceSignature) return false; // reject legacy templates
+      if (t.attendanceSignature !== sig) return false;
+      return true;
+    });
+    if (matching.length > 0) {
+      // Auto-load the most recent matching template
+      const best = matching[matching.length - 1];
+      const totalMins = halfMins * 2;
+      let grid = best.grid;
+      // If template has playerOrder, remap columns to match current order
+      if (Array.isArray(best.playerOrder) && best.playerOrder.length > 0) {
+        const currentOrder = order.map(p => p.jersey);
+        const colMap = best.playerOrder.map(tj => currentOrder.indexOf(tj));
+        grid = grid.map(row => {
+          const newRow = new Array(available.length).fill(false);
+          for (let ti = 0; ti < best.playerOrder.length; ti++) {
+            const ci = colMap[ti];
+            if (ci >= 0 && ci < available.length && ti < row.length) {
+              newRow[ci] = row[ti];
+            }
+          }
+          return newRow;
+        });
+      }
+      // Scale rows if halfMins differs
+      if (grid.length !== totalMins) {
+        const scaled = [];
+        for (let m = 0; m < totalMins; m++) {
+          scaled[m] = m < grid.length ? grid[m].slice(0, available.length) : new Array(available.length).fill(false);
+        }
+        grid = scaled;
+      }
+      if (grid[0] && grid[0].length !== available.length) {
+        grid = grid.map(row => {
+          const newRow = new Array(available.length).fill(false);
+          for (let i = 0; i < Math.min(row.length, available.length); i++) newRow[i] = row[i];
+          return newRow;
+        });
+      }
+      setEditableGrid(grid);
+      showToast(`Loaded "${best.name}" template`);
+    } else if (rp && rp.segments) {
+      // No template — fall back to algorithm-generated grid
+      const { grid } = buildEditableGridFromPlan(rp, available);
+      setEditableGrid(grid);
+    }
+
+    // Legacy plan for backwards compat (rotationPlan is the single source of truth)
     const newPlan = generatePlan(available, halfMins, manualStarting5);
     setPlan(newPlan);
-    setAdjustedTargetMins({ ...newPlan.targetMins });
+    setAdjustedTargetMins(rp ? { ...Object.fromEntries(
+      Object.entries(rp.targetMinutes).map(([j, m]) => [j, Math.round(m * 10) / 10])
+    )} : { ...newPlan.targetMins });
     setScreen("plan");
   }
 
   function handleStartGame() {
-    const courtJerseys = plan.starting.map(p => p.jersey);
+    // Sync editable grid back into rotationPlan before starting
+    const syncedPlan = syncGridToPlan();
+    // Use synced plan's first segment lineup if available, fallback to plan.starting
+    let courtJerseys;
+    const firstSeg = syncedPlan?.segments?.[0] || rotationPlan?.segments?.[0];
+    if (firstSeg && firstSeg.onCourt && firstSeg.onCourt.length === 5) {
+      courtJerseys = firstSeg.onCourt;
+    } else {
+      courtJerseys = plan.starting.map(p => p.jersey);
+    }
     const acc = {}, stint = {};
     const off = {};
     available.forEach(p => {
@@ -623,7 +1640,9 @@ function App() {
     setActiveMenu(null);
     setBenchMenu(null);
     setReplacingJersey(null);
-    setAdjustedTargetMins({ ...plan.targetMins });
+    // Use V3 plan targets if available, fallback to reactive engine targets
+    const targetSource = syncedPlan?.targetMinutes || rotationPlan?.targetMinutes || plan?.targetMins || {};
+    setAdjustedTargetMins({ ...targetSource });
     setSubLog([]);
     setLastSubTime(-120);
     setPendingSub(null);
@@ -635,6 +1654,11 @@ function App() {
       .filter(p => !courtJerseys.includes(p.jersey))
       .map(p => p.jersey);
     setRestedThisHalf(new Set(initialBench));
+    setScoreUs(0); setScoreOpponent(0);
+    setTimeoutsUs(0); setTimeoutsOpponent(0);
+    setUndoStack([]);
+    setShowWhySub(false);
+    setDismissedTimeouts(new Set());
     setScreen("game");
   }
 
@@ -732,19 +1756,39 @@ function App() {
 
   function handleStartSecondHalf() {
     withActionLock(() => {
+    pushUndo("Start 2nd half");
     const now = halfMins * 60;
     const unavail = jersey => fouledOut.has(jersey) || injured.has(jersey);
 
-    // Flush stints so courtTime reflects end-of-H1 totals
-    setAccumulated(prev => {
-      const next = { ...prev };
-      Object.keys(stintStart).forEach(j => {
-        next[j] = (next[j] || 0) + (now - (stintStart[j] ?? now));
-      });
-      return next;
+    // Compute flushed accumulated into a local variable BEFORE async setState
+    // so reroute math (below) uses correct H1 totals, not stale closure values
+    const flushedAccumulated = { ...accumulated };
+    Object.keys(stintStart).forEach(j => {
+      flushedAccumulated[j] = (flushedAccumulated[j] || 0) + (now - (stintStart[j] ?? now));
     });
+    setAccumulated(flushedAccumulated);
 
-    const { courtJerseys } = computeSecondHalfLineup();
+    // Use plan's H2 starting lineup if available
+    let courtJerseys;
+    if (rotationPlan && rotationPlan.segments) {
+      const h2Start = rotationPlan.segments.find(s => s.half === 2);
+      if (h2Start && h2Start.onCourt) {
+        courtJerseys = h2Start.onCourt.filter(j => !unavail(j));
+        // If injuries/fouls reduced the H2 lineup, backfill from bench
+        if (courtJerseys.length < 5) {
+          const activeBench = available.filter(p =>
+            !courtJerseys.includes(p.jersey) && !unavail(p.jersey));
+          for (const p of activeBench) {
+            if (courtJerseys.length >= 5) break;
+            courtJerseys.push(p.jersey);
+          }
+        }
+      } else {
+        courtJerseys = computeSecondHalfLineup().courtJerseys;
+      }
+    } else {
+      courtJerseys = computeSecondHalfLineup().courtJerseys;
+    }
 
     const stint = {};
     courtJerseys.forEach(j => { stint[j] = now; });
@@ -759,7 +1803,7 @@ function App() {
     setHalftimeDone(true);
     setShowHalftime(false);
     setRunning(false);
-    setLastSubTime(now - 120);
+    setLastSubTime(now); // H2 grace: engine sees "just subbed" → waits before firing
     setPendingSub(null);
     setHandledWindows(new Set());
     // Seed carousel for H2: bench players start as "rested"
@@ -767,6 +1811,17 @@ function App() {
       .filter(p => !courtJerseys.includes(p.jersey) && !unavail(p.jersey))
       .map(p => p.jersey);
     setRestedThisHalf(new Set(h2Bench));
+    // If any player was injured/fouled-out during halftime, reroute to update H2 plan
+    if (rotationPlan && (fouledOut.size > 0 || injured.size > 0)) {
+      const activePlayers = available.filter(p => !unavail(p.jersey));
+      const actualMins = {};
+      for (const p of available) {
+        actualMins[p.jersey] = (flushedAccumulated[p.jersey] || 0) / 60;
+      }
+      const newPlan = reroutePlan(rotationPlan, now, activePlayers, actualMins, "H2 roster update", halfMins, courtJerseys);
+      setRotationPlan(newPlan);
+      setLastExecutedSegId(null);
+    }
     }); // withActionLock
   }
 
@@ -774,6 +1829,27 @@ function App() {
     const base = accumulated[jersey] || 0;
     if (stintStart[jersey] !== undefined) return base + (gameSecs - stintStart[jersey]);
     return base;
+  }
+
+  // Window absorption: after a confirmed sub, consume any upcoming rotation
+  // window within absorbSecs so the engine doesn't fire again immediately.
+  function markNearbyWindowHandled(absorbSecs = 90) {
+    const rosterForCadence = available.length - fouledOut.size - injured.size;
+    if (rosterForCadence <= 5) return;
+    const schedule = getWindowSchedule(rosterForCadence, halfMins, START_BLOCK_SECS, CLOSE_BLOCK_SECS);
+    const nearby = schedule.filter(w =>
+      !w.isCloser &&
+      !handledWindows.has(wKey(rosterForCadence, w.targetSecs)) &&
+      gameSecs >= w.openSecs - absorbSecs &&
+      gameSecs <= w.hardLateSecs
+    );
+    if (nearby.length > 0) {
+      setHandledWindows(prev => {
+        const next = new Set(prev);
+        for (const w of nearby) next.add(wKey(rosterForCadence, w.targetSecs));
+        return next;
+      });
+    }
   }
 
   function doSubs(subList) {
@@ -832,7 +1908,9 @@ function App() {
       return next;
     });
     // Rule engine: sub resets cooldown, clears pending suggestion.
+    // Bigger bundles buy more quiet time (120s for 2+, 90s for singles).
     setLastSubTime(now);
+    markNearbyWindowHandled(subList.length >= 2 ? 120 : 90);
     setPendingSub(null);
     // Log the sub
     const logEntry = {
@@ -851,13 +1929,49 @@ function App() {
   //  now handle their own redistribution inline, and record the info needed for
   //  time-aware clawback on Undo / Return.)
 
+  // ── REROUTE: recalculate plan when roster changes mid-game ──────────────────
+  // triggerReroute accepts explicit roster overrides to avoid stale React state.
+  // opts.removeJersey / opts.removeJerseys: jerseys to exclude even if not yet in injured/fouledOut state
+  // opts.addJersey: jersey to include even if still in injured/fouledOut state (returning player)
+  // opts.currentOnCourt: explicit on-court lineup to use for transition segment
+  function triggerReroute(reason, opts = {}) {
+    if (!rotationPlan) return;
+    const removeSet = new Set(opts.removeJerseys || []);
+    if (opts.removeJersey != null) removeSet.add(opts.removeJersey);
+    const addSet = new Set();
+    if (opts.addJersey != null) addSet.add(opts.addJersey);
+
+    const activePlayers = available.filter(p => {
+      if (removeSet.has(p.jersey)) return false;
+      if (addSet.has(p.jersey)) return true;
+      return !fouledOut.has(p.jersey) && !injured.has(p.jersey);
+    });
+    // Build actual minutes played so far
+    const actualMins = {};
+    for (const p of available) {
+      const base = accumulated[p.jersey] || 0;
+      const stint = stintStart[p.jersey] != null ? gameSecs - stintStart[p.jersey] : 0;
+      actualMins[p.jersey] = (base + stint) / 60;
+    }
+    // Pass current on-court lineup for accurate transition segment
+    const actualOnCourt = opts.currentOnCourt || onCourt;
+    const targetOverride = opts.targetMinutesOverride || adjustedTargetMins;
+    const newPlan = reroutePlan(rotationPlan, gameSecs, activePlayers, actualMins, reason, halfMins, actualOnCourt, targetOverride);
+    setRotationPlan(newPlan);
+    setLastExecutedSegId(null); // force re-evaluation at next tick
+    // Show auto-dismissing banner
+    setRerouteBanner(reason);
+    setTimeout(() => setRerouteBanner(null), 5000);
+  }
+
 
   // Mark player fouled out. Same minutes model as injury: take remaining target
   // and split it across active teammates, freeze player's target at played time,
   // and store a fouloutInfo record so Undo can do a time-aware partial clawback.
-  function markFouledOut(jersey) {
+  function markFouledOut(jersey, { skipUndo = false } = {}) {
     if (fouledOut.has(jersey) || injured.has(jersey)) return;
     withActionLock(() => {
+    if (!skipUndo) pushUndo("Foul out #" + jersey);
     setActiveMenu(null);
     setBenchMenu(null);
 
@@ -875,19 +1989,19 @@ function App() {
       .map(p => p.jersey)
       .filter(j => j !== jersey && !fouledOut.has(j) && !injured.has(j));
 
+    // Compute next targets LOCALLY to avoid stale closure in triggerReroute
+    let nextTargets = { ...(plan?.targetMins || {}), ...adjustedTargetMins };
     if (remainingMins > 0 && others.length > 0) {
       const perOtherMins = remainingMins / others.length;
-      setAdjustedTargetMins(prev => {
-        const base = { ...(plan?.targetMins || {}), ...prev };
-        base[jersey] = playedSecs / 60; // freeze target at minutes already played
-        others.forEach(j => { base[j] = (base[j] || 0) + perOtherMins; });
-        return base;
-      });
+      nextTargets[jersey] = playedSecs / 60;
+      others.forEach(j => { nextTargets[j] = (nextTargets[j] || 0) + perOtherMins; });
+      setAdjustedTargetMins(nextTargets);
       setFouloutInfo(prev => ({
         ...prev,
         [jersey]: { startSecs: now, remainingMins, perOtherMins, others },
       }));
     } else {
+      setAdjustedTargetMins(nextTargets);
       setFouloutInfo(prev => ({
         ...prev,
         [jersey]: { startSecs: now, remainingMins: 0, perOtherMins: 0, others: [] },
@@ -895,8 +2009,6 @@ function App() {
     }
 
     setFouledOut(prev => new Set([...prev, jersey]));
-    // Fouled-out players are unavailable, not on the bench — clear offSince
-    // so they don't count in "longest bench stint" fairness calcs.
     setOffSince(prev => { const n = { ...prev }; delete n[jersey]; return n; });
 
     if (wasOnCourt) {
@@ -908,6 +2020,13 @@ function App() {
       setStintStart(prev => { const n = { ...prev }; delete n[jersey]; return n; });
       setReplacingJersey(jersey);
     }
+    // Reroute plan — pass locally computed targets to avoid stale closure
+    const p = pObj(jersey);
+    triggerReroute(`#${jersey} ${p?.name || ""} fouled out`, {
+      removeJersey: jersey,
+      currentOnCourt: wasOnCourt ? onCourt.filter(j => j !== jersey) : onCourt,
+      targetMinutesOverride: nextTargets,
+    });
     }); // withActionLock
   }
 
@@ -919,6 +2038,7 @@ function App() {
   function markInjured(jersey) {
     if (injured.has(jersey) || fouledOut.has(jersey)) return;
     withActionLock(() => {
+    pushUndo("Injury #" + jersey);
     setActiveMenu(null);
     setBenchMenu(null);
 
@@ -940,27 +2060,19 @@ function App() {
       .map(p => p.jersey)
       .filter(j => j !== jersey && !fouledOut.has(j) && !injured.has(j));
 
+    // Compute next targets LOCALLY to avoid stale closure in triggerReroute
+    let nextTargets = { ...(plan?.targetMins || {}), ...adjustedTargetMins };
     if (remainingMins > 0 && others.length > 0) {
       const perOtherMins = remainingMins / others.length;
-      setAdjustedTargetMins(prev => {
-        // Establish a working base: whatever's already in adjustedTargetMins,
-        // falling back to plan.targetMins for any missing jersey
-        const base = { ...(plan?.targetMins || {}), ...prev };
-        base[jersey] = playedSecs / 60; // freeze their target at minutes already played
-        others.forEach(j => { base[j] = (base[j] || 0) + perOtherMins; });
-        return base;
-      });
+      nextTargets[jersey] = playedSecs / 60;
+      others.forEach(j => { nextTargets[j] = (nextTargets[j] || 0) + perOtherMins; });
+      setAdjustedTargetMins(nextTargets);
       setInjuryInfo(prev => ({
         ...prev,
-        [jersey]: {
-          startSecs: now,
-          remainingMins,
-          perOtherMins,
-          others,
-        },
+        [jersey]: { startSecs: now, remainingMins, perOtherMins, others },
       }));
     } else {
-      // No redistribution possible — still record the start for UI elapsed timer
+      setAdjustedTargetMins(nextTargets);
       setInjuryInfo(prev => ({
         ...prev,
         [jersey]: { startSecs: now, remainingMins: 0, perOtherMins: 0, others: [] },
@@ -968,7 +2080,6 @@ function App() {
     }
 
     setInjured(prev => new Set([...prev, jersey]));
-    // Injured players are unavailable — clear offSince.
     setOffSince(prev => { const n = { ...prev }; delete n[jersey]; return n; });
 
     if (wasOnCourt) {
@@ -980,6 +2091,13 @@ function App() {
       setStintStart(prev => { const n = { ...prev }; delete n[jersey]; return n; });
       setReplacingJersey(jersey);
     }
+    // Reroute plan — pass locally computed targets to avoid stale closure
+    const p = pObj(jersey);
+    triggerReroute(`#${jersey} ${p?.name || ""} injured`, {
+      removeJersey: jersey,
+      currentOnCourt: wasOnCourt ? onCourt.filter(j => j !== jersey) : onCourt,
+      targetMinutesOverride: nextTargets,
+    });
     }); // withActionLock
   }
 
@@ -1003,6 +2121,7 @@ function App() {
   function manualSubOut(jersey) {
     if (!onCourt.includes(jersey)) return;
     withActionLock(() => {
+      pushUndo("Sub out #" + jersey);
       const now = gameSecs;
       setAccumulated(prev => ({
         ...prev,
@@ -1017,6 +2136,7 @@ function App() {
       // Manual sub resets the cooldown, clears pending, marks active window,
       // and adds the player to carousel memory.
       setLastSubTime(now);
+      markNearbyWindowHandled();
       setPendingSub(null);
       markActiveWindowHandled();
       setRestedThisHalf(prev => { const next = new Set(prev); next.add(jersey); return next; });
@@ -1032,10 +2152,12 @@ function App() {
       const p = PLAYERS_DB.find(pl => pl.jersey === jersey);
       const name = p ? `#${p.jersey} ${p.name}` : `#${jersey}`;
       if (window.confirm(`5th foul for ${name}. Foul out this player?`)) {
+        pushUndo("5th foul + foul out #" + jersey);
         setFouls(prev => ({ ...prev, [jersey]: Math.max(prev[jersey] || 0, 5) }));
-        setTimeout(() => markFouledOut(jersey), 0);
+        setTimeout(() => markFouledOut(jersey, { skipUndo: true }), 0);
       }
     } else {
+      pushUndo("Foul #" + jersey);
       // Use functional updater to avoid stale closure under rapid taps
       setFouls(prev => {
         const c = prev[jersey] || 0;
@@ -1045,6 +2167,7 @@ function App() {
     }
   }
   function removeFoul(jersey) {
+    pushUndo("Remove foul #" + jersey);
     setFouls(prev => {
       const cur = prev[jersey] || 0;
       if (cur <= 0) return prev;
@@ -1060,6 +2183,7 @@ function App() {
   function clearInjury(jersey) {
     if (!injured.has(jersey)) return;
     withActionLock(() => {
+      pushUndo("Return #" + jersey);
       const info = injuryInfo[jersey];
       setInjured(prev => { const n = new Set(prev); n.delete(jersey); return n; });
       // Returning player has been resting — add to carousel memory
@@ -1067,8 +2191,19 @@ function App() {
       // Returning player goes to bench: start their bench-stint clock now.
       setOffSince(prev => ({ ...prev, [jersey]: gameSecs }));
 
+      // Helper: reroute plan to re-include returning player
+      const rerouteReturn = () => {
+        if (rotationPlan) {
+          setTimeout(() => {
+            const p = pObj(jersey);
+            triggerReroute(`#${jersey} ${p?.name || ""} returned from injury`, { addJersey: jersey });
+          }, 0);
+        }
+      };
+
       if (!info || info.remainingMins <= 0 || info.others.length === 0) {
         setInjuryInfo(prev => { const n = { ...prev }; delete n[jersey]; return n; });
+        rerouteReturn();
         return;
       }
 
@@ -1091,6 +2226,7 @@ function App() {
       }
 
       setInjuryInfo(prev => { const n = { ...prev }; delete n[jersey]; return n; });
+      rerouteReturn();
     });
   }
 
@@ -1101,6 +2237,7 @@ function App() {
   function undoFoulOut(jersey) {
     if (!fouledOut.has(jersey)) return;
     withActionLock(() => {
+      pushUndo("Undo foul-out #" + jersey);
       const info = fouloutInfo[jersey];
 
       setFouledOut(prev => { const n = new Set(prev); n.delete(jersey); return n; });
@@ -1109,8 +2246,19 @@ function App() {
       setFouls(prev => ({ ...prev, [jersey]: 4 }));
       setOffSince(prev => ({ ...prev, [jersey]: gameSecs }));
 
+      // Helper: reroute plan to re-include returning player
+      const rerouteReturn = () => {
+        if (rotationPlan) {
+          setTimeout(() => {
+            const p = pObj(jersey);
+            triggerReroute(`#${jersey} ${p?.name || ""} returned from foul-out`, { addJersey: jersey });
+          }, 0);
+        }
+      };
+
       if (!info || info.remainingMins <= 0 || info.others.length === 0) {
         setFouloutInfo(prev => { const n = { ...prev }; delete n[jersey]; return n; });
+        rerouteReturn();
         return;
       }
 
@@ -1131,6 +2279,7 @@ function App() {
       }
 
       setFouloutInfo(prev => { const n = { ...prev }; delete n[jersey]; return n; });
+      rerouteReturn();
     });
   }
 
@@ -1141,6 +2290,7 @@ function App() {
     if (onCourt.length >= 5) return;
     if (unavailableJerseys.has(inJersey)) return;
     withActionLock(() => {
+      pushUndo("Emergency sub #" + inJersey);
       const now = gameSecs;
       setStintStart(prev => ({ ...prev, [inJersey]: now }));
       setOffSince(prev => { const n = { ...prev }; delete n[inJersey]; return n; });
@@ -1152,6 +2302,7 @@ function App() {
       }]);
       setReplacingJersey(null);
       setLastSubTime(now);
+      markNearbyWindowHandled();
       setPendingSub(null);
       markActiveWindowHandled();
       // Carousel memory: the incoming player just rested on the bench, so mark
@@ -1235,6 +2386,143 @@ function App() {
   //
   // This replaces the old continuous-trigger engine. The coach sees fewer,
   // more predictable stoppages while maintaining fairness.
+  // ── PLAN-BASED SUB EXECUTOR ──────────────────────────────────────────────────
+  // When rotationPlan exists, this effect drives sub suggestions by comparing
+  // the current on-court lineup to the plan's segment at the current gameSecs.
+  // It fires at segment boundaries and shows Confirm/Delay/Skip.
+  const [lastExecutedSegId, setLastExecutedSegId] = useState(null);
+  const [planDelayUntilSecs, setPlanDelayUntilSecs] = useState(null);
+  const [delayedSegId, setDelayedSegId] = useState(null);
+
+  useEffect(() => {
+    if (!rotationPlan || !plan || gameOver || showHalftime || screen !== "game" || replacingJersey != null) return;
+
+    const segs = rotationPlan.segments;
+    if (!segs || segs.length === 0) return;
+
+    // Find current segment based on gameSecs
+    const currentSeg = segs.find(s => gameSecs >= s.startSecs && gameSecs < s.endSecs)
+      || segs[segs.length - 1]; // last segment if past end
+
+    if (!currentSeg || !currentSeg.onCourt) return;
+
+    // If we already executed this segment's subs, skip
+    if (lastExecutedSegId === currentSeg.id) return;
+
+    // If this segment is delayed, suppress until game clock passes delay threshold
+    if (delayedSegId === currentSeg.id && planDelayUntilSecs != null && gameSecs < planDelayUntilSecs) return;
+    // Clear expired delay
+    if (delayedSegId === currentSeg.id && planDelayUntilSecs != null && gameSecs >= planDelayUntilSecs) {
+      setDelayedSegId(null);
+      setPlanDelayUntilSecs(null);
+    }
+
+    // Check if lineup needs changing
+    const plannedSet = new Set(currentSeg.onCourt);
+    const currentSet = new Set(onCourt);
+
+    // Find who needs to come in and go out
+    const needIn = currentSeg.onCourt.filter(j => !currentSet.has(j));
+    const needOut = onCourt.filter(j => !plannedSet.has(j));
+
+    // If lineup already matches plan, mark as executed
+    if (needIn.length === 0 && needOut.length === 0) {
+      if (lastExecutedSegId !== currentSeg.id) setLastExecutedSegId(currentSeg.id);
+      if (pendingSub !== null) setPendingSub(null);
+      return;
+    }
+
+    // Don't show if currently showing the same suggestion
+    if (pendingSub && pendingSub._planSegId === currentSeg.id) return;
+
+    // Build sub pairs: match out/in by position similarity
+    const subs = [];
+    const outPool = [...needOut];
+    const inPool = [...needIn];
+    while (outPool.length > 0 && inPool.length > 0) {
+      const outJ = outPool.shift();
+      const inJ = inPool.shift();
+      const outP = available.find(p => p.jersey === outJ);
+      const inP = available.find(p => p.jersey === inJ);
+      if (outP && inP) subs.push({ out: outP, in: inP });
+    }
+    // Any remaining in without matching out (shouldn't happen with 5v5)
+    for (const inJ of inPool) {
+      const inP = available.find(p => p.jersey === inJ);
+      if (inP) subs.push({ out: null, in: inP });
+    }
+
+    if (subs.length === 0) return;
+
+    // Flag add-only subs (ALL subs must be adds, not just any one)
+    const isAddOnly = subs.every(s => !s.out);
+
+    // Determine urgency — at boundary = due, past boundary + 30s = overdue
+    const segStart = currentSeg.startSecs;
+    const reason = currentSeg.locked
+      ? `Planned sub (${currentSeg.lockReason === "close-block" ? "closer" : "opener"})`
+      : `Planned rotation @ ${Math.floor(segStart / 60)}:${String(segStart % 60).padStart(2, "0")}`;
+
+    const next = {
+      subs,
+      reason,
+      mandatory: false,
+      addOnly: isAddOnly,
+      windowTarget: segStart,
+      windowSoftLate: segStart + 30,
+      windowRoster: available.length,
+      _planSegId: currentSeg.id,
+      whyDetails: [subs.map(s => {
+        if (!s.out) return `Add #${s.in.jersey} ${s.in.name} per plan`;
+        return `#${s.out.jersey} ${s.out.name} → #${s.in.jersey} ${s.in.name} per rotation grid`;
+      })],
+    };
+
+    setPendingSub(next);
+  }, [rotationPlan, gameSecs, onCourt, plan, gameOver, showHalftime, screen, replacingJersey, lastExecutedSegId, delayedSegId, planDelayUntilSecs]);
+
+  // When plan sub is confirmed, update lastExecutedSegId
+  const confirmPlanSub = () => {
+    if (pendingSub && pendingSub._planSegId) {
+      setLastExecutedSegId(pendingSub._planSegId);
+      setDelayedSegId(null);
+      setPlanDelayUntilSecs(null);
+    }
+  };
+
+  // ── EMERGENCY REPAIR: runs regardless of plan-first or reactive mode ──
+  // Catches short-handed situations (fewer than 5 on court) when rotationPlan is active.
+  useEffect(() => {
+    if (!plan || gameOver || showHalftime || screen !== "game" || replacingJersey != null) return;
+    if (!rotationPlan) return; // reactive engine handles its own short-handed check
+    if (pendingSub && pendingSub.mandatory) return; // already showing an emergency prompt
+
+    const onCourtPlayers = onCourt.map(j => PLAYERS_DB.find(p => p.jersey === j)).filter(Boolean);
+    const benchAvail = available.filter(p =>
+      !onCourt.includes(p.jersey) && !unavailableJerseys.has(p.jersey));
+
+    if (onCourtPlayers.length < 5 && benchAvail.length > 0) {
+      const courtNow = [...onCourtPlayers];
+      const hasSkillVio = !meetsSkillRequirements(courtNow);
+      const sorted = [...benchAvail].sort((a, b) => {
+        if (hasSkillVio) {
+          const aFixes = meetsSkillRequirements([...courtNow, a]);
+          const bFixes = meetsSkillRequirements([...courtNow, b]);
+          if (aFixes !== bFixes) return aFixes ? -1 : 1;
+        }
+        return b.rating - a.rating;
+      });
+      const inP = sorted[0];
+      setPendingSub({
+        subs: [{ out: null, in: inP }],
+        reason: "⚠ Add player — fewer than 5 on court",
+        mandatory: true,
+        addOnly: true,
+        whyDetails: [[`Only ${onCourtPlayers.length} on court, need 5`, `Best available: #${inP.jersey} ${inP.name}`]],
+      });
+    }
+  }, [rotationPlan, onCourt, available, unavailableJerseys, plan, gameOver, showHalftime, screen, replacingJersey, pendingSub]);
+
   useEffect(() => {
     if (!plan || gameOver || showHalftime) {
       if (pendingSub !== null) setPendingSub(null);
@@ -1244,6 +2532,8 @@ function App() {
       if (pendingSub !== null) setPendingSub(null);
       return;
     }
+    // ── BYPASS: When plan-first executor is active, skip reactive engine ──
+    if (rotationPlan) return;
     // Suppress while the emergency replacement overlay is open — the coach
     // is already handling a player-off-court event, don't stack suggestions.
     if (replacingJersey != null) {
@@ -1316,6 +2606,46 @@ function App() {
       }
       return null;
     };
+    // ── Scored global pair selection ──────────────────────────────────
+    // Instead of picking OUT first (greedy), evaluate ALL legal (out, in)
+    // pairs across court × bench and pick the highest-scored swap. This
+    // ensures players like Naisha who can only replace specific court
+    // players are found even when greedy selection misses them.
+    const scorePair = (court, pOut, pIn, { triggerOut = null } = {}) => {
+      // Only evaluate legal swaps
+      const strict = legalStrictSim(court, pOut, pIn);
+      const loose = !strict && legalSkillSim(court, pOut, pIn);
+      if (!strict && !loose) return null;
+
+      let score = 0;
+      // IN urgency — how badly pIn needs court time (from benchInScore)
+      score += benchInScore(pIn) * 2;
+      // OUT merit — longer stint = better candidate to sit
+      score += stintLen(pOut.jersey) / 60; // convert to minutes for scale
+      // OUT over-pace bonus — if pOut is ahead of pace, pulling them is fine
+      const outExpected = fairShareSecs_engine * (gameSecs / Math.max(1, totalGameSecs));
+      const outSurplus = courtSecsOf(pOut.jersey) - outExpected;
+      if (outSurplus > 0) score += outSurplus / 30;
+      // Trigger match bonus — if pOut is specifically the one that caused the trigger
+      if (triggerOut && pOut.jersey === triggerOut.jersey) score += 50;
+      // Strict legality bonus — prefer swaps that maintain weakest balance
+      if (strict) score += 20;
+      return score;
+    };
+    const findBestScoredPair = (court, outCandidates, benchCandidates, opts = {}) => {
+      let bestPair = null;
+      let bestScore = -Infinity;
+      for (const out of outCandidates) {
+        for (const inP of benchCandidates) {
+          const s = scorePair(court, out, inP, opts);
+          if (s !== null && s > bestScore) {
+            bestScore = s;
+            bestPair = { out, in: inP, score: s };
+          }
+        }
+      }
+      return bestPair;
+    };
 
     // Compare two pendingSub objects to avoid useless re-renders.
     const subsEq = (a, b) => {
@@ -1325,6 +2655,59 @@ function App() {
       if (a.subs.length !== b.subs.length) return false;
       return a.subs.every((s, i) =>
         s.out?.jersey === b.subs[i].out?.jersey && s.in.jersey === b.subs[i].in.jersey);
+    };
+
+    // ── "Why this sub?" detail builder ─────────────────────────────────
+    const buildWhyDetails = (pairs) => pairs.map(({ out, in: inP, reason }) => {
+      const details = [];
+      if (out) {
+        const outOU = (effectiveCourtSecs(out.jersey) - ((5 * totalGameSecs) / rosterForCadence) * (gameSecs / Math.max(1, totalGameSecs)));
+        details.push(`OUT #${out.jersey} ${out.name}: ${(outOU / 60).toFixed(1)}m ${outOU >= 0 ? "over" : "under"} pace, stint ${fmt(stintLen(out.jersey))}`);
+      }
+      if (inP) {
+        const inOU = (courtSecsOf(inP.jersey) - ((5 * totalGameSecs) / rosterForCadence) * (gameSecs / Math.max(1, totalGameSecs)));
+        const benchTime = offSince[inP.jersey] != null ? gameSecs - offSince[inP.jersey] : 0;
+        details.push(`IN #${inP.jersey} ${inP.name}: ${(inOU / 60).toFixed(1)}m ${inOU >= 0 ? "over" : "under"} pace, benched ${fmt(benchTime)}`);
+      }
+      if (reason) details.push(`Trigger: ${reason}`);
+      return details;
+    });
+
+    // ── Bench IN scoring: rank by pace deficit, not raw court time ───────
+    // How much time a player can realistically still play. Non-starters
+    // won't play during the closer block, and bench players need at least
+    // one cadence cycle before they can get back on court.
+    const closeStartSecs = totalGameSecs - CLOSE_BLOCK_SECS;
+    const remainingGameSecs_engine = totalGameSecs - gameSecs;
+    const maxRecoverableSecs = (j) => {
+      const remaining = remainingGameSecs_engine;
+      if (starterJerseys.has(j)) return remaining;
+      // Non-starter: can't count on closer block time
+      return Math.max(0, closeStartSecs - gameSecs);
+    };
+    const fairShareSecs_engine = (5 * totalGameSecs) / rosterForCadence;
+    const floorSecs_engine = 0.85 * fairShareSecs_engine;
+
+    // Score a bench player for IN priority. Higher = more urgently needed.
+    const benchInScore = (p) => {
+      const j = p.jersey;
+      const actual = courtSecsOf(j);
+      const expectedNow = fairShareSecs_engine * (gameSecs / Math.max(1, totalGameSecs));
+      const paceDebt = expectedNow - actual; // positive = behind pace, needs time
+      const projectedMax = actual + maxRecoverableSecs(j);
+
+      let score = 0;
+      // Primary: how far behind expected pace (bigger = more urgent)
+      score += paceDebt;
+      // Penalize over-pace players — make them less attractive
+      if (paceDebt < 0) score += paceDebt * 2;
+      // Floor-risk emergency: player can't reach 85% even playing all remaining time
+      if (projectedMax < floorSecs_engine) score += 100000;
+      // Floor-risk warning: one more missed cycle creates danger
+      else if (projectedMax < floorSecs_engine + config.cadenceSecs) score += 10000;
+      // Heavy penalty if already over final target
+      if (actual >= fairShareSecs_engine) score -= 10000;
+      return score;
     };
 
     // ── 0. SHORT-HANDED REPAIR: add player when fewer than 5 on court ───
@@ -1338,7 +2721,7 @@ function App() {
           const bFixes = meetsSkillRequirements([...courtNow, b]);
           if (aFixes !== bFixes) return aFixes ? -1 : 1;
         }
-        return effectiveCourtSecs(a.jersey) - effectiveCourtSecs(b.jersey);
+        return benchInScore(b) - benchInScore(a); // highest score = most needed
       });
       const inP = sorted[0];
       const next = {
@@ -1346,8 +2729,22 @@ function App() {
         reason: "⚠ Add player — fewer than 5 on court",
         mandatory: true,
         addOnly: true,
+        whyDetails: [[`Only ${onCourtPlayers.length} on court, need 5`, `Best available: #${inP.jersey} ${inP.name}`]],
       };
       if (!subsEq(pendingSub, next)) { setPendingSub(next); notifySub(); }
+      return;
+    }
+
+    // ── PRE-HALFTIME / PRE-END QUIET ZONE ───────────────────────────────
+    // Suppress ALL subs (including mandatory) in the last 180 seconds of
+    // each half. At U12, no sub is worth stopping play with 3 minutes left
+    // — halftime or the final buzzer resets everything. Only short-handed
+    // repair (above) still fires because playing with 4 is an emergency.
+    const PRE_BREAK_QUIET_SECS = 180;
+    const halfEndSecs = half === 1 ? halfMins * 60 : halfMins * 2 * 60;
+    const secsUntilBreak = halfEndSecs - gameSecs;
+    if (!inStartBlock && secsUntilBreak <= PRE_BREAK_QUIET_SECS && secsUntilBreak > 0) {
+      if (pendingSub !== null) setPendingSub(null);
       return;
     }
 
@@ -1367,7 +2764,14 @@ function App() {
       const skillVio = !meetsSkillRequirements(onCourtPlayers);
       const weakVio = violatesWeakestThree(onCourtPlayers, weakest3);
 
-      if (overStint.length > 0 || skillVio || weakVio) {
+      // Soft-mandatory grace: stint cap and dev balance triggers can wait
+      // if we just did a sub within the last 90 seconds. Skill violations
+      // and critical triggers always fire immediately.
+      const SOFT_MANDATORY_GRACE_SECS = 90;
+      const inSoftGrace = gameSecs - lastSubTime < SOFT_MANDATORY_GRACE_SECS;
+      const hasHardTrigger = skillVio || weakVio; // skill violation + dev balance always urgent
+      const hasSoftTrigger = overStint.length > 0; // only stint cap can be deferred
+      if (hasHardTrigger || (hasSoftTrigger && !inSoftGrace)) {
         let simCourt = [...onCourtPlayers];
         let simBench = [...benchAvail];
         const subPairs = [];
@@ -1405,13 +2809,11 @@ function App() {
           if (!out) break;
           const excluded = new Set([...usedIn, ...usedOut]);
           const freeBench = simBench.filter(p => !excluded.has(p.jersey));
-          const sorted = [...freeBench].sort((a, b) => effectiveCourtSecs(a.jersey) - effectiveCourtSecs(b.jersey));
+          const sorted = [...freeBench].sort((a, b) => benchInScore(b) - benchInScore(a));
           let inP = pickInSim(simCourt, out, sorted);
           if (!inP) {
-            // Out-first failed — restrict fallback to candidates that fix the trigger.
-            // For stint cap: must remove an over-stint player.
-            // For dev balance: must remove a weakest-3 player.
-            // For skill: any court player is fair game.
+            // Out-first failed — use scored global pair selection.
+            // Restrict OUT candidates to trigger-fixing players.
             let outCandidates;
             if (osNow.length > 0) {
               outCandidates = osNow.filter(p => !skip.has(p.jersey));
@@ -1421,7 +2823,7 @@ function App() {
             } else {
               outCandidates = simCourt.filter(p => !skip.has(p.jersey));
             }
-            const pair = findLegalPair(simCourt, outCandidates, sorted);
+            const pair = findBestScoredPair(simCourt, outCandidates, sorted, { triggerOut: out });
             if (!pair) break;
             out = pair.out;
             inP = pair.in;
@@ -1436,7 +2838,7 @@ function App() {
 
         if (subPairs.length > 0) {
           const reasons = [...new Set(subPairs.map(s => s.reason))];
-          const next = { subs: subPairs, reason: "⚠ " + reasons.join(" + "), mandatory: true };
+          const next = { subs: subPairs, reason: "⚠ " + reasons.join(" + "), mandatory: true, whyDetails: buildWhyDetails(subPairs) };
           if (!subsEq(pendingSub, next)) { setPendingSub(next); notifySub(); }
           return;
         }
@@ -1446,6 +2848,16 @@ function App() {
     // ── START BLOCK (H1 only): no subs ──────────────────────────────────
     if (inStartBlock) {
       if (pendingSub !== null) setPendingSub(null);
+      return;
+    }
+
+    // ── H2 START GRACE ZONE ─────────────────────────────────────────────
+    // Suppress all non-critical subs in the first 120 seconds of H2.
+    // If a sub was needed that early, it should have been handled at halftime.
+    const H2_GRACE_SECS = 120;
+    const halfStartSecs = halfMins * 60;
+    if (half === 2 && (gameSecs - halfStartSecs) < H2_GRACE_SECS) {
+      if (pendingSub !== null && !pendingSub.mandatory) setPendingSub(null);
       return;
     }
 
@@ -1490,7 +2902,12 @@ function App() {
       // not limited by normal bundleCap. Ensures all available starters return.
       const closerMax = benchCount;
       for (let pass = 0; pass < closerMax && simBench.length > 0; pass++) {
-        const nonStartersOn = simCourt.filter(p => !starterJerseys.has(p.jersey));
+        const nonStartersOn = simCourt.filter(p => {
+          if (starterJerseys.has(p.jersey)) return false;
+          // Closer safety: don't pull a non-starter who is below 85% floor
+          if (courtSecsOf(p.jersey) < floorSecs_engine) return false;
+          return true;
+        });
         const startersOff = simBench.filter(p => starterJerseys.has(p.jersey));
         if (nonStartersOn.length === 0 || startersOff.length === 0) break;
         const out = [...nonStartersOn].sort((a, b) => stintLen(b.jersey) - stintLen(a.jersey))[0];
@@ -1511,13 +2928,22 @@ function App() {
       }
       // Check if any starters are unavailable (fouled out / injured)
       const unavailableStarters = (plan?.starting || []).filter(p => unavailableJerseys.has(p.jersey));
-      const reason = unavailableStarters.length > 0
-        ? `Closer: partial restore (${unavailableStarters.map(p => `#${p.jersey}`).join(", ")} unavailable)`
-        : "Closer: restore starters";
+      // Check if any non-starters were protected from closer due to floor risk
+      const protectedPlayers = onCourtPlayers.filter(p =>
+        !starterJerseys.has(p.jersey) && courtSecsOf(p.jersey) < floorSecs_engine
+      );
+      let reason = "Closer: restore starters";
+      if (unavailableStarters.length > 0) {
+        reason = `Closer: partial restore (${unavailableStarters.map(p => `#${p.jersey}`).join(", ")} unavailable)`;
+      }
+      if (protectedPlayers.length > 0) {
+        reason += ` · ${protectedPlayers.map(p => `#${p.jersey}`).join(", ")} kept on (85% floor)`;
+      }
       const next = {
         subs: pairs,
         reason,
         mandatory: true,
+        whyDetails: buildWhyDetails(pairs.map(p => ({ ...p, reason: "Closer restore" }))),
         windowTarget: activeWindow.targetSecs,
         windowSoftLate: activeWindow.softLateSecs,
         windowRoster: rosterForCadence,
@@ -1555,12 +2981,12 @@ function App() {
       });
 
       // Floor-risk guard: exclude players who can't reach 85% of fair-share
-      // if benched now. Projected max = current court time + (remaining - cadence),
-      // since they'd sit at least one full cadence cycle before returning.
+      // if benched now. Uses closer-adjusted remaining time for non-starters.
       if (floorRiskApplies && eligible.length > 1) {
         const safe = eligible.filter(p => {
-          const projected = courtSecsOf(p.jersey) + Math.max(0, remainingGameSecs - config.cadenceSecs);
-          return projected >= floorSecs;
+          const recoverable = maxRecoverableSecs(p.jersey);
+          const projected = courtSecsOf(p.jersey) + Math.max(0, recoverable - config.cadenceSecs);
+          return projected >= floorSecs_engine;
         });
         // Only apply if we still have someone to sub out
         if (safe.length > 0) eligible = safe;
@@ -1568,45 +2994,55 @@ function App() {
 
       if (eligible.length === 0) break;
 
-      let out;
-      if (isFirstCycle) {
-        // Priority-rest carousel: only pick players who haven't rested yet
-        // this half. This prevents the yo-yo bug where the just-entered bench
-        // player gets pulled right back off (common with 6 players / 1 bench).
-        const unrested = eligible.filter(p => !restedThisHalf.has(p.jersey));
-        const pool = unrested.length > 0 ? unrested : eligible;
-        // Within the pool, sub out weaker players first so strongest play longest
-        out = [...pool].sort((a, b) => a.rating - b.rating)[0];
-      } else {
-        // Normal fairness: sub out player with most effective court time
-        out = [...eligible].sort((a, b) => effectiveCourtSecs(b.jersey) - effectiveCourtSecs(a.jersey))[0];
+      // ── SCORED GLOBAL PAIR SELECTION (primary method) ─────────────
+      // Evaluate ALL legal (out, in) pairs across eligible × bench and
+      // pick the swap that maximises overall fairness. This prevents
+      // Swiss-Army-Knife overuse (Lola) and ensures constrained players
+      // like Naisha get found even when greedy selection misses them.
+      //
+      // First-cycle tweak: boost weaker-rated OUT candidates so they
+      // rest first, matching the old priority-rest carousel behaviour.
+      const benchCandidates = [...freeBench];
+
+      // Build scored pairs with context-aware bonuses
+      let bestPair = null;
+      let bestScore = -Infinity;
+      for (const pOut of eligible) {
+        for (const pIn of benchCandidates) {
+          const s = scorePair(simCourt, pOut, pIn);
+          if (s === null) continue; // illegal swap
+          let adjusted = s;
+          // First-cycle: prefer resting weaker players first, and avoid
+          // pulling back someone who already rested this half (yo-yo guard)
+          if (isFirstCycle) {
+            if (restedThisHalf.has(pOut.jersey)) adjusted -= 500;
+            // Lower-rated OUT = more attractive to rest first
+            adjusted += (10 - pOut.rating) * 5;
+          }
+          // Floor-risk guard on OUT: penalise benching someone who can't
+          // recover to 85% floor (already filtered above, but add scoring
+          // tiebreak for borderline cases)
+          if (floorRiskApplies) {
+            const recoverable = maxRecoverableSecs(pOut.jersey);
+            const projected = courtSecsOf(pOut.jersey) + Math.max(0, recoverable - config.cadenceSecs);
+            if (projected < floorSecs_engine) adjusted -= 50000;
+          }
+          // Weakest-balance awareness: if all 3 weakest are on bench,
+          // boost swaps that bring one in
+          const simSet = new Set(simCourt.map(p => p.jersey));
+          const weakOnCount = weakest3.filter(j => simSet.has(j)).length;
+          if (weakOnCount === 0 && weakest3.length === 3 && weakest3.includes(pIn.jersey)) {
+            adjusted += 30;
+          }
+          if (adjusted > bestScore) {
+            bestScore = adjusted;
+            bestPair = { out: pOut, in: pIn };
+          }
+        }
       }
 
-      // Pick IN — least effective court time (bench players look under-served)
-      const excluded = new Set([...usedIn, ...usedOut]);
-      const simSet = new Set(simCourt.map(p => p.jersey));
-      const weakOnCount = weakest3.filter(j => simSet.has(j)).length;
-      let sorted;
-      if (weakOnCount === 0 && weakest3.length === 3) {
-        // All weak on bench — prefer bringing one in
-        const weakB = freeBench.filter(p => weakest3.includes(p.jersey))
-          .sort((a, b) => effectiveCourtSecs(a.jersey) - effectiveCourtSecs(b.jersey));
-        const strongB = freeBench.filter(p => !weakest3.includes(p.jersey))
-          .sort((a, b) => effectiveCourtSecs(a.jersey) - effectiveCourtSecs(b.jersey));
-        sorted = [...weakB, ...strongB];
-      } else {
-        sorted = [...freeBench]
-          .sort((a, b) => effectiveCourtSecs(a.jersey) - effectiveCourtSecs(b.jersey));
-      }
-
-      let inP = pickInSim(simCourt, out, sorted);
-      if (!inP) {
-        // Out-first failed — search all eligible pairs
-        const pair = findLegalPair(simCourt, eligible, sorted);
-        if (!pair) break;
-        out = pair.out;
-        inP = pair.in;
-      }
+      if (!bestPair) break;
+      let { out, in: inP } = bestPair;
 
       subPairs.push({ out, in: inP });
       usedOut.add(out.jersey);
@@ -1634,6 +3070,7 @@ function App() {
       subs: subPairs,
       reason: `Rotation${isFirstCycle ? " (first cycle)" : ""}`,
       mandatory: false,
+      whyDetails: buildWhyDetails(subPairs.map(p => ({ ...p, reason: "Fairness rotation" }))),
       windowTarget: activeWindow.targetSecs,
       windowSoftLate: activeWindow.softLateSecs,
       windowRoster: rosterForCadence,
@@ -1678,6 +3115,41 @@ function App() {
   }
 
   const pObj = (jersey) => PLAYERS_DB.find(p => p.jersey === jersey);
+
+  // ── SCORE HELPERS ──────────────────────────────────────────────────────────
+  function addScore(team, pts) {
+    withActionLock(() => {
+      pushUndo(`+${pts} ${team}`);
+      if (team === "us") setScoreUs(prev => prev + pts);
+      else setScoreOpponent(prev => prev + pts);
+    });
+  }
+  function undoScore(team) {
+    withActionLock(() => {
+      if (team === "us" && scoreUs > 0) { pushUndo("Undo score us"); setScoreUs(prev => Math.max(0, prev - 1)); }
+      if (team === "opp" && scoreOpponent > 0) { pushUndo("Undo score opp"); setScoreOpponent(prev => Math.max(0, prev - 1)); }
+    });
+  }
+
+  // ── TIMEOUT HELPERS ────────────────────────────────────────────────────────
+  function useTimeout(team) {
+    withActionLock(() => {
+      pushUndo("Timeout " + team);
+      if (team === "us") setTimeoutsUs(prev => prev + 1);
+      else setTimeoutsOpponent(prev => prev + 1);
+      setRunning(false); // pause clock on timeout
+      setSubLog(prev => [...prev, {
+        time: gameSecs, half, timeInHalf,
+        timeout: true,
+        team: team === "us" ? "Roadies" : "Opponent",
+      }]);
+      // Dismiss matching planned timeout reminder
+      const currentGameMin = Math.floor(gameSecs / 60);
+      if (plannedTimeouts.has(currentGameMin)) {
+        setDismissedTimeouts(prev => new Set([...prev, currentGameMin]));
+      }
+    });
+  }
 
   // ── SETUP SCREEN ────────────────────────────────────────────────────────────
   if (screen === "setup") return (
@@ -1740,6 +3212,34 @@ function App() {
             </div>
             <button onClick={() => setHalfMins(m => m + 5)}
               style={{ width: 44, height: 44, borderRadius: "50%", background: "#334155", border: "none", color: "#fff", fontSize: 22, cursor: "pointer" }}>+</button>
+          </div>
+        </div>
+
+        <div style={{ background: "#1e293b", borderRadius: 16, padding: 16, marginBottom: 12 }}>
+          <div style={{ color: "#94a3b8", fontSize: 12, fontWeight: 700, marginBottom: 10, letterSpacing: 1 }}>GAME OPTIONS</div>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8 }}>
+            <span style={{ color: "#cbd5e1", fontSize: 13 }}>Score & timeout tracking</span>
+            <button onClick={() => setShowScorePanel(p => !p)} style={{
+              width: 48, height: 26, borderRadius: 13, border: "none", cursor: "pointer",
+              background: showScorePanel ? "#3b82f6" : "#475569", position: "relative", transition: "background 0.2s",
+            }}>
+              <div style={{
+                width: 20, height: 20, borderRadius: "50%", background: "#fff", position: "absolute", top: 3,
+                left: showScorePanel ? 25 : 3, transition: "left 0.2s",
+              }} />
+            </button>
+          </div>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+            <span style={{ color: "#cbd5e1", fontSize: 13 }}>Possession arrow</span>
+            <button onClick={() => setShowPossessionArrow(p => !p)} style={{
+              width: 48, height: 26, borderRadius: 13, border: "none", cursor: "pointer",
+              background: showPossessionArrow ? "#3b82f6" : "#475569", position: "relative", transition: "background 0.2s",
+            }}>
+              <div style={{
+                width: 20, height: 20, borderRadius: "50%", background: "#fff", position: "absolute", top: 3,
+                left: showPossessionArrow ? 25 : 3, transition: "left 0.2s",
+              }} />
+            </button>
           </div>
         </div>
 
@@ -1824,25 +3324,52 @@ function App() {
 
         {(() => {
           const starterObjs = available.filter(p => starters.has(p.jersey));
-          const skillsOk = starters.size === 5 && meetsSkillRequirements(starterObjs);
-          const missingSkills = starters.size === 5 && !skillsOk
-            ? SKILL_MINIMUMS.filter(({ skill, min }) =>
-                starterObjs.filter(p => p.skills.includes(skill)).length < min
-              ).map(({ skill }) => skill)
+          const hardOk = starters.size === 5 && satisfiesHardRules(starterObjs);
+          const softWarnings = starters.size === 5 ? checkSoftRules(starterObjs) : [];
+          const missingHard = starters.size === 5 && !hardOk
+            ? [
+                !starterObjs.some(p => p.skills.includes("BallHandle")) ? "BallHandle" : null,
+                !starterObjs.some(p => p.skills.includes("Passing")) ? "Passing" : null,
+              ].filter(Boolean)
             : [];
           const w3 = weakestThreeJerseys(available);
           const devBalanceWarn = starters.size === 5 && w3.length >= 3 && violatesWeakestThree(starterObjs, w3);
-          const canGenerate = starters.size === 5 && skillsOk;
+          const canGenerate = starters.size === 5 && hardOk;
           return (
             <>
-              {missingSkills.length > 0 && (
+              {missingHard.length > 0 && (
                 <div style={{ background: "#7f1d1d", borderRadius: 10, padding: "8px 12px", marginBottom: 8, color: "#fca5a5", fontSize: 12, fontWeight: 600 }}>
-                  ⚠️ Starting 5 needs: {missingSkills.join(", ")}
+                  ⚠️ Starting 5 needs: {missingHard.join(", ")}
+                </div>
+              )}
+              {softWarnings.length > 0 && missingHard.length === 0 && (
+                <div style={{ background: "#78350f", borderRadius: 10, padding: "8px 12px", marginBottom: 8, color: "#fcd34d", fontSize: 12, fontWeight: 600 }}>
+                  ⚠️ Soft warning: {softWarnings.join(" / ")}
                 </div>
               )}
               {devBalanceWarn && (
                 <div style={{ background: "#78350f", borderRadius: 10, padding: "8px 12px", marginBottom: 8, color: "#fcd34d", fontSize: 12, fontWeight: 600 }}>
                   ⚠️ All 3 developing players in the starting 5 — engine can't fix this during the 4-min start lock
+                </div>
+              )}
+              {/* Plan Mode Selector */}
+              {starters.size === 5 && (
+                <div style={{ background: "#1e293b", borderRadius: 12, padding: 12, marginBottom: 12 }}>
+                  <div style={{ color: "#94a3b8", fontSize: 11, fontWeight: 700, letterSpacing: 1, marginBottom: 8 }}>PLAN MODE</div>
+                  <div style={{ display: "flex", gap: 6 }}>
+                    {[
+                      { id: "balanced", label: "Balanced", desc: "Fair time for all" },
+                      { id: "competitive", label: "Compete", desc: "Best players, more time" },
+                      { id: "development", label: "Develop", desc: "Weaker players get a boost" },
+                    ].map(m => (
+                      <button key={m.id} onClick={() => setPlanMode(m.id)}
+                        style={{ flex: 1, padding: "8px 4px", borderRadius: 10, border: `2px solid ${planMode === m.id ? "#3b82f6" : "#334155"}`,
+                          background: planMode === m.id ? "#1e3a8a" : "#0f172a", cursor: "pointer", textAlign: "center" }}>
+                        <div style={{ color: planMode === m.id ? "#60a5fa" : "#94a3b8", fontSize: 12, fontWeight: 700 }}>{m.label}</div>
+                        <div style={{ color: "#64748b", fontSize: 9, marginTop: 2 }}>{m.desc}</div>
+                      </button>
+                    ))}
+                  </div>
                 </div>
               )}
               <button onClick={handleGeneratePlan} disabled={!canGenerate}
@@ -1861,101 +3388,433 @@ function App() {
     </div>
   );
 
-  // ── PLAN SCREEN ─────────────────────────────────────────────────────────────
+  // ── PLAN SCREEN (EDITABLE ROTATION GRID) ────────────────────────────────────
   if (screen === "plan") return (
-    <div style={{ minHeight: "100vh", backgroundColor: "#0f172a", padding: "16px", fontFamily: "system-ui, sans-serif" }}>
-      <div style={{ maxWidth: 400, margin: "0 auto" }}>
-        <div style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 16 }}>
-          <button onClick={() => setScreen(gameIsLive ? "game" : "setup")}
-            style={{ background: "#334155", border: "none", color: "#fff", borderRadius: 10, padding: "8px 14px", cursor: "pointer", fontSize: 14 }}>← Back</button>
-          <div style={{ color: "#fff", fontSize: 18, fontWeight: 700 }}>Rotation Plan</div>
-        </div>
+    <div style={{ minHeight: "100vh", backgroundColor: "#0f172a", padding: "16px", fontFamily: "-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif", color: "#e2e8f0" }}
+      onMouseUp={() => { gridPainting.current = false; }}>
+      <div style={{ maxWidth: 700, margin: "0 auto" }}>
+        {/* Header */}
+        <h1 style={{ textAlign: "center", fontSize: "1.3rem", marginBottom: 12, color: "#f8fafc" }}>
+          🏀 Rotation Planner
+        </h1>
 
-        {/* Starting 5 */}
-        <div style={{ background: "#1e293b", borderRadius: 16, padding: 16, marginBottom: 12 }}>
-          <div style={{ color: "#fbbf24", fontSize: 12, fontWeight: 700, letterSpacing: 1, marginBottom: 10 }}>⭐ STARTING 5 (also CLOSING 5)</div>
-          <div style={{ display: "flex", flexWrap: "wrap", gap: 8 }}>
-            {plan.starting.map(p => (
-              <div key={p.jersey} style={{ background: p.color + "33", border: `1px solid ${p.color}`, borderRadius: 10, padding: "6px 10px", display: "flex", alignItems: "center", gap: 6 }}>
-                <div style={{ width: 26, height: 26, borderRadius: "50%", background: p.color, display: "flex", alignItems: "center", justifyContent: "center", color: "#fff", fontSize: 11, fontWeight: 700 }}>#{p.jersey}</div>
-                <span style={{ color: "#fff", fontSize: 13, fontWeight: 600 }}>{p.name}</span>
-              </div>
-            ))}
-          </div>
+        {/* Controls — Row 1: Grid tools */}
+        <div style={{ display: "flex", justifyContent: "center", gap: 8, marginBottom: 8, flexWrap: "wrap" }}>
+          <button onClick={() => { if (gameIsLive) { syncGridToPlan(); setScreen("game"); } else { setScreen("setup"); } }}
+            style={{ background: "#334155", border: "1px solid #475569", color: "#e2e8f0", padding: "6px 14px", borderRadius: 6, cursor: "pointer", fontSize: "0.85rem" }}>
+            ← Back
+          </button>
+          <button onClick={() => {
+            if (!editableGrid) return;
+            if (!window.confirm("Clear the entire rotation grid?")) return;
+            setEditableGrid(editableGrid.map(row => row.map(() => false)));
+          }}
+            style={{ background: "#334155", border: "1px solid #475569", color: "#e2e8f0", padding: "6px 14px", borderRadius: 6, cursor: "pointer", fontSize: "0.85rem" }}>
+            Clear All
+          </button>
+          <button onClick={() => setGridPaintMode(p => !p)}
+            style={{ background: gridPaintMode ? "#2563eb" : "#334155", border: `1px solid ${gridPaintMode ? "#3b82f6" : "#475569"}`, color: "#e2e8f0", padding: "6px 14px", borderRadius: 6, cursor: "pointer", fontSize: "0.85rem" }}>
+            Paint: {gridPaintMode ? "ON" : "OFF"}
+          </button>
         </div>
-
-        {/* Target minutes */}
-        <div style={{ background: "#1e293b", borderRadius: 16, padding: 16, marginBottom: 12 }}>
-          <div style={{ color: "#94a3b8", fontSize: 12, fontWeight: 700, letterSpacing: 1, marginBottom: 10 }}>TARGET MINUTES</div>
-          {available.map(p => (
-            <div key={p.jersey} style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 6 }}>
-              <div style={{ width: 28, height: 28, borderRadius: "50%", background: p.color, display: "flex", alignItems: "center", justifyContent: "center", color: "#fff", fontSize: 11, fontWeight: 700, flexShrink: 0 }}>#{p.jersey}</div>
-              <div style={{ color: "#cbd5e1", fontSize: 14, flex: 1 }}>{p.name}</div>
-              <div style={{ color: "#60a5fa", fontSize: 14, fontWeight: 600 }}>{adjustedTargetMins[p.jersey]} min</div>
-            </div>
-          ))}
-        </div>
-
-        {/* Rule-driven rotation note — no pre-scheduled events */}
-        <div style={{ background: "#1e293b", borderRadius: 16, padding: 16, marginBottom: 12 }}>
-          <div style={{ color: "#94a3b8", fontSize: 12, fontWeight: 700, letterSpacing: 1, marginBottom: 10 }}>ROTATION</div>
+        {/* Controls — Row 2: Templates */}
+        <div style={{ display: "flex", justifyContent: "center", gap: 8, marginBottom: 16, flexWrap: "wrap" }}>
+          <button onClick={() => { setShowSaveDialog(true); setShowLoadDialog(false); }}
+            style={{ background: "#065f46", border: "1px solid #059669", color: "#6ee7b7", padding: "6px 14px", borderRadius: 6, cursor: "pointer", fontSize: "0.85rem", fontWeight: 600 }}>
+            💾 Save Template
+          </button>
+          <button onClick={() => { setShowLoadDialog(true); setShowSaveDialog(false); }}
+            style={{ background: "#1e3a8a", border: "1px solid #3b82f6", color: "#93c5fd", padding: "6px 14px", borderRadius: 6, cursor: "pointer", fontSize: "0.85rem", fontWeight: 600 }}>
+            📂 Load Template
+          </button>
           {(() => {
-            const activeRosterSize = gameIsLive
-              ? available.length - fouledOut.size - injured.size
-              : available.length;
-            const config = getRotationConfig(activeRosterSize);
-            const schedule = activeRosterSize > 5
-              ? getWindowSchedule(activeRosterSize, halfMins, START_BLOCK_SECS, CLOSE_BLOCK_SECS)
-              : [];
-            const rotationWindows = schedule.filter(w => !w.isCloser);
-            if (activeRosterSize <= 5) return (
-              <div style={{ color: "#cbd5e1", fontSize: 13, lineHeight: 1.5 }}>
-                No bench — all {activeRosterSize} players on court full time.
-                <br />
-                <span style={{ color: "#64748b", fontSize: 12 }}>
-                  No rotation windows. Mandatory checks (stint cap, skill, weakest-3) still active.
-                </span>
-              </div>
-            );
+            const matching = getMatchingTemplates();
+            if (matching.length === 0) return null;
             return (
-              <div style={{ color: "#cbd5e1", fontSize: 13, lineHeight: 1.5 }}>
-                Window-based — subs at scheduled intervals.
-                <br />
-                <span style={{ color: "#64748b", fontSize: 12 }}>
-                  {activeRosterSize} players → {config.benchCount} bench → cadence every {fmt(config.cadenceSecs)}.
-                  {config.firstCycleCount > 0 && ` First cycle faster (${fmt(config.firstCycleCadenceSecs)}).`}
-                  {" "}Bundle: up to {config.bundleCap} swap{config.bundleCap > 1 ? "s" : ""} per window.
-                  {" "}Stint cap: {fmt(config.hardStintCapSecs)}.
-                  {" "}Starters locked {fmt(START_BLOCK_SECS)}, closers last {fmt(CLOSE_BLOCK_SECS)}.
-                  {" "}{rotationWindows.length} rotation windows + closer.
-                </span>
-              </div>
+              <span style={{ fontSize: "0.75rem", color: "#64748b", alignSelf: "center" }}>
+                {matching.length} saved for {gridPlayerOrder.length}p
+              </span>
             );
           })()}
         </div>
-
-        {gameIsLive ? (
-          <>
-            <button onClick={() => setScreen("game")}
-              style={{ width: "100%", padding: "16px", borderRadius: 16, border: "none", cursor: "pointer",
-                background: "linear-gradient(135deg,#1d4ed8,#3b82f6)", color: "#fff", fontSize: 17, fontWeight: 700,
-                display: "flex", alignItems: "center", justifyContent: "center", gap: 10, marginBottom: 8 }}>
-              ← Back to Game
-            </button>
-            <button onClick={() => { if (window.confirm("This will end the current game and lose all data. Are you sure?")) { discardSavedGame(); } }}
-              style={{ width: "100%", padding: "12px", borderRadius: 12, border: "1px solid #991b1b", cursor: "pointer",
-                background: "transparent", color: "#f87171", fontSize: 14, fontWeight: 600 }}>
-              End Game & New Setup
-            </button>
-          </>
-        ) : (
-          <button onClick={handleStartGame}
-            style={{ width: "100%", padding: "16px", borderRadius: 16, border: "none", cursor: "pointer",
-              background: "linear-gradient(135deg,#059669,#10b981)", color: "#fff", fontSize: 17, fontWeight: 700,
-              display: "flex", alignItems: "center", justifyContent: "center", gap: 10 }}>
-            <CoachKLogo size={24} /> Start Game
+        {/* Timeout controls */}
+        <div style={{ display: "flex", justifyContent: "center", gap: 8, marginBottom: 16, flexWrap: "wrap", alignItems: "center" }}>
+          <button onClick={() => setTimeoutRemindersOn(p => !p)}
+            style={{ background: timeoutRemindersOn ? "#92400e" : "#334155", border: `1px solid ${timeoutRemindersOn ? "#f59e0b" : "#475569"}`,
+              color: timeoutRemindersOn ? "#fbbf24" : "#94a3b8", padding: "6px 14px", borderRadius: 6, cursor: "pointer", fontSize: "0.85rem", fontWeight: 600 }}>
+            ⏱ Timeouts: {timeoutRemindersOn ? "ON" : "OFF"}
           </button>
+          {plannedTimeouts.size > 0 && (
+            <span style={{ fontSize: "0.75rem", color: "#f59e0b" }}>
+              {plannedTimeouts.size} planned — tap minute labels to add/remove
+            </span>
+          )}
+          {plannedTimeouts.size === 0 && timeoutRemindersOn && (
+            <span style={{ fontSize: "0.75rem", color: "#64748b" }}>
+              Tap a minute label on the left to plan a timeout
+            </span>
+          )}
+          {plannedTimeouts.size > 0 && (
+            <button onClick={() => setPlannedTimeouts(new Set())}
+              style={{ background: "#334155", border: "1px solid #475569", color: "#94a3b8", padding: "4px 10px", borderRadius: 6, cursor: "pointer", fontSize: "0.75rem" }}>
+              Clear all
+            </button>
+          )}
+        </div>
+
+        {/* Save Template Dialog */}
+        {showSaveDialog && (
+          <div style={{ background: "#1e293b", border: "1px solid #334155", borderRadius: 12, padding: 16, marginBottom: 16 }}>
+            <div style={{ color: "#e2e8f0", fontSize: 14, fontWeight: 700, marginBottom: 10 }}>Save Rotation Template</div>
+            <div style={{ color: "#94a3b8", fontSize: 12, marginBottom: 10 }}>
+              {gridPlayerOrder.length} players • {halfMins * 2} min game
+            </div>
+            <div style={{ display: "flex", gap: 8 }}>
+              <input
+                type="text"
+                value={templateNameInput}
+                onChange={e => setTemplateNameInput(e.target.value)}
+                onKeyDown={e => { if (e.key === "Enter" && templateNameInput.trim()) saveTemplate(templateNameInput); }}
+                placeholder="e.g. Standard 8-Player"
+                autoFocus
+                style={{ flex: 1, padding: "8px 12px", borderRadius: 8, border: "1px solid #475569", background: "#0f172a", color: "#e2e8f0", fontSize: 14, outline: "none" }}
+              />
+              <button onClick={() => { if (templateNameInput.trim()) saveTemplate(templateNameInput); }}
+                disabled={!templateNameInput.trim()}
+                style={{ padding: "8px 16px", borderRadius: 8, border: "none", cursor: templateNameInput.trim() ? "pointer" : "not-allowed",
+                  background: templateNameInput.trim() ? "#059669" : "#334155", color: "#fff", fontSize: 14, fontWeight: 700 }}>
+                Save
+              </button>
+              <button onClick={() => { setShowSaveDialog(false); setTemplateNameInput(""); }}
+                style={{ padding: "8px 12px", borderRadius: 8, border: "1px solid #475569", background: "#334155", color: "#94a3b8", cursor: "pointer", fontSize: 14 }}>
+                ✕
+              </button>
+            </div>
+            {/* Show existing templates with same name warning */}
+            {templateNameInput.trim() && savedTemplates.some(t => t.name === templateNameInput.trim() && t.playerCount === gridPlayerOrder.length) && (
+              <div style={{ color: "#fbbf24", fontSize: 11, marginTop: 6 }}>
+                ⚠ A template with this name exists for {gridPlayerOrder.length} players — saving will replace it
+              </div>
+            )}
+          </div>
         )}
+
+        {/* Load Template Dialog */}
+        {showLoadDialog && (
+          <div style={{ background: "#1e293b", border: "1px solid #334155", borderRadius: 12, padding: 16, marginBottom: 16 }}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 10 }}>
+              <div style={{ color: "#e2e8f0", fontSize: 14, fontWeight: 700 }}>Load Template</div>
+              <button onClick={() => setShowLoadDialog(false)}
+                style={{ padding: "4px 10px", borderRadius: 6, border: "1px solid #475569", background: "#334155", color: "#94a3b8", cursor: "pointer", fontSize: 12 }}>
+                ✕
+              </button>
+            </div>
+            {/* Matching templates (same player count) */}
+            {(() => {
+              const matching = getMatchingTemplates();
+              const others = savedTemplates.filter(t => t.playerCount !== gridPlayerOrder.length);
+              return (
+                <>
+                  {matching.length > 0 && (
+                    <div style={{ marginBottom: others.length > 0 ? 12 : 0 }}>
+                      <div style={{ color: "#4ade80", fontSize: 11, fontWeight: 700, marginBottom: 6 }}>
+                        ✓ {gridPlayerOrder.length}-PLAYER TEMPLATES
+                      </div>
+                      {matching.map(t => (
+                        <div key={t.id} style={{ display: "flex", alignItems: "center", gap: 8, padding: "8px 10px", borderRadius: 8, background: "#0f172a", border: "1px solid #334155", marginBottom: 4, cursor: "pointer" }}
+                          onClick={() => loadTemplate(t)}>
+                          <div style={{ flex: 1 }}>
+                            <div style={{ color: "#e2e8f0", fontSize: 13, fontWeight: 600 }}>{t.name}</div>
+                            <div style={{ color: "#64748b", fontSize: 10 }}>{t.playerCount}p • {t.halfMins * 2}m</div>
+                          </div>
+                          <button onClick={e => { e.stopPropagation(); if (window.confirm(`Delete "${t.name}"?`)) deleteTemplate(t.id); }}
+                            style={{ padding: "4px 8px", borderRadius: 4, border: "1px solid #7f1d1d", background: "transparent", color: "#f87171", cursor: "pointer", fontSize: 11 }}>
+                            ✕
+                          </button>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                  {others.length > 0 && (
+                    <div>
+                      <div style={{ color: "#64748b", fontSize: 11, fontWeight: 700, marginBottom: 6 }}>
+                        OTHER TEMPLATES
+                      </div>
+                      {others.map(t => (
+                        <div key={t.id} style={{ display: "flex", alignItems: "center", gap: 8, padding: "8px 10px", borderRadius: 8, background: "#0f172a", border: "1px solid #1e293b", marginBottom: 4, opacity: 0.6 }}>
+                          <div style={{ flex: 1 }}>
+                            <div style={{ color: "#94a3b8", fontSize: 13 }}>{t.name}</div>
+                            <div style={{ color: "#475569", fontSize: 10 }}>{t.playerCount}p • {t.halfMins * 2}m</div>
+                          </div>
+                          <button onClick={e => { e.stopPropagation(); if (window.confirm(`Delete "${t.name}"?`)) deleteTemplate(t.id); }}
+                            style={{ padding: "4px 8px", borderRadius: 4, border: "1px solid #7f1d1d", background: "transparent", color: "#f87171", cursor: "pointer", fontSize: 11 }}>
+                            ✕
+                          </button>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                  {matching.length === 0 && others.length === 0 && (
+                    <div style={{ color: "#64748b", fontSize: 13, textAlign: "center", padding: "12px 0" }}>
+                      No saved templates yet. Paint a rotation and save it.
+                    </div>
+                  )}
+                </>
+              );
+            })()}
+          </div>
+        )}
+
+        {/* Toast notification */}
+        {templateToast && (
+          <div style={{
+            position: "fixed", bottom: 24, left: "50%", transform: "translateX(-50%)",
+            background: "#065f46", border: "1px solid #059669", color: "#6ee7b7",
+            padding: "10px 20px", borderRadius: 10, fontSize: 14, fontWeight: 600,
+            zIndex: 200, boxShadow: "0 4px 12px rgba(0,0,0,0.4)",
+          }}>
+            {templateToast}
+          </div>
+        )}
+
+        {/* Grid */}
+        {editableGrid && gridPlayerOrder.length > 0 && (() => {
+          const totalMins = halfMins * 2;
+          const players = gridPlayerOrder;
+          const grid = editableGrid;
+          const target = rotationPlan ? rotationPlan.targetMinutes : {};
+
+          // Compute per-player totals
+          const playerTotals = players.map((p, pIdx) => {
+            let total = 0;
+            for (let m = 0; m < totalMins; m++) { if (grid[m] && grid[m][pIdx]) total++; }
+            return total;
+          });
+
+          // Compute per-row court count
+          const rowCounts = [];
+          for (let m = 0; m < totalMins; m++) {
+            rowCounts[m] = grid[m] ? grid[m].filter(Boolean).length : 0;
+          }
+
+          // Total court-minutes (sum of all row counts)
+          const totalCourtMins = rowCounts.reduce((s, c) => s + c, 0);
+
+          // Spread
+          const maxMins = Math.max(...playerTotals);
+          const minMins = Math.min(...playerTotals);
+          const spread = maxMins - minMins;
+          const idealTarget = (5 * totalMins) / players.length;
+
+          // Cell handlers
+          const cellDown = (e, m, pIdx) => {
+            e.preventDefault();
+            gridPainting.current = true;
+            if (gridPaintMode) {
+              gridPaintValue.current = !grid[m][pIdx];
+              setEditableGrid(prev => {
+                const next = prev.map(r => [...r]);
+                next[m][pIdx] = gridPaintValue.current;
+                return next;
+              });
+            } else {
+              setEditableGrid(prev => {
+                const next = prev.map(r => [...r]);
+                next[m][pIdx] = !next[m][pIdx];
+                return next;
+              });
+            }
+          };
+
+          const cellEnter = (e, m, pIdx) => {
+            if (!gridPainting.current || !gridPaintMode) return;
+            setEditableGrid(prev => {
+              const next = prev.map(r => [...r]);
+              next[m][pIdx] = gridPaintValue.current;
+              return next;
+            });
+          };
+
+          return (
+            <>
+              <div style={{ overflowX: "auto", display: "flex", justifyContent: "center" }}>
+                <table style={{ borderCollapse: "collapse", userSelect: "none" }}>
+                  <thead>
+                    <tr>
+                      <th style={{ padding: "4px 6px", fontSize: "0.75rem", color: "#94a3b8", fontWeight: 600, textAlign: "center", minWidth: 40, position: "sticky", top: 0, background: "#0f172a" }}></th>
+                      {players.map((p, pIdx) => {
+                        const isSelected = swapSelectedIdx === pIdx;
+                        return (
+                          <th key={p.jersey}
+                            onClick={() => {
+                              if (swapSelectedIdx === null) {
+                                // First tap — select this column
+                                setSwapSelectedIdx(pIdx);
+                              } else if (swapSelectedIdx === pIdx) {
+                                // Tapped same — deselect
+                                setSwapSelectedIdx(null);
+                              } else {
+                                // Second tap — swap columns
+                                const fromIdx = swapSelectedIdx;
+                                const toIdx = pIdx;
+                                // Swap player order
+                                setGridPlayerOrder(prev => {
+                                  const next = [...prev];
+                                  const tmp = next[fromIdx];
+                                  next[fromIdx] = next[toIdx];
+                                  next[toIdx] = tmp;
+                                  return next;
+                                });
+                                // Swap grid columns
+                                setEditableGrid(prev => prev.map(row => {
+                                  const next = [...row];
+                                  const tmp = next[fromIdx];
+                                  next[fromIdx] = next[toIdx];
+                                  next[toIdx] = tmp;
+                                  return next;
+                                }));
+                                setSwapSelectedIdx(null);
+                              }
+                            }}
+                            style={{
+                              padding: "6px 4px", fontSize: "0.72rem", lineHeight: 1.2, textAlign: "center",
+                              minWidth: 52, position: "sticky", top: 0, cursor: "pointer",
+                              background: isSelected ? "#1e3a8a" : "#0f172a",
+                              border: isSelected ? "2px solid #3b82f6" : "2px solid transparent",
+                              borderRadius: isSelected ? 6 : 0,
+                              transition: "background 0.15s, border 0.15s",
+                            }}>
+                            <span style={{ color: "#fbbf24", fontSize: "0.85rem", display: "block" }}>#{p.jersey}</span>
+                            <span style={{ color: isSelected ? "#93c5fd" : "#94a3b8", fontSize: "0.65rem", display: "block" }}>{p.name}</span>
+                            {isSelected && <span style={{ color: "#60a5fa", fontSize: "0.55rem", display: "block" }}>swap ↔</span>}
+                          </th>
+                        );
+                      })}
+                      <th style={{ padding: "4px 6px", fontSize: "0.75rem", color: "#94a3b8", fontWeight: 600, textAlign: "center", minWidth: 28, position: "sticky", top: 0, background: "#0f172a" }}></th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {Array.from({ length: totalMins }, (_, m) => {
+                      // Halftime row
+                      const htRow = m === halfMins ? (
+                        <tr key="ht" style={{ height: 6 }}>
+                          <td style={{ background: "transparent", color: "#fbbf24", fontSize: "0.6rem", fontWeight: 700, textAlign: "right", paddingRight: 4, cursor: "default", border: "none" }}>HT</td>
+                          {players.map(p => <td key={p.jersey} style={{ background: "#fbbf24", border: "none", cursor: "default" }}></td>)}
+                          <td style={{ background: "#fbbf24", border: "none", cursor: "default" }}></td>
+                        </tr>
+                      ) : null;
+
+                      const displayMin = m < halfMins ? m + 1 : m - halfMins + 1;
+                      const halfLabel = m < halfMins ? "H1" : "H2";
+                      const rowCount = rowCounts[m];
+                      const hasTimeout = plannedTimeouts.has(m);
+
+                      return [
+                        htRow,
+                        <tr key={m}>
+                          <td onClick={() => {
+                              setPlannedTimeouts(prev => {
+                                const next = new Set(prev);
+                                if (next.has(m)) next.delete(m); else next.add(m);
+                                return next;
+                              });
+                            }}
+                            style={{ cursor: "pointer", fontSize: "0.7rem", color: hasTimeout ? "#f59e0b" : "#64748b", border: "none", textAlign: "right", paddingRight: 8, width: 40, minWidth: 40,
+                              background: hasTimeout ? "#78350f" : "transparent", borderRadius: hasTimeout ? 3 : 0, fontWeight: hasTimeout ? 700 : 400 }}>
+                            {hasTimeout ? "⏱ " : ""}{halfLabel} {displayMin}
+                          </td>
+                          {players.map((p, pIdx) => {
+                            const filled = grid[m] && grid[m][pIdx];
+                            return (
+                              <td key={p.jersey}
+                                onMouseDown={e => cellDown(e, m, pIdx)}
+                                onMouseEnter={e => cellEnter(e, m, pIdx)}
+                                style={{
+                                  width: 52, height: 22, border: "1px solid #1e293b", textAlign: "center",
+                                  cursor: "pointer", transition: "background 0.05s",
+                                  background: filled ? "#16a34a" : "transparent",
+                                }}></td>
+                            );
+                          })}
+                          <td style={{ fontSize: "0.6rem", width: 28, textAlign: "center", border: "none", cursor: "default", padding: "0 2px",
+                            color: rowCount === 5 ? "#4ade80" : "#f87171", fontWeight: 700 }}>
+                            {rowCount}/5
+                          </td>
+                        </tr>,
+                      ];
+                    }).flat().filter(Boolean)}
+
+                    {/* TOTALS row */}
+                    <tr>
+                      <td style={{ cursor: "default", fontSize: "0.75rem", fontWeight: 700, color: "#e2e8f0", border: "none", textAlign: "right", paddingRight: 8 }}>
+                        TOTAL
+                      </td>
+                      {players.map((p, pIdx) => {
+                        const total = playerTotals[pIdx];
+                        const tgt = target[p.jersey] || idealTarget;
+                        let color = "#4ade80";
+                        if (total > tgt + 2) color = "#f87171";
+                        else if (total < tgt - 2) color = "#fbbf24";
+                        return (
+                          <td key={p.jersey} style={{ cursor: "default", fontSize: "0.75rem", fontWeight: 700, border: "1px solid #334155", background: "#1e293b", textAlign: "center", color }}>
+                            {total}
+                          </td>
+                        );
+                      })}
+                      <td style={{ cursor: "default", fontSize: "0.65rem", fontWeight: 700, border: "1px solid #334155", background: "#1e293b", textAlign: "center",
+                        color: totalCourtMins === 5 * totalMins ? "#4ade80" : "#fbbf24" }}>
+                        {totalCourtMins}
+                      </td>
+                    </tr>
+                  </tbody>
+                </table>
+              </div>
+
+              {/* Summary stats */}
+              <div style={{ display: "flex", justifyContent: "center", gap: 16, marginTop: 14, flexWrap: "wrap", fontSize: "0.8rem" }}>
+                <div style={{ color: "#94a3b8" }}>Spread: <span style={{ color: "#f8fafc", fontWeight: 600 }}>{spread} min</span></div>
+                <div style={{ color: "#94a3b8" }}>Most: <span style={{ color: "#f8fafc", fontWeight: 600 }}>{maxMins} min</span></div>
+                <div style={{ color: "#94a3b8" }}>Least: <span style={{ color: "#f8fafc", fontWeight: 600 }}>{minMins} min</span></div>
+                <div style={{ color: "#94a3b8" }}>Target: <span style={{ color: "#f8fafc", fontWeight: 600 }}>{idealTarget.toFixed(1)} min</span></div>
+              </div>
+              <div style={{ textAlign: "center", marginTop: 8, fontSize: "0.75rem", color: "#64748b" }}>
+                5 players × {totalMins} min ÷ {players.length} players = {idealTarget.toFixed(1)} min each
+              </div>
+              {/* Legend */}
+              <div style={{ display: "flex", justifyContent: "center", gap: 16, marginTop: 10, fontSize: "0.7rem", color: "#64748b" }}>
+                <span><span style={{ display: "inline-block", width: 12, height: 12, borderRadius: 2, marginRight: 4, verticalAlign: "middle", background: "#4ade80" }}></span> On target</span>
+                <span><span style={{ display: "inline-block", width: 12, height: 12, borderRadius: 2, marginRight: 4, verticalAlign: "middle", background: "#fbbf24" }}></span> Under target</span>
+                <span><span style={{ display: "inline-block", width: 12, height: 12, borderRadius: 2, marginRight: 4, verticalAlign: "middle", background: "#f87171" }}></span> Over target</span>
+              </div>
+            </>
+          );
+        })()}
+
+        {/* Action buttons */}
+        <div style={{ marginTop: 16 }}>
+          {gameIsLive ? (
+            <>
+              <button onClick={() => { syncGridToPlan(); setScreen("game"); }}
+                style={{ width: "100%", padding: "16px", borderRadius: 16, border: "none", cursor: "pointer",
+                  background: "linear-gradient(135deg,#1d4ed8,#3b82f6)", color: "#fff", fontSize: 17, fontWeight: 700,
+                  display: "flex", alignItems: "center", justifyContent: "center", gap: 10, marginBottom: 8 }}>
+                ← Back to Game
+              </button>
+              <button onClick={() => { if (window.confirm("This will end the current game and lose all data. Are you sure?")) { discardSavedGame(); } }}
+                style={{ width: "100%", padding: "12px", borderRadius: 12, border: "1px solid #991b1b", cursor: "pointer",
+                  background: "transparent", color: "#f87171", fontSize: 14, fontWeight: 600 }}>
+                End Game & New Setup
+              </button>
+            </>
+          ) : (
+            <button onClick={handleStartGame}
+              style={{ width: "100%", padding: "16px", borderRadius: 16, border: "none", cursor: "pointer",
+                background: "linear-gradient(135deg,#059669,#10b981)", color: "#fff", fontSize: 17, fontWeight: 700,
+                display: "flex", alignItems: "center", justifyContent: "center", gap: 10 }}>
+              <CoachKLogo size={24} /> Start Game
+            </button>
+          )}
+        </div>
       </div>
     </div>
   );
@@ -1977,9 +3836,26 @@ function App() {
                 <CoachKLogo size={64} />
               </div>
               <div style={{ color: "#fbbf24", fontSize: 22, fontWeight: 800, marginBottom: 8 }}>HALFTIME</div>
-              <div style={{ color: "#94a3b8", fontSize: 14, marginBottom: 24 }}>Players who sat most in H1 start the 2nd half</div>
+              <div style={{ color: "#94a3b8", fontSize: 14, marginBottom: 24 }}>
+                {rotationPlan ? "H2 lineup from rotation plan" : "Players who sat most in H1 start the 2nd half"}
+              </div>
               <div style={{ display: "flex", flexWrap: "wrap", gap: 8, justifyContent: "center", marginBottom: 24 }}>
                 {(() => {
+                  // If plan exists, use the first H2 segment lineup
+                  if (rotationPlan && rotationPlan.segments) {
+                    const h2Start = rotationPlan.segments.find(s => s.half === 2);
+                    if (h2Start && h2Start.onCourt) {
+                      return h2Start.onCourt.map(j => {
+                        const p = available.find(pl => pl.jersey === j) || PLAYERS_DB.find(pl => pl.jersey === j);
+                        if (!p) return null;
+                        return (
+                          <div key={j} style={{ background: p.color + "44", border: `1px solid ${p.color}`, borderRadius: 8, padding: "4px 10px", color: "#fff", fontSize: 13, fontWeight: 600 }}>
+                            #{p.jersey} {p.name}
+                          </div>
+                        );
+                      }).filter(Boolean);
+                    }
+                  }
                   const { courtObjs: court } = computeSecondHalfLineup();
                   return court.map(p => (
                     <div key={p.jersey} style={{ background: p.color + "44", border: `1px solid ${p.color}`, borderRadius: 8, padding: "4px 10px", color: "#fff", fontSize: 13, fontWeight: 600 }}>
@@ -2056,6 +3932,106 @@ function App() {
           </div>
         </div>
 
+        {/* REROUTE BANNER — auto-dismisses, no OK button */}
+        {rerouteBanner && (
+          <div style={{
+            background: "linear-gradient(135deg, #7c2d12, #9a3412)",
+            borderRadius: 12, padding: "10px 14px", marginBottom: 10,
+            display: "flex", alignItems: "center", gap: 10,
+            animation: "fadeIn 0.3s ease-in",
+          }}>
+            <span style={{ fontSize: 18 }}>🔄</span>
+            <div>
+              <div style={{ color: "#fed7aa", fontSize: 12, fontWeight: 700 }}>PLAN REROUTED</div>
+              <div style={{ color: "#fdba74", fontSize: 11 }}>{rerouteBanner} — remaining time redistributed</div>
+            </div>
+          </div>
+        )}
+
+        {/* SCORE & TIMEOUT PANEL */}
+        {!gameOver && showScorePanel && (
+          <div style={{ background: "#1e293b", borderRadius: 12, padding: "8px 12px", marginBottom: 10 }}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 6 }}>
+              {/* Us score */}
+              <div style={{ flex: 1, textAlign: "center" }}>
+                <div style={{ color: "#4ade80", fontSize: 10, fontWeight: 700, letterSpacing: 1 }}>ROADIES</div>
+                <div style={{ color: "#fff", fontSize: 28, fontWeight: 800, lineHeight: 1.1 }}>{scoreUs}</div>
+                <div style={{ display: "flex", gap: 4, justifyContent: "center", marginTop: 4 }}>
+                  <button onClick={() => addScore("us", 1)} style={{ padding: "4px 8px", borderRadius: 6, border: "none", background: "#166534", color: "#4ade80", fontSize: 11, fontWeight: 700, cursor: "pointer" }}>+1</button>
+                  <button onClick={() => addScore("us", 2)} style={{ padding: "4px 8px", borderRadius: 6, border: "none", background: "#166534", color: "#4ade80", fontSize: 11, fontWeight: 700, cursor: "pointer" }}>+2</button>
+                  <button onClick={() => addScore("us", 3)} style={{ padding: "4px 8px", borderRadius: 6, border: "none", background: "#166534", color: "#4ade80", fontSize: 11, fontWeight: 700, cursor: "pointer" }}>+3</button>
+                  <button onClick={() => undoScore("us")} style={{ padding: "4px 6px", borderRadius: 6, border: "1px solid #334155", background: "transparent", color: "#64748b", fontSize: 11, cursor: "pointer" }}>−1</button>
+                </div>
+              </div>
+              {/* Divider + timeouts */}
+              <div style={{ display: "flex", flexDirection: "column", alignItems: "center", padding: "0 8px" }}>
+                <div style={{ color: "#475569", fontSize: 20, fontWeight: 300, marginBottom: 4 }}>—</div>
+                <div style={{ display: "flex", gap: 4 }}>
+                  <button onClick={() => useTimeout("us")} title="Our timeout"
+                    style={{ padding: "3px 6px", borderRadius: 5, border: "1px solid #475569", background: "#334155", color: "#94a3b8", fontSize: 9, fontWeight: 700, cursor: "pointer" }}>
+                    TO:{timeoutsUs}
+                  </button>
+                  <button onClick={() => useTimeout("opp")} title="Their timeout"
+                    style={{ padding: "3px 6px", borderRadius: 5, border: "1px solid #475569", background: "#334155", color: "#94a3b8", fontSize: 9, fontWeight: 700, cursor: "pointer" }}>
+                    TO:{timeoutsOpponent}
+                  </button>
+                </div>
+              </div>
+              {/* Opponent score */}
+              <div style={{ flex: 1, textAlign: "center" }}>
+                <div style={{ color: "#f87171", fontSize: 10, fontWeight: 700, letterSpacing: 1 }}>OPPONENT</div>
+                <div style={{ color: "#fff", fontSize: 28, fontWeight: 800, lineHeight: 1.1 }}>{scoreOpponent}</div>
+                <div style={{ display: "flex", gap: 4, justifyContent: "center", marginTop: 4 }}>
+                  <button onClick={() => addScore("opp", 1)} style={{ padding: "4px 8px", borderRadius: 6, border: "none", background: "#7f1d1d", color: "#fca5a5", fontSize: 11, fontWeight: 700, cursor: "pointer" }}>+1</button>
+                  <button onClick={() => addScore("opp", 2)} style={{ padding: "4px 8px", borderRadius: 6, border: "none", background: "#7f1d1d", color: "#fca5a5", fontSize: 11, fontWeight: 700, cursor: "pointer" }}>+2</button>
+                  <button onClick={() => addScore("opp", 3)} style={{ padding: "4px 8px", borderRadius: 6, border: "none", background: "#7f1d1d", color: "#fca5a5", fontSize: 11, fontWeight: 700, cursor: "pointer" }}>+3</button>
+                  <button onClick={() => undoScore("opp")} style={{ padding: "4px 6px", borderRadius: 6, border: "1px solid #334155", background: "transparent", color: "#64748b", fontSize: 11, cursor: "pointer" }}>−1</button>
+                </div>
+              </div>
+            </div>
+            <div style={{ borderTop: "1px solid #334155", paddingTop: 4, display: "flex", justifyContent: "center" }}>
+              <button onClick={() => setShowScorePanel(false)}
+                style={{ padding: "2px 10px", borderRadius: 6, border: "none", background: "transparent", color: "#475569", fontSize: 10, cursor: "pointer" }}>
+                Hide score panel
+              </button>
+            </div>
+          </div>
+        )}
+        {/* Show score button when panel is hidden */}
+        {!gameOver && !showScorePanel && (
+          <div style={{ textAlign: "center", marginBottom: 6 }}>
+            <button onClick={() => setShowScorePanel(true)}
+              style={{ padding: "4px 12px", borderRadius: 8, border: "1px solid #334155", background: "#1e293b", color: "#64748b", fontSize: 11, cursor: "pointer" }}>
+              Show score panel
+            </button>
+          </div>
+        )}
+
+        {/* POSSESSION ARROW */}
+        {!gameOver && showPossessionArrow && (
+          <div style={{ textAlign: "center", marginBottom: 10 }}>
+            <button onClick={() => setPossessionLeft(p => !p)}
+              style={{
+                width: "100%", padding: "10px", borderRadius: 12, border: "2px solid #475569",
+                background: "#1e293b", cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center", gap: 12,
+              }}>
+              <span style={{ color: possessionLeft ? "#fbbf24" : "#475569", fontSize: 28, fontWeight: 900, transition: "color 0.2s" }}>⬅</span>
+              <span style={{ color: "#94a3b8", fontSize: 11, fontWeight: 700, letterSpacing: 1 }}>POSS</span>
+              <span style={{ color: !possessionLeft ? "#fbbf24" : "#475569", fontSize: 28, fontWeight: 900, transition: "color 0.2s" }}>➡</span>
+            </button>
+          </div>
+        )}
+
+        {/* UNDO BUTTON — always visible when undo available */}
+        {!gameOver && undoStack.length > 0 && (
+          <div style={{ textAlign: "center", marginBottom: 10 }}>
+            <button onClick={performUndo}
+              style={{ padding: "5px 14px", borderRadius: 8, border: "1px solid #475569", background: "#334155", color: "#cbd5e1", fontSize: 12, fontWeight: 600, cursor: "pointer" }}>
+              ↩ Undo: {undoStack[undoStack.length - 1].label}
+            </button>
+          </div>
+        )}
+
         {/* SUB SUGGESTION — window-based with urgency levels */}
         {pendingSub && !gameOver && (() => {
           // Compute urgency from window timing
@@ -2104,9 +4080,30 @@ function App() {
                   <span style={{ color: "#64748b" }}> ({s.in.pos[0]})</span>
                 </div>
               ))}
+              {/* Why this sub? disclosure */}
+              {pendingSub.whyDetails && (
+                <div style={{ marginTop: 4 }}>
+                  <div onClick={() => setShowWhySub(prev => !prev)}
+                    style={{ color: "#64748b", fontSize: 11, cursor: "pointer", fontWeight: 600 }}>
+                    {showWhySub ? "▼ Hide details" : "▶ Why this sub?"}
+                  </div>
+                  {showWhySub && (
+                    <div style={{ background: "#0f172a", borderRadius: 8, padding: "6px 10px", marginTop: 4 }}>
+                      {pendingSub.whyDetails.map((details, i) => (
+                        <div key={i} style={{ marginBottom: i < pendingSub.whyDetails.length - 1 ? 4 : 0 }}>
+                          {details.map((line, j) => (
+                            <div key={j} style={{ color: "#94a3b8", fontSize: 11, lineHeight: 1.4 }}>• {line}</div>
+                          ))}
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              )}
               <div style={{ display: "flex", gap: 8, marginTop: 8 }}>
                 <button
                   onClick={() => withActionLock(() => {
+                    pushUndo(pendingSub.addOnly ? "Add player" : "Confirm sub");
                     if (pendingSub.addOnly) {
                       // Add-only: bring player onto court without removing anyone
                       const inJersey = pendingSub.subs[0].in.jersey;
@@ -2121,12 +4118,40 @@ function App() {
                         subs: [{ out: null, in: pObj(inJersey) }],
                       }]);
                       setLastSubTime(now);
+                      markNearbyWindowHandled();
                       setPendingSub(null);
                       setRestedThisHalf(prev => { const next = new Set(prev); next.add(inJersey); return next; });
                       markActiveWindowHandled();
                     } else {
-                      const applied = doSubs(pendingSub.subs.map(s => ({ outJersey: s.out.jersey, inJersey: s.in.jersey })));
-                      if (applied > 0) {
+                      // Process swaps (out+in pairs)
+                      const swaps = pendingSub.subs.filter(s => s.out);
+                      const applied = swaps.length > 0
+                        ? doSubs(swaps.map(s => ({ outJersey: s.out.jersey, inJersey: s.in.jersey })))
+                        : 0;
+                      // Process any adds in a mixed array (out: null entries)
+                      const adds = pendingSub.subs.filter(s => !s.out);
+                      let courtAfterSwaps = [...onCourt];
+                      for (const sw of swaps) {
+                        courtAfterSwaps = courtAfterSwaps.filter(j => j !== sw.out.jersey);
+                        if (!courtAfterSwaps.includes(sw.in.jersey)) courtAfterSwaps.push(sw.in.jersey);
+                      }
+                      let addedCount = 0;
+                      for (const addSub of adds) {
+                        const inJersey = addSub.in.jersey;
+                        if (courtAfterSwaps.length >= 5) break; // capacity guard
+                        if (courtAfterSwaps.includes(inJersey) || unavailableJerseys.has(inJersey)) continue;
+                        courtAfterSwaps.push(inJersey);
+                        addedCount++;
+                        const now = gameSecs;
+                        setStintStart(prev => ({ ...prev, [inJersey]: now }));
+                        setOffSince(prev => { const n = { ...prev }; delete n[inJersey]; return n; });
+                        setOnCourt(prev => [...prev, inJersey]);
+                        setSubLog(prev => [...prev, {
+                          time: now, half, timeInHalf,
+                          subs: [{ out: null, in: pObj(inJersey) }],
+                        }]);
+                      }
+                      if (applied > 0 || addedCount > 0) {
                         if (pendingSub.windowTarget != null && pendingSub.windowRoster != null) {
                           const k = wKey(pendingSub.windowRoster, pendingSub.windowTarget);
                           setHandledWindows(prev => new Set([...prev, k]));
@@ -2136,6 +4161,11 @@ function App() {
                         if (pendingSub.windowTarget == null && !pendingSub.reason?.startsWith("Closer")) {
                           markActiveWindowHandled();
                         }
+                        setLastSubTime(gameSecs);
+                      }
+                      // Only advance plan if actual changes happened
+                      if (applied > 0 || addedCount > 0) {
+                        confirmPlanSub();
                       }
                       setPendingSub(null);
                     }
@@ -2148,9 +4178,24 @@ function App() {
                       ? `✓ Confirm ${pendingSub.subs.length} Subs`
                       : "✓ Confirm Sub"}
                 </button>
+                {/* Delay — dismiss now, will re-appear next tick (plan-based) */}
+                {!pendingSub.mandatory && pendingSub._planSegId && (
+                  <button
+                    onClick={() => withActionLock(() => {
+                      setDelayedSegId(pendingSub._planSegId);
+                      setPlanDelayUntilSecs(gameSecs + 15);
+                      setPendingSub(null);
+                    })}
+                    style={{ padding: "10px 14px", borderRadius: 10, border: "1px solid #475569", cursor: "pointer",
+                      background: "#334155", color: "#fbbf24", fontWeight: 600, fontSize: 13 }}>
+                    Delay
+                  </button>
+                )}
+                {/* Skip — don't make this sub at all */}
                 {!pendingSub.mandatory && pendingSub.windowTarget != null && (
                   <button
                     onClick={() => withActionLock(() => {
+                      pushUndo("Skip window");
                       // Log the skipped window in the sub log
                       setSubLog(prev => [...prev, {
                         time: gameSecs,
@@ -2160,10 +4205,14 @@ function App() {
                         reason: pendingSub.reason,
                         windowTarget: pendingSub.windowTarget,
                         suggestedSubs: pendingSub.subs.map(s => ({
-                          outJersey: s.out.jersey, outName: s.out.name,
+                          outJersey: s.out?.jersey ?? null, outName: s.out?.name ?? null,
                           inJersey: s.in.jersey, inName: s.in.name,
                         })),
                       }]);
+                      if (pendingSub._planSegId) {
+                        // Mark this segment as handled so plan executor doesn't re-fire
+                        setLastExecutedSegId(pendingSub._planSegId);
+                      }
                       if (pendingSub.windowRoster != null) {
                         setHandledWindows(prev => new Set([...prev, wKey(pendingSub.windowRoster, pendingSub.windowTarget)]));
                       }
@@ -2178,8 +4227,101 @@ function App() {
             </div>
           );
         })()}
+        {/* TIMEOUT REMINDER */}
+        {!gameOver && screen === "game" && !showHalftime && timeoutRemindersOn && plannedTimeouts.size > 0 && (() => {
+          const currentGameMin = Math.floor(gameSecs / 60);
+          // Find the active timeout (current minute matches a planned one, not yet dismissed)
+          const activeTO = plannedTimeouts.has(currentGameMin) && !dismissedTimeouts.has(currentGameMin);
+          // Find next upcoming timeout
+          const sortedTOs = [...plannedTimeouts].sort((a, b) => a - b);
+          const nextTO = sortedTOs.find(m => m > currentGameMin && !dismissedTimeouts.has(m));
+          const nextTOCountdown = nextTO !== undefined ? (nextTO * 60) - gameSecs : null;
+
+          if (!activeTO && nextTO === undefined) return null;
+
+          if (activeTO) {
+            const toHalf = currentGameMin < halfMins ? "H1" : "H2";
+            const toMin = currentGameMin < halfMins ? currentGameMin + 1 : currentGameMin - halfMins + 1;
+            return (
+              <div style={{ background: "#78350f", border: "2px solid #f59e0b", borderRadius: 12, padding: "10px 14px", marginBottom: 10,
+                display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                <div>
+                  <div style={{ color: "#fbbf24", fontSize: 13, fontWeight: 700 }}>⏱ CALL TIMEOUT</div>
+                  <div style={{ color: "#fde68a", fontSize: 11 }}>Planned timeout at {toHalf} {toMin}:00</div>
+                </div>
+                <button onClick={() => setDismissedTimeouts(prev => new Set([...prev, currentGameMin]))}
+                  style={{ padding: "6px 12px", borderRadius: 8, border: "1px solid #92400e", background: "#451a03",
+                    color: "#fbbf24", cursor: "pointer", fontSize: 12, fontWeight: 600 }}>
+                  Done
+                </button>
+              </div>
+            );
+          }
+
+          // Show upcoming timeout in a subtle bar
+          if (nextTOCountdown !== null && nextTOCountdown <= 120) {
+            return (
+              <div style={{ background: "#1c1917", border: "1px solid #78350f", borderRadius: 10, padding: "6px 12px", marginBottom: 10,
+                display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                <span style={{ color: "#a16207", fontSize: 11, fontWeight: 600 }}>⏱ Timeout in {fmt(nextTOCountdown)}</span>
+              </div>
+            );
+          }
+          return null;
+        })()}
+
         {!pendingSub && !gameOver && screen === "game" && plan && !showHalftime && (() => {
-          // Show next window countdown
+          // Plan-based: show last sub and next sub info
+          if (rotationPlan && rotationPlan.segments) {
+            const segs = rotationPlan.segments;
+            const currentSeg = segs.find(s => gameSecs >= s.startSecs && gameSecs < s.endSecs);
+            // Find next segment with a lineup change
+            const currentIdx = currentSeg ? segs.indexOf(currentSeg) : -1;
+            let nextSubSeg = null;
+            let nextSubPlayers = [];
+            for (let i = currentIdx + 1; i < segs.length; i++) {
+              if (!currentSeg) break;
+              const prevCourt = new Set(segs[i > 0 ? i - 1 : 0].onCourt);
+              const changes = segs[i].onCourt.filter(j => !prevCourt.has(j));
+              if (changes.length > 0) {
+                nextSubSeg = segs[i];
+                nextSubPlayers = changes;
+                break;
+              }
+            }
+            // Find last sub that was executed
+            const lastSub = subLog.length > 0 ? subLog[subLog.length - 1] : null;
+
+            const nextCountdown = nextSubSeg ? nextSubSeg.startSecs - gameSecs : null;
+            return (
+              <div style={{ background: "#042f2e", border: "1px solid #14b8a6", borderRadius: 12, padding: "10px 14px", marginBottom: 10 }}>
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 4 }}>
+                  <span style={{ color: "#5eead4", fontSize: 12, fontWeight: 700 }}>✓ Following plan</span>
+                  {nextCountdown != null && nextCountdown > 0 && (
+                    <span style={{ color: "#2dd4bf", fontSize: 11, fontWeight: 600 }}>
+                      next sub in {fmt(nextCountdown)}
+                    </span>
+                  )}
+                </div>
+                {nextSubSeg && nextSubPlayers.length > 0 && (
+                  <div style={{ fontSize: 10, color: "#94a3b8", marginTop: 2 }}>
+                    <span style={{ color: "#64748b" }}>Next in: </span>
+                    {nextSubPlayers.map(j => {
+                      const p = available.find(pl => pl.jersey === j);
+                      return p ? `#${p.jersey} ${p.name}` : `#${j}`;
+                    }).join(", ")}
+                  </div>
+                )}
+                {lastSub && !lastSub.skipped && lastSub.subs && (
+                  <div style={{ fontSize: 10, color: "#64748b", marginTop: 2 }}>
+                    Last: {lastSub.subs.map(s => s.out ? `#${s.out.jersey}→#${s.in.jersey}` : `+#${s.in.jersey}`).join(", ")} @ {fmt(lastSub.time)}
+                  </div>
+                )}
+              </div>
+            );
+          }
+
+          // Fallback: old reactive engine countdown
           const activeRosterSize = available.length - fouledOut.size - injured.size;
           const schedule = activeRosterSize > 5
             ? getWindowSchedule(activeRosterSize, halfMins, START_BLOCK_SECS, CLOSE_BLOCK_SECS)
@@ -2463,61 +4605,238 @@ function App() {
             <div style={{ color: "#94a3b8", fontSize: 11, fontWeight: 700, letterSpacing: 1, marginBottom: 8 }}>SUB LOG</div>
             {subLog.map((entry, i) => (
               <div key={i} style={{ marginBottom: 8, paddingBottom: 8, borderBottom: i < subLog.length - 1 ? "1px solid #334155" : "none" }}>
-                <div style={{
-                  color: entry.skipped ? "#94a3b8" : entry.emergency ? "#fb923c" : "#fbbf24",
-                  fontSize: 11, fontWeight: 700, marginBottom: 3,
-                }}>
-                  {entry.skipped ? "⏭ SKIPPED" : entry.emergency ? "⚠️ EMERGENCY" : entry.subs.some(s => !s.out) ? "➕ ADD" : "🔄 SUB"} · H{entry.half} @ {fmt(entry.timeInHalf)}
-                </div>
-                {entry.skipped ? (
-                  <div style={{ fontSize: 12, color: "#64748b", fontStyle: "italic" }}>
-                    {entry.reason || "no sub needed"}
-                  </div>
-                ) : entry.subs.map((s, j) => (
-                  <div key={j} style={{ fontSize: 12, color: "#cbd5e1" }}>
-                    {s.out ? (
-                      <>
-                        <span style={{ color: "#f87171" }}>OUT {s.out.name}</span>
-                        <span style={{ color: "#64748b" }}> → </span>
-                      </>
-                    ) : null}
-                    <span style={{ color: "#4ade80" }}>{s.out ? "IN" : "➕ ADD"} {s.in?.name ?? "?"}</span>
-                  </div>
-                ))}
+                {entry.timeout ? (
+                  <>
+                    <div style={{ color: "#f59e0b", fontSize: 11, fontWeight: 700, marginBottom: 3 }}>
+                      ⏸ TIMEOUT ({entry.team}) · H{entry.half} @ {fmt(entry.timeInHalf)}
+                    </div>
+                  </>
+                ) : (
+                  <>
+                    <div style={{
+                      color: entry.skipped ? "#94a3b8" : entry.emergency ? "#fb923c" : "#fbbf24",
+                      fontSize: 11, fontWeight: 700, marginBottom: 3,
+                    }}>
+                      {entry.skipped ? "⏭ SKIPPED" : entry.emergency ? "⚠️ EMERGENCY" : entry.subs.some(s => !s.out) ? "➕ ADD" : "🔄 SUB"} · H{entry.half} @ {fmt(entry.timeInHalf)}
+                    </div>
+                    {entry.skipped ? (
+                      <div style={{ fontSize: 12, color: "#64748b", fontStyle: "italic" }}>
+                        {entry.reason || "no sub needed"}
+                      </div>
+                    ) : entry.subs.map((s, j) => (
+                      <div key={j} style={{ fontSize: 12, color: "#cbd5e1" }}>
+                        {s.out ? (
+                          <>
+                            <span style={{ color: "#f87171" }}>OUT {s.out.name}</span>
+                            <span style={{ color: "#64748b" }}> → </span>
+                          </>
+                        ) : null}
+                        <span style={{ color: "#4ade80" }}>{s.out ? "IN" : "➕ ADD"} {s.in?.name ?? "?"}</span>
+                      </div>
+                    ))}
+                  </>
+                )}
               </div>
             ))}
           </div>
         )}
 
-        {/* GAME OVER */}
-        {gameOver && (
-          <div style={{ background: "#1e3a8a", borderRadius: 14, padding: 16, textAlign: "center" }}>
-            <div style={{ color: "#fbbf24", fontSize: 20, fontWeight: 800, marginBottom: 4 }}>🏆 Full Time!</div>
-            <div style={{ color: "#93c5fd", fontSize: 13, marginBottom: 12 }}>Final minutes played:</div>
-            {available.map(p => {
-              const secs = courtTime(p.jersey);
-              const m = Math.floor(secs / 60);
-              const s = secs % 60;
-              return (
-                <div key={p.jersey} style={{ display: "flex", justifyContent: "space-between", color: "#cbd5e1", fontSize: 13, marginBottom: 4, padding: "4px 8px" }}>
-                  <span>#{p.jersey} {p.name}</span>
-                  <span style={{ color: "#60a5fa", fontWeight: 600 }}>{m}:{s.toString().padStart(2,"0")}</span>
+        {/* GAME OVER — ENHANCED SUMMARY */}
+        {gameOver && (() => {
+          const rosterSize = available.length;
+          const equalTarget = totalGameSecs * 5 / rosterSize;
+          const playerRows = available.map(p => {
+            const secs = courtTime(p.jersey);
+            // Use planned/adjusted target if available, fallback to equal share
+            const plannedTarget = (adjustedTargetMins[p.jersey] ?? rotationPlan?.targetMinutes?.[p.jersey]) != null
+              ? (adjustedTargetMins[p.jersey] ?? rotationPlan?.targetMinutes?.[p.jersey]) * 60
+              : equalTarget;
+            const fairTarget = plannedTarget;
+            const diff = secs - fairTarget;
+            const pct = fairTarget > 0 ? (secs / fairTarget) * 100 : 0;
+            const foulCount = fouls[p.jersey] || 0;
+            const status = fouledOut.has(p.jersey) ? "Fouled out" : injured.has(p.jersey) ? "Injured" : "";
+            return { jersey: p.jersey, name: p.name, secs, diff, pct, foulCount, status };
+          }).sort((a, b) => b.secs - a.secs);
+          const allSecs = playerRows.map(r => r.secs);
+          const maxSecs = Math.max(...allSecs);
+          const minSecs = Math.min(...allSecs);
+          const spread = maxSecs - minSecs;
+          const below85 = playerRows.filter(r => r.pct < 85);
+          const subStoppages = subLog.filter(e => !e.skipped && !e.timeout).length;
+          const playerSwaps = subLog.filter(e => !e.skipped && !e.timeout).reduce((sum, e) => sum + (e.subs?.length || 0), 0);
+          const totalFouls = Object.values(fouls).reduce((a, b) => a + b, 0);
+
+          function buildClipboard() {
+            const lines = [];
+            lines.push("=== GAME SUMMARY ===");
+            if (scoreUs > 0 || scoreOpponent > 0) lines.push(`Score: Roadies ${scoreUs} – ${scoreOpponent} Opponent`);
+            if (timeoutsUs > 0 || timeoutsOpponent > 0) lines.push(`Timeouts: Roadies ${timeoutsUs}, Opponent ${timeoutsOpponent}`);
+            lines.push("");
+            lines.push(`Targets: planned/adjusted rotation targets (${rosterSize} players)`);
+            lines.push("");
+            lines.push("MINUTES:");
+            playerRows.forEach(r => {
+              const m = Math.floor(r.secs / 60);
+              const s = r.secs % 60;
+              const diffSign = r.diff >= 0 ? "+" : "";
+              const diffM = (r.diff / 60).toFixed(1);
+              const pTarget = (adjustedTargetMins[r.jersey] ?? rotationPlan?.targetMinutes?.[r.jersey]) != null
+                ? (adjustedTargetMins[r.jersey] ?? rotationPlan.targetMinutes[r.jersey])
+                : equalTarget / 60;
+              let line = `  #${r.jersey} ${r.name}: ${m}:${s.toString().padStart(2,"0")} / target ${fmt(Math.round(pTarget * 60))} (${diffSign}${diffM}m, ${Math.round(r.pct)}%)`;
+              if (r.foulCount > 0) line += ` [${r.foulCount}F]`;
+              if (r.status) line += ` [${r.status}]`;
+              lines.push(line);
+            });
+            lines.push("");
+            lines.push(`Spread: ${fmt(spread)} (max ${fmt(maxSecs)} / min ${fmt(minSecs)})`);
+            if (below85.length > 0) {
+              lines.push(`Below 85%: ${below85.map(r => {
+                const rTgt = (adjustedTargetMins[r.jersey] ?? rotationPlan?.targetMinutes?.[r.jersey]) != null
+                  ? (adjustedTargetMins[r.jersey] ?? rotationPlan?.targetMinutes?.[r.jersey]) * 60 : equalTarget;
+                const gap = Math.round(0.85 * rTgt - r.secs);
+                return `#${r.jersey} ${r.name} — ${r.pct.toFixed(1)}% (${fmt(Math.abs(gap))} below floor)`;
+              }).join(", ")}`);
+            } else {
+              lines.push("All players at or above 85% of target ✓");
+            }
+            lines.push(`Sub stoppages: ${subStoppages} | Player swaps: ${playerSwaps} | Total fouls: ${totalFouls}`);
+            lines.push("");
+            lines.push("SUB LOG:");
+            subLog.forEach(entry => {
+              if (entry.timeout) {
+                lines.push(`  H${entry.half} ${fmt(entry.timeInHalf)} — TIMEOUT (${entry.team})`);
+              } else if (entry.skipped) {
+                lines.push(`  H${entry.half} ${fmt(entry.timeInHalf)} — SKIPPED: ${entry.reason || "no sub needed"}`);
+              } else {
+                const parts = entry.subs.map(s => s.out ? `${s.out.name} → ${s.in?.name}` : `+${s.in?.name}`);
+                const tag = entry.emergency ? "EMERGENCY" : entry.subs.some(s => !s.out) ? "ADD" : "SUB";
+                lines.push(`  H${entry.half} ${fmt(entry.timeInHalf)} — ${tag}: ${parts.join(", ")}`);
+              }
+            });
+            return lines.join("\n");
+          }
+
+          return (
+            <div style={{ background: "#1e3a8a", borderRadius: 14, padding: 16 }}>
+              <div style={{ textAlign: "center", marginBottom: 12 }}>
+                <div style={{ color: "#fbbf24", fontSize: 20, fontWeight: 800, marginBottom: 4 }}>🏆 Full Time!</div>
+                {(scoreUs > 0 || scoreOpponent > 0) && (
+                  <div style={{ color: "#93c5fd", fontSize: 16, fontWeight: 700 }}>
+                    Roadies {scoreUs} – {scoreOpponent} Opponent
+                  </div>
+                )}
+                {(timeoutsUs > 0 || timeoutsOpponent > 0) && (
+                  <div style={{ color: "#94a3b8", fontSize: 12, marginTop: 2 }}>
+                    Timeouts: Roadies {timeoutsUs} · Opponent {timeoutsOpponent}
+                  </div>
+                )}
+              </div>
+
+              <div style={{ background: "#0f172a", borderRadius: 10, padding: 10, marginBottom: 10 }}>
+                <div style={{ color: "#94a3b8", fontSize: 11, fontWeight: 700, letterSpacing: 1, marginBottom: 6 }}>
+                  MINUTES vs planned target
                 </div>
-              );
-            })}
-            <button onClick={discardSavedGame} style={{ marginTop: 16, width: "100%", padding: "12px", borderRadius: 12, border: "none", background: "#1d4ed8", color: "#fff", fontSize: 15, fontWeight: 700, cursor: "pointer" }}>
-              New Game
-            </button>
-          </div>
-        )}
+                {playerRows.map(r => {
+                  const m = Math.floor(r.secs / 60);
+                  const s = r.secs % 60;
+                  const rTarget = (adjustedTargetMins[r.jersey] ?? rotationPlan?.targetMinutes?.[r.jersey]) != null
+                    ? (adjustedTargetMins[r.jersey] ?? rotationPlan?.targetMinutes?.[r.jersey]) * 60
+                    : equalTarget;
+                  const barPct = rTarget > 0 ? Math.min(120, (r.secs / rTarget) * 100) : 0;
+                  const barColor = r.pct < 85 ? "#ef4444" : r.pct < 95 ? "#f59e0b" : "#22c55e";
+                  return (
+                    <div key={r.jersey} style={{ marginBottom: 6 }}>
+                      <div style={{ display: "flex", justifyContent: "space-between", fontSize: 12, color: "#cbd5e1", marginBottom: 2 }}>
+                        <span>
+                          #{r.jersey} {r.name}
+                          {r.foulCount > 0 && <span style={{ color: "#f87171", marginLeft: 6, fontSize: 10 }}>{r.foulCount}F</span>}
+                          {r.status && <span style={{ color: "#fb923c", marginLeft: 6, fontSize: 10 }}>{r.status}</span>}
+                        </span>
+                        <span style={{ fontWeight: 600, color: barColor }}>
+                          {m}:{s.toString().padStart(2,"0")}
+                          <span style={{ color: "#64748b", fontSize: 10, marginLeft: 4 }}>
+                            ({r.diff >= 0 ? "+" : ""}{(r.diff / 60).toFixed(1)}m)
+                          </span>
+                        </span>
+                      </div>
+                      <div style={{ background: "#1e293b", borderRadius: 4, height: 6, overflow: "hidden" }}>
+                        <div style={{ background: barColor, width: `${Math.min(100, barPct)}%`, height: "100%", borderRadius: 4 }} />
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+
+              <div style={{ background: "#0f172a", borderRadius: 10, padding: 10, marginBottom: 10 }}>
+                <div style={{ color: "#94a3b8", fontSize: 11, fontWeight: 700, letterSpacing: 1, marginBottom: 6 }}>FAIRNESS</div>
+                <div style={{ display: "flex", justifyContent: "space-between", fontSize: 12, color: "#cbd5e1", marginBottom: 4 }}>
+                  <span>Spread (max – min)</span>
+                  <span style={{ fontWeight: 600, color: spread <= 120 ? "#22c55e" : spread <= 180 ? "#f59e0b" : "#ef4444" }}>{fmt(spread)}</span>
+                </div>
+                <div style={{ display: "flex", justifyContent: "space-between", fontSize: 12, color: "#cbd5e1", marginBottom: 4 }}>
+                  <span>Most court time</span>
+                  <span style={{ color: "#60a5fa" }}>{fmt(maxSecs)}</span>
+                </div>
+                <div style={{ display: "flex", justifyContent: "space-between", fontSize: 12, color: "#cbd5e1", marginBottom: 4 }}>
+                  <span>Least court time</span>
+                  <span style={{ color: "#60a5fa" }}>{fmt(minSecs)}</span>
+                </div>
+                <div style={{ display: "flex", justifyContent: "space-between", fontSize: 12, color: "#cbd5e1" }}>
+                  <span>Below 85% target</span>
+                  <span style={{ color: below85.length === 0 ? "#22c55e" : "#ef4444", fontWeight: 600 }}>
+                    {below85.length === 0 ? "None ✓" : below85.map(r => `#${r.jersey} (${r.pct.toFixed(1)}%)`).join(", ")}
+                  </span>
+                </div>
+              </div>
+
+              <div style={{ background: "#0f172a", borderRadius: 10, padding: 10, marginBottom: 12 }}>
+                <div style={{ color: "#94a3b8", fontSize: 11, fontWeight: 700, letterSpacing: 1, marginBottom: 6 }}>GAME STATS</div>
+                <div style={{ display: "flex", justifyContent: "space-between", fontSize: 12, color: "#cbd5e1", marginBottom: 4 }}>
+                  <span>Sub stoppages</span>
+                  <span style={{ color: "#60a5fa", fontWeight: 600 }}>{subStoppages}</span>
+                </div>
+                <div style={{ display: "flex", justifyContent: "space-between", fontSize: 12, color: "#cbd5e1", marginBottom: 4 }}>
+                  <span>Player swaps</span>
+                  <span style={{ color: "#60a5fa", fontWeight: 600 }}>{playerSwaps}</span>
+                </div>
+                <div style={{ display: "flex", justifyContent: "space-between", fontSize: 12, color: "#cbd5e1" }}>
+                  <span>Total fouls</span>
+                  <span style={{ color: totalFouls > 0 ? "#f87171" : "#60a5fa", fontWeight: 600 }}>{totalFouls}</span>
+                </div>
+              </div>
+
+              <div style={{ display: "flex", gap: 8 }}>
+                <button onClick={() => {
+                  const text = buildClipboard();
+                  if (navigator.clipboard) {
+                    navigator.clipboard.writeText(text).then(() => {
+                      alert("Game summary copied to clipboard!");
+                    }).catch(() => {
+                      prompt("Copy this summary:", text);
+                    });
+                  } else {
+                    prompt("Copy this summary:", text);
+                  }
+                }} style={{ flex: 1, padding: "12px", borderRadius: 12, border: "1px solid #3b82f6", background: "transparent", color: "#93c5fd", fontSize: 14, fontWeight: 700, cursor: "pointer" }}>
+                  📋 Copy Summary
+                </button>
+                <button onClick={discardSavedGame} style={{ flex: 1, padding: "12px", borderRadius: 12, border: "none", background: "#1d4ed8", color: "#fff", fontSize: 14, fontWeight: 700, cursor: "pointer" }}>
+                  New Game
+                </button>
+              </div>
+            </div>
+          );
+        })()}
       </div>
     </div>
   );
 }
 
-
 const root = ReactDOM.createRoot(document.getElementById("root"));
 root.render(React.createElement(App));
+
 </script>
 </body>
 </html>
