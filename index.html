@@ -1,16 +1,15 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-<meta charset="UTF-8" />
-<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
-<title>SubPlanner V3</title>
-<script src="https://unpkg.com/react@18/umd/react.production.min.js" crossorigin></script>
-<script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js" crossorigin></script>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no"/>
+<title>Coach K Sub Planner</title>
+<script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
 <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
 <style>
-  * { margin: 0; padding: 0; box-sizing: border-box; }
-  body { background: #0f172a; overflow-x: hidden; }
-  #root { min-height: 100vh; }
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:#0f172a;overflow-x:hidden;-webkit-tap-highlight-color:transparent}
 </style>
 </head>
 <body>
@@ -339,7 +338,7 @@ function buildSegments(rosterSize, halfMins) {
       const startSecs = baseOffset + t;
       const endSecs = baseOffset + Math.min(t + blockSecs, halfSecs);
       const isStart = t < START_BLOCK_SECS;
-      const isClose = (baseOffset + halfSecs - t) <= CLOSE_BLOCK_SECS && h === 2;
+      const isClose = (halfSecs - t) <= CLOSE_BLOCK_SECS && h === 2;
       const isH1Close = t >= (halfSecs - CLOSE_BLOCK_SECS) && h === 1;
       segments.push({
         id: `H${h}-${String(Math.floor(t/60)).padStart(2,"0")}-${String(Math.floor(Math.min(t+blockSecs,halfSecs)/60)).padStart(2,"0")}`,
@@ -400,7 +399,7 @@ function scoreLineup(lineup, segment, plan, targetMinutes, minutesUsed, mode, pr
   if (prevLineup && prevLineup.length === 5) {
     const prevSet = new Set(prevLineup.map(p => p.jersey));
     const changes = lineup.filter(p => !prevSet.has(p.jersey)).length;
-    if (changes === 0) score -= 100; // no change = wasted window
+    if (changes === 0) score += 100;  // stability = fewer stoppages = good
     if (changes > 0) score -= 200;   // base stoppage cost per change event
     if (changes >= 3) score -= 300;  // heavy penalty for 3+ swaps at once
     if (changes >= 4) score -= 500;  // extreme penalty for 4+ swaps at once
@@ -613,16 +612,40 @@ function reroutePlan(currentPlan, gameSecs, activePlayers, actualMinutesPlayed, 
   const totalGameSecs = halfMins * 2 * 60;
   const segments = currentPlan.segments;
 
-  // Freeze completed segments
-  const frozen = segments.filter(s => s.endSecs <= gameSecs);
-  const future = segments.filter(s => s.startSecs > gameSecs); // strictly > to avoid boundary duplication
+  // Freeze completed segments + capture partial past for the currently-playing segment
+  const frozen = segments.filter(s => s.endSecs <= gameSecs).map(s => ({ ...s }));
+  const playingSeg = segments.find(s => s.startSecs < gameSecs && s.endSecs > gameSecs);
+  if (playingSeg) {
+    frozen.push({ ...playingSeg, endSecs: gameSecs, durationSecs: gameSecs - playingSeg.startSecs });
+  }
+  // Use >= so boundary segments (startSecs === gameSecs) are not lost
+  const future = segments.filter(s => s.startSecs >= gameSecs);
 
   // If no future segments, nothing to do
-  if (future.length === 0 && !segments.some(s => s.startSecs <= gameSecs && s.endSecs > gameSecs)) return currentPlan;
+  if (future.length === 0 && !playingSeg) return currentPlan;
 
   // Snap to next 2-min boundary for clean regeneration
   const nextBoundary = Math.ceil(gameSecs / 120) * 120;
-  const futureFresh = future.filter(s => s.startSecs >= nextBoundary);
+
+  // Gap fix: if playingSeg extends past nextBoundary (merged segments can be > 2 min),
+  // inject its remainder into future so the solver covers the full timeline.
+  if (playingSeg && playingSeg.endSecs > nextBoundary) {
+    const alreadyCovers = future.some(s => s.startSecs >= nextBoundary && s.startSecs < playingSeg.endSecs);
+    if (!alreadyCovers) {
+      future.push({
+        ...playingSeg,
+        id: `rem-${nextBoundary}`,
+        startSecs: nextBoundary,
+        endSecs: playingSeg.endSecs,
+        durationSecs: playingSeg.endSecs - nextBoundary,
+        onCourt: [...playingSeg.onCourt],
+        warnings: [],
+      });
+      future.sort((a, b) => a.startSecs - b.startSecs);
+    }
+  }
+
+  const futureFresh = future.filter(s => s.startSecs >= nextBoundary).map(s => ({ ...s, onCourt: [...s.onCourt], warnings: [...(s.warnings || [])] }));
 
   // Build transition segment from ACTUAL on-court lineup, not old plan segment.
   // This ensures the injured/fouled-out player is never in the transition.
@@ -650,7 +673,7 @@ function reroutePlan(currentPlan, gameSecs, activePlayers, actualMinutesPlayed, 
     const played = actualMinutesPlayed[p.jersey] || 0;
     const original = (targetMinutesOverride && targetMinutesOverride[p.jersey] != null)
       ? targetMinutesOverride[p.jersey]
-      : currentPlan.targetMinutes[p.jersey];
+      : currentPlan.targetMinutes?.[p.jersey];
     if (original != null) {
       remainingTargets[p.jersey] = Math.max(0, original - played);
     } else {
@@ -676,7 +699,8 @@ function reroutePlan(currentPlan, gameSecs, activePlayers, actualMinutesPlayed, 
     }
     const totals = {};
     activePlayers.forEach(p => { totals[p.jersey] = actualMinutesPlayed[p.jersey] || 0; });
-    for (const seg of futureFresh) {
+    const projSegs = [...(transition ? [transition] : []), ...futureFresh];
+    for (const seg of projSegs) {
       const dur = seg.durationSecs / 60;
       for (const j of seg.onCourt) totals[j] = (totals[j] || 0) + dur;
     }
@@ -698,7 +722,8 @@ function reroutePlan(currentPlan, gameSecs, activePlayers, actualMinutesPlayed, 
     }
     const totals = {};
     activePlayers.forEach(p => { totals[p.jersey] = actualMinutesPlayed[p.jersey] || 0; });
-    for (const seg of futureFresh) {
+    const projSegs = [...(transition ? [transition] : []), ...futureFresh];
+    for (const seg of projSegs) {
       const dur = seg.durationSecs / 60;
       for (const j of seg.onCourt) totals[j] = (totals[j] || 0) + dur;
     }
@@ -711,11 +736,54 @@ function reroutePlan(currentPlan, gameSecs, activePlayers, actualMinutesPlayed, 
     };
   }
 
-  const allLineups = combinations(activePlayers, 5).filter(satisfiesHardRules);
+  let allLineups = combinations(activePlayers, 5).filter(satisfiesHardRules);
+
+  // Fallback: if no hard-legal lineup exists (e.g. key ball-handler + passer both out),
+  // use all combinations without hard rules and attach a warning
+  let noHardLegalLineup = false;
+  if (allLineups.length === 0) {
+    allLineups = combinations(activePlayers, 5);
+    noHardLegalLineup = true;
+  }
+  // If still empty (fewer than 5 active players), build best-effort single lineup
+  if (allLineups.length === 0) {
+    const fallback = activePlayers.slice(0, Math.min(5, activePlayers.length));
+    const totals = {};
+    activePlayers.forEach(p => { totals[p.jersey] = actualMinutesPlayed[p.jersey] || 0; });
+    for (const seg of futureFresh) {
+      seg.onCourt = fallback.map(p => p.jersey);
+      seg.warnings = ["Fewer than 5 active players"];
+      const dur = seg.durationSecs / 60;
+      for (const j of seg.onCourt) totals[j] = (totals[j] || 0) + dur;
+    }
+    return {
+      ...currentPlan,
+      segments: [...frozen, ...(transition ? [transition] : []), ...futureFresh],
+      actualMinutes: totals,
+      rerouteReason: reason + " — fewer than 5 active players",
+      rerouteAtSecs: gameSecs,
+    };
+  }
+
   const minutesUsed = {};
   activePlayers.forEach(p => { minutesUsed[p.jersey] = 0; });
 
+  // Seed solver with transition segment time so it doesn't over-assign court players
+  if (transition) {
+    const tDur = transition.durationSecs / 60;
+    for (const j of transition.onCourt) {
+      minutesUsed[j] = (minutesUsed[j] || 0) + tDur;
+    }
+  }
+
+  // Seed prevLineup from transition or last frozen segment so continuity
+  // penalty is enforced across the reroute boundary (prevents mass line changes).
   let prevLineup = null;
+  if (transition) {
+    prevLineup = activePlayers.filter(p => transition.onCourt.includes(p.jersey));
+  } else if (frozen.length > 0) {
+    prevLineup = activePlayers.filter(p => frozen[frozen.length - 1].onCourt.includes(p.jersey));
+  }
   for (const seg of futureFresh) {
     if (seg.locked && (seg.lockReason === "close-block" || seg.lockReason === "start-block")) {
       // Preserve bookend lineup: closers for close-block, starters for start-block
@@ -739,7 +807,7 @@ function reroutePlan(currentPlan, gameSecs, activePlayers, actualMinutesPlayed, 
       if (prevLineup) {
         const prevSet = new Set(prevLineup.map(p => p.jersey));
         const changes = lineup.filter(p => !prevSet.has(p.jersey)).length;
-        if (changes === 0) score -= 100;
+        if (changes === 0) score += 100;
         if (changes > 0) score -= 200;
         if (changes >= 3) score -= 300;
         if (changes >= 4) score -= 500;
@@ -750,6 +818,9 @@ function reroutePlan(currentPlan, gameSecs, activePlayers, actualMinutesPlayed, 
     if (bestLineup) {
       seg.onCourt = bestLineup.map(p => p.jersey);
       seg.warnings = checkSoftRules(bestLineup);
+      if (noHardLegalLineup) {
+        seg.warnings = [...(seg.warnings || []), "No BallHandle + Passing lineup available — using best effort"];
+      }
       const dur = seg.durationSecs / 60;
       for (const p of bestLineup) minutesUsed[p.jersey] = (minutesUsed[p.jersey] || 0) + dur;
       prevLineup = bestLineup;
@@ -786,10 +857,11 @@ function reroutePlan(currentPlan, gameSecs, activePlayers, actualMinutesPlayed, 
     if (!swapped) break;
   }
 
-  // Recalc actual totals
+  // Recalc actual totals — include transition segment so projections are accurate
   const totals = {};
   activePlayers.forEach(p => { totals[p.jersey] = actualMinutesPlayed[p.jersey] || 0; });
-  for (const seg of futureFresh) {
+  const projectedSegs = [...(transition ? [transition] : []), ...futureFresh];
+  for (const seg of projectedSegs) {
     const dur = seg.durationSecs / 60;
     for (const j of seg.onCourt) totals[j] = (totals[j] || 0) + dur;
   }
@@ -864,6 +936,7 @@ function App() {
   const [planMode, setPlanMode] = useState("balanced"); // balanced | competitive | development
   const [rotationPlan, setRotationPlan] = useState(null); // V3 plan-first rotation grid
   const [rerouteBanner, setRerouteBanner] = useState(null); // auto-dismiss reroute notification
+  const rerouteBannerTimer = useRef(null);
 
   // Editable grid state — grid[minuteIdx][playerIdx] = true/false
   // Initialized from rotationPlan segments when plan screen opens
@@ -871,6 +944,19 @@ function App() {
   const [gridPaintMode, setGridPaintMode] = useState(true);
   const gridPainting = useRef(false);
   const gridPaintValue = useRef(true);
+  const gridTableRef = useRef(null);
+  const gridTouchMoveRef = useRef(null);
+  // Attach touchmove as non-passive so preventDefault works on mobile
+  // Only re-bind when the grid actually mounts/unmounts (screen change or grid init)
+  const gridMounted = editableGrid !== null && screen === "plan";
+  useEffect(() => {
+    if (!gridMounted) return;
+    const node = gridTableRef.current;
+    if (!node) return;
+    const handler = (e) => { if (gridTouchMoveRef.current) gridTouchMoveRef.current(e); };
+    node.addEventListener("touchmove", handler, { passive: false });
+    return () => node.removeEventListener("touchmove", handler);
+  }, [gridMounted]);
   // Stable player ordering for grid columns (set when grid is initialized)
   const [gridPlayerOrder, setGridPlayerOrder] = useState([]);
   // Column swap: first tap selects, second tap swaps
@@ -1021,6 +1107,7 @@ function App() {
   const [activeMenu, setActiveMenu] = useState(null);    // jersey with open menu (on court)
   const [benchMenu, setBenchMenu] = useState(null);      // jersey with open menu (bench)
   const [replacingJersey, setReplacingJersey] = useState(null); // jersey needing replacement
+  const [shortHandedDismissedAt, setShortHandedDismissedAt] = useState(null); // coach chose to play short-handed
 
   // Adjusted target minutes (redistributed when player fouls out)
   const [adjustedTargetMins, setAdjustedTargetMins] = useState({});
@@ -1129,62 +1216,66 @@ function App() {
         lastExecutedSegId,
         planDelayUntilSecs,
         delayedSegId,
+        shortHandedDismissedAt,
       },
     }]);
   }
 
   function performUndo() {
-    if (undoStack.length === 0) return;
-    const { snapshot: s } = undoStack[undoStack.length - 1];
-    setUndoStack(prev => prev.slice(0, -1));
-    setGameSecs(s.gameSecs);
-    setRunning(s.running);
-    setOnCourt(s.onCourt);
-    setAccumulated(s.accumulated);
-    setStintStart(s.stintStart);
-    setOffSince(s.offSince);
-    setFouls(s.fouls);
-    setFouledOut(s.fouledOut);
-    setInjured(s.injured);
-    setAdjustedTargetMins(s.adjustedTargetMins);
-    setSubLog(s.subLog);
-    setInjuryInfo(s.injuryInfo);
-    setFouloutInfo(s.fouloutInfo);
-    setHandledWindows(s.handledWindows);
-    setRestedThisHalf(s.restedThisHalf);
-    setReplacingJersey(s.replacingJersey);
-    setPendingSub(s.pendingSub);
-    setLastSubTime(s.lastSubTime);
-    setHalftimeDone(s.halftimeDone);
-    setShowHalftime(s.showHalftime);
-    setScoreUs(s.scoreUs);
-    setScoreOpponent(s.scoreOpponent);
-    setTimeoutsUs(s.timeoutsUs);
-    setTimeoutsOpponent(s.timeoutsOpponent);
-    if (typeof s.possessionLeft === "boolean") setPossessionLeft(s.possessionLeft);
-    setActiveMenu(null);
-    setBenchMenu(null);
-    // V3 plan-first state restore
-    if (s.rotationPlan !== undefined) setRotationPlan(s.rotationPlan);
-    if (s.editableGrid !== undefined) setEditableGrid(s.editableGrid);
-    if (Array.isArray(s.gridPlayerOrderJerseys)) {
-      const order = s.gridPlayerOrderJerseys.map(j => PLAYERS_DB.find(p => p.jersey === j)).filter(Boolean);
-      if (order.length > 0) setGridPlayerOrder(order);
-    }
-    if (s.plannedTimeouts) setPlannedTimeouts(s.plannedTimeouts);
-    if (s.dismissedTimeouts) setDismissedTimeouts(s.dismissedTimeouts);
-    if (s.lastExecutedSegId !== undefined) setLastExecutedSegId(s.lastExecutedSegId);
-    if (s.planDelayUntilSecs !== undefined) setPlanDelayUntilSecs(s.planDelayUntilSecs);
-    if (s.delayedSegId !== undefined) setDelayedSegId(s.delayedSegId);
-    if (s.running) {
-      clockBaseRef.current = { wallMs: Date.now(), secs: s.gameSecs };
-    }
+    withActionLock(() => {
+      if (undoStack.length === 0) return;
+      const { snapshot: s } = undoStack[undoStack.length - 1];
+      setUndoStack(prev => prev.slice(0, -1));
+      setGameSecs(s.gameSecs);
+      setRunning(s.running);
+      setOnCourt(s.onCourt);
+      setAccumulated(s.accumulated);
+      setStintStart(s.stintStart);
+      setOffSince(s.offSince);
+      setFouls(s.fouls);
+      setFouledOut(s.fouledOut);
+      setInjured(s.injured);
+      setAdjustedTargetMins(s.adjustedTargetMins);
+      setSubLog(s.subLog);
+      setInjuryInfo(s.injuryInfo);
+      setFouloutInfo(s.fouloutInfo);
+      setHandledWindows(s.handledWindows);
+      setRestedThisHalf(s.restedThisHalf);
+      setReplacingJersey(s.replacingJersey);
+      setPendingSub(s.pendingSub);
+      setLastSubTime(s.lastSubTime);
+      setHalftimeDone(s.halftimeDone);
+      setShowHalftime(s.showHalftime);
+      setScoreUs(s.scoreUs);
+      setScoreOpponent(s.scoreOpponent);
+      setTimeoutsUs(s.timeoutsUs);
+      setTimeoutsOpponent(s.timeoutsOpponent);
+      if (typeof s.possessionLeft === "boolean") setPossessionLeft(s.possessionLeft);
+      setActiveMenu(null);
+      setBenchMenu(null);
+      // V3 plan-first state restore
+      if (s.rotationPlan !== undefined) setRotationPlan(s.rotationPlan);
+      if (s.editableGrid !== undefined) setEditableGrid(s.editableGrid);
+      if (Array.isArray(s.gridPlayerOrderJerseys)) {
+        const order = s.gridPlayerOrderJerseys.map(j => PLAYERS_DB.find(p => p.jersey === j)).filter(Boolean);
+        if (order.length > 0) setGridPlayerOrder(order);
+      }
+      if (s.plannedTimeouts) setPlannedTimeouts(s.plannedTimeouts);
+      if (s.dismissedTimeouts) setDismissedTimeouts(s.dismissedTimeouts);
+      if (s.lastExecutedSegId !== undefined) setLastExecutedSegId(s.lastExecutedSegId);
+      if (s.planDelayUntilSecs !== undefined) setPlanDelayUntilSecs(s.planDelayUntilSecs);
+      if (s.delayedSegId !== undefined) setDelayedSegId(s.delayedSegId);
+      if (s.shortHandedDismissedAt !== undefined) setShortHandedDismissedAt(s.shortHandedDismissedAt);
+      if (s.running) {
+        clockBaseRef.current = { wallMs: Date.now(), secs: s.gameSecs };
+      }
+    }); // withActionLock
   }
 
   // ── PERSISTENCE ─────────────────────────────────────────────────────────────
   // Save / restore full game state across browser refresh, tab close, mobile memory flush, etc.
   const STORAGE_KEY = "coachk-subplanner-v9";
-  const hydratedRef = useRef(false); // blocks save effect until after restore
+  const [hydrated, setHydrated] = useState(false); // blocks save effect until restore commits
   const [hasSavedGame, setHasSavedGame] = useState(false); // whether restore found a live game
   const [confirmDiscard, setConfirmDiscard] = useState(false); // two-tap confirm for discard button
 
@@ -1236,8 +1327,18 @@ function App() {
         if (typeof s.scoreOpponent === "number") setScoreOpponent(s.scoreOpponent);
         if (typeof s.timeoutsUs === "number") setTimeoutsUs(s.timeoutsUs);
         if (typeof s.timeoutsOpponent === "number") setTimeoutsOpponent(s.timeoutsOpponent);
-        // V3 plan-first state restore
-        if (s.rotationPlan) setRotationPlan(s.rotationPlan);
+        // V3 plan-first state restore — validate structure before restoring
+        if (s.rotationPlan &&
+            Array.isArray(s.rotationPlan.starters) &&
+            Array.isArray(s.rotationPlan.segments) &&
+            s.rotationPlan.targetMinutes && typeof s.rotationPlan.targetMinutes === "object" &&
+            s.rotationPlan.segments.every(seg =>
+              typeof seg.startSecs === "number" &&
+              typeof seg.endSecs === "number" &&
+              Array.isArray(seg.onCourt)
+            )) {
+          setRotationPlan(s.rotationPlan);
+        }
         if (Array.isArray(s.gridPlayerOrderJerseys)) {
           const order = s.gridPlayerOrderJerseys
             .map(j => PLAYERS_DB.find(p => p.jersey === j))
@@ -1251,16 +1352,17 @@ function App() {
         if (typeof s.lastExecutedSegId === "string") setLastExecutedSegId(s.lastExecutedSegId);
         if (typeof s.planDelayUntilSecs === "number") setPlanDelayUntilSecs(s.planDelayUntilSecs);
         if (typeof s.delayedSegId === "string") setDelayedSegId(s.delayedSegId);
+        if (typeof s.shortHandedDismissedAt === "number") setShortHandedDismissedAt(s.shortHandedDismissedAt);
         // pendingSub is NOT persisted — always recomputed from current state
         // undoStack is NOT persisted — starts fresh on reload
         // Always start paused — never auto-resume the clock after a refresh
       }
     } catch (e) { /* ignore corrupted storage */ }
-    hydratedRef.current = true;
+    setHydrated(true); // batched with restore setState calls — save effect won't fire until next render
   }, []);
 
   useEffect(() => {
-    if (!hydratedRef.current) return; // don't overwrite saved state during initial restore
+    if (!hydrated) return; // don't overwrite saved state during initial restore
     // Save every tick — state is small, reliability beats battery savings.
     try {
       const snapshot = {
@@ -1288,15 +1390,16 @@ function App() {
         lastExecutedSegId: lastExecutedSegId || null,
         planDelayUntilSecs: planDelayUntilSecs ?? null,
         delayedSegId: delayedSegId || null,
+        shortHandedDismissedAt: shortHandedDismissedAt ?? null,
       };
       localStorage.setItem(STORAGE_KEY, JSON.stringify(snapshot));
     } catch (e) { /* quota or serialization issue */ }
-  }, [screen, halfMins, selected, starters, plan, planMode, gameSecs, onCourt, accumulated, stintStart,
+  }, [hydrated, screen, halfMins, selected, starters, plan, planMode, gameSecs, onCourt, accumulated, stintStart,
       halftimeDone, fouls, fouledOut, injured, adjustedTargetMins, subLog, injuryInfo, fouloutInfo,
       lastSubTime, offSince, handledWindows, restedThisHalf, replacingJersey,
       scoreUs, scoreOpponent, timeoutsUs, timeoutsOpponent, possessionLeft,
       rotationPlan, gridPlayerOrder, editableGrid, plannedTimeouts, dismissedTimeouts,
-      timeoutRemindersOn, lastExecutedSegId, planDelayUntilSecs, delayedSegId]);
+      timeoutRemindersOn, lastExecutedSegId, planDelayUntilSecs, delayedSegId, shortHandedDismissedAt]);
 
   function discardSavedGame() {
     try { localStorage.removeItem(STORAGE_KEY); } catch (e) {}
@@ -1317,6 +1420,7 @@ function App() {
     setHandledWindows(new Set());
     setRestedThisHalf(new Set());
     setReplacingJersey(null);
+    setShortHandedDismissedAt(null);
     setHasSavedGame(false);
     setScoreUs(0); setScoreOpponent(0);
     setTimeoutsUs(0); setTimeoutsOpponent(0);
@@ -1390,12 +1494,63 @@ function App() {
   const totalGameSecs = halfMins * 2 * 60;
   // Clock adjustment helper — updates both gameSecs AND the timestamp anchor
   // so the running interval doesn't snap the clock back to its old position.
+  // Uses functional updater for setGameSecs so rapid taps see the correct
+  // previous value and the full-time rewind correction only fires once.
   const setClockSecs = (nextSecs) => {
     const clamped = Math.max(0, Math.min(totalGameSecs, nextSecs));
-    setGameSecs(clamped);
+    setGameSecs(prevSecs => {
+      // If rewinding out of game-over state, re-seed stintStart for players on court
+      // so their live court time resumes ticking correctly.
+      // Uses prevSecs (not closed-over gameSecs) to prevent double-subtraction on rapid taps.
+      if (prevSecs >= totalGameSecs && clamped < totalGameSecs && onCourt.length > 0) {
+        // Full-time effect already flushed stints to accumulated. Subtract the
+        // over-flushed portion (totalGameSecs - clamped) so it isn't double-counted
+        // when the clock resumes ticking from the rewound position.
+        const overFlush = totalGameSecs - clamped;
+        setAccumulated(prev => {
+          const next = { ...prev };
+          onCourt.forEach(j => {
+            next[j] = Math.max(0, (next[j] || 0) - overFlush);
+          });
+          return next;
+        });
+        setStintStart(prev => {
+          const next = { ...prev };
+          onCourt.forEach(j => { next[j] = clamped; });
+          return next;
+        });
+      }
+      return clamped;
+    });
     if (running) {
       clockBaseRef.current = { wallMs: Date.now(), secs: clamped };
     }
+  };
+  // Delta-based clock adjustment — avoids stale closure when rapid-tapping ±10s.
+  // Uses functional updater so each tap sees the result of the previous one.
+  const adjustClock = (delta) => {
+    setGameSecs(prevSecs => {
+      const lower = halftimeDone ? halfMins * 60 : 0;
+      const clamped = Math.max(lower, Math.min(totalGameSecs, prevSecs + delta));
+      // Full-time rewind correction (same logic as setClockSecs)
+      if (prevSecs >= totalGameSecs && clamped < totalGameSecs && onCourt.length > 0) {
+        const overFlush = totalGameSecs - clamped;
+        setAccumulated(prev => {
+          const next = { ...prev };
+          onCourt.forEach(j => { next[j] = Math.max(0, (next[j] || 0) - overFlush); });
+          return next;
+        });
+        setStintStart(prev => {
+          const next = { ...prev };
+          onCourt.forEach(j => { next[j] = clamped; });
+          return next;
+        });
+      }
+      if (running) {
+        clockBaseRef.current = { wallMs: Date.now(), secs: clamped };
+      }
+      return clamped;
+    });
   };
   const half = gameSecs < halfMins * 60 ? 1 : 2;
   const timeInHalf = half === 1 ? gameSecs : gameSecs - halfMins * 60;
@@ -1434,6 +1589,10 @@ function App() {
   // Grid is per-minute granularity (each row = 1 game minute).
   // grid[minuteIdx][playerIdx] = boolean (on court).
   function buildEditableGridFromPlan(rp, players) {
+    // Guard against malformed plan data
+    if (!rp?.segments || !Array.isArray(rp.segments) || !Array.isArray(rp.starters)) {
+      return { grid: [], order: players };
+    }
     const totalMins = halfMins * 2;
     const grid = [];
     // Sort players: starters first by rating desc, then bench by rating desc
@@ -1462,10 +1621,15 @@ function App() {
     if (!editableGrid || !rotationPlan || gridPlayerOrder.length === 0) return null;
     const rp = { ...rotationPlan };
     const totalMins = halfMins * 2;
+    const isLive = screen === "game" || (gameSecs > 0 && !gameOver);
+    // During live games, preserve completed segments unchanged
+    const currentMinBoundary = isLive ? Math.floor(gameSecs / 60) * 60 : 0;
 
     // Build fresh 1-minute segments from grid, then merge adjacent identical lineups
+    // During live games, only rebuild from current minute onward
     const rawSegs = [];
     for (let m = 0; m < Math.min(editableGrid.length, totalMins); m++) {
+      if (isLive && m * 60 < currentMinBoundary) continue; // skip completed minutes
       const row = editableGrid[m];
       const onCourt = gridPlayerOrder
         .filter((p, idx) => row[idx])
@@ -1474,11 +1638,20 @@ function App() {
       rawSegs.push({ startSecs: m * 60, endSecs: (m + 1) * 60, onCourt, half: h });
     }
 
-    // Merge adjacent segments with identical lineups within the same half
+    // Merge adjacent segments with identical lineups within the same half,
+    // but never merge across structural boundaries (start-block, close-block edges)
+    const halfSecs = halfMins * 60;
+    const boundaries = new Set([
+      0, START_BLOCK_SECS,
+      halfSecs - CLOSE_BLOCK_SECS, halfSecs,
+      halfSecs + START_BLOCK_SECS,
+      totalMins * 60 - CLOSE_BLOCK_SECS,
+    ]);
     const merged = [];
     for (const seg of rawSegs) {
       const prev = merged[merged.length - 1];
-      if (prev && prev.half === seg.half &&
+      const crossesBoundary = boundaries.has(seg.startSecs);
+      if (prev && !crossesBoundary && prev.half === seg.half &&
           prev.onCourt.length === seg.onCourt.length &&
           prev.onCourt.every((j, i) => j === seg.onCourt[i])) {
         prev.endSecs = seg.endSecs;
@@ -1505,31 +1678,56 @@ function App() {
       }
     }
 
-    // Recalc validation
+    // During live games, prepend frozen completed segments from original plan
+    if (isLive && currentMinBoundary > 0) {
+      const frozenSegs = rotationPlan.segments.filter(s => s.endSecs <= currentMinBoundary);
+      // Salvage the partially-completed segment spanning the boundary
+      const playingSeg = rotationPlan.segments.find(s => s.startSecs < currentMinBoundary && s.endSecs > currentMinBoundary);
+      if (playingSeg) {
+        frozenSegs.push({
+          ...playingSeg,
+          endSecs: currentMinBoundary,
+          durationSecs: currentMinBoundary - playingSeg.startSecs,
+        });
+      }
+      rp.segments = [...frozenSegs, ...merged];
+    } else {
+      rp.segments = merged;
+    }
+    // Recalc validation from final assembled segments (frozen + merged)
     const totals = {};
     gridPlayerOrder.forEach(p => { totals[p.jersey] = 0; });
-    for (const seg of merged) {
+    for (const seg of rp.segments) {
       const dur = seg.durationSecs / 60;
       for (const j of seg.onCourt) totals[j] = (totals[j] || 0) + dur;
     }
     const vals = Object.values(totals);
     const spread = vals.length > 0 ? Math.round((Math.max(...vals) - Math.min(...vals)) * 10) / 10 : 0;
     let stoppages = 0;
-    for (let i = 1; i < merged.length; i++) {
-      if (merged[i].half !== merged[i-1].half) continue;
-      const prev = new Set(merged[i-1].onCourt);
-      if (merged[i].onCourt.some(j => !prev.has(j))) stoppages++;
+    for (let i = 1; i < rp.segments.length; i++) {
+      if (rp.segments[i].half !== rp.segments[i-1].half) continue;
+      const prev = new Set(rp.segments[i-1].onCourt);
+      if (rp.segments[i].onCourt.some(j => !prev.has(j))) stoppages++;
     }
-    rp.segments = merged;
     rp.actualMinutes = totals;
     rp.validation = { ...rp.validation, spreadMins: spread, stoppages };
     setRotationPlan(rp);
-    // Also update adjusted target display
-    setAdjustedTargetMins(prev => {
-      const next = { ...prev };
-      gridPlayerOrder.forEach(p => { next[p.jersey] = rp.targetMinutes[p.jersey]; });
-      return next;
-    });
+    // Force plan executor to re-evaluate against the new plan
+    if (isLive) {
+      setLastExecutedSegId(null);
+      setDelayedSegId(null);
+      setPlanDelayUntilSecs(null);
+      setPendingSub(null);
+    }
+    // Also update adjusted target display — but NOT mid-game, where injury/foul
+    // adjustments would be clobbered by the original plan targets
+    if (!isLive) {
+      setAdjustedTargetMins(prev => {
+        const next = { ...prev };
+        gridPlayerOrder.forEach(p => { next[p.jersey] = rp.targetMinutes[p.jersey]; });
+        return next;
+      });
+    }
     return rp;
   }
 
@@ -1608,7 +1806,36 @@ function App() {
     setScreen("plan");
   }
 
+  // Returns true if grid has invalid rows, shows alert. Used by start + mid-game back.
+  // During live games with fewer than 5 active players (injuries/foul-outs), allows short-handed rows.
+  // During live games, only validates from current minute onward (completed rows are history).
+  function gridHasInvalidRows() {
+    if (!editableGrid) return false;
+    const isLive = screen === "game" || (gameSecs > 0 && !gameOver);
+    const activeCount = isLive
+      ? Math.min(5, available.length - fouledOut.size - injured.size)
+      : 5;
+    const requiredCount = isLive ? Math.max(0, activeCount) : 5;
+    // During live games, skip already-completed minutes — they're history
+    const startRow = isLive ? Math.floor(gameSecs / 60) : 0;
+    const invalidRows = editableGrid
+      .map((row, idx) => ({ idx, count: row.filter(Boolean).length }))
+      .filter(r => r.idx >= startRow && r.count !== requiredCount);
+    if (invalidRows.length > 0) {
+      alert(
+        `Every minute must have exactly ${requiredCount} player${requiredCount !== 1 ? "s" : ""}.\n\n` +
+        invalidRows.slice(0, 8)
+          .map(r => `Minute ${r.idx + 1}: ${r.count}/${requiredCount}`)
+          .join("\n")
+      );
+      return true;
+    }
+    return false;
+  }
+
   function handleStartGame() {
+    // Validate grid: every row must have exactly 5 players
+    if (gridHasInvalidRows()) return;
     // Sync editable grid back into rotationPlan before starting
     const syncedPlan = syncGridToPlan();
     // Use synced plan's first segment lineup if available, fallback to plan.starting
@@ -1647,6 +1874,10 @@ function App() {
     setLastSubTime(-120);
     setPendingSub(null);
     setHandledWindows(new Set());
+    setShortHandedDismissedAt(null); // prevent leak from previous game
+    setLastExecutedSegId(null);      // prevent stale executor skip
+    setDelayedSegId(null);
+    setPlanDelayUntilSecs(null);
     // Seed carousel: bench players have already "rested" relative to starters,
     // so mark them to prevent the first-cycle carousel from pulling them right
     // back off after they enter (especially critical for 6-player / 1-bench).
@@ -1818,7 +2049,7 @@ function App() {
       for (const p of available) {
         actualMins[p.jersey] = (flushedAccumulated[p.jersey] || 0) / 60;
       }
-      const newPlan = reroutePlan(rotationPlan, now, activePlayers, actualMins, "H2 roster update", halfMins, courtJerseys);
+      const newPlan = reroutePlan(rotationPlan, now, activePlayers, actualMins, "H2 roster update", halfMins, courtJerseys, adjustedTargetMins);
       setRotationPlan(newPlan);
       setLastExecutedSegId(null);
     }
@@ -1864,7 +2095,7 @@ function App() {
       courtSet.add(sub.inJersey);
       safeSubs.push(sub);
     }
-    if (safeSubs.length === 0) return 0;
+    if (safeSubs.length === 0) return [];
     subList = safeSubs;
 
     const now = gameSecs;
@@ -1910,6 +2141,7 @@ function App() {
     // Rule engine: sub resets cooldown, clears pending suggestion.
     // Bigger bundles buy more quiet time (120s for 2+, 90s for singles).
     setLastSubTime(now);
+    setShortHandedDismissedAt(null); // clear short-handed grace on real sub
     markNearbyWindowHandled(subList.length >= 2 ? 120 : 90);
     setPendingSub(null);
     // Log the sub
@@ -1922,7 +2154,7 @@ function App() {
       })),
     };
     setSubLog(prev => [...prev, logEntry]);
-    return subList.length;
+    return subList; // return applied sub list (not just count) for accurate post-sub court calculation
   }
 
   // (Legacy redistributeMinutes helper removed — markFouledOut / markInjured
@@ -1959,21 +2191,29 @@ function App() {
     const newPlan = reroutePlan(rotationPlan, gameSecs, activePlayers, actualMins, reason, halfMins, actualOnCourt, targetOverride);
     setRotationPlan(newPlan);
     setLastExecutedSegId(null); // force re-evaluation at next tick
-    // Show auto-dismissing banner
+    setPendingSub(null);        // clear stale pre-reroute suggestion
+    setDelayedSegId(null);
+    setPlanDelayUntilSecs(null);
+    // Show auto-dismissing banner (clear previous timer to avoid race condition)
+    if (rerouteBannerTimer.current) clearTimeout(rerouteBannerTimer.current);
     setRerouteBanner(reason);
-    setTimeout(() => setRerouteBanner(null), 5000);
+    rerouteBannerTimer.current = setTimeout(() => {
+      setRerouteBanner(null);
+      rerouteBannerTimer.current = null;
+    }, 5000);
   }
 
 
   // Mark player fouled out. Same minutes model as injury: take remaining target
   // and split it across active teammates, freeze player's target at played time,
   // and store a fouloutInfo record so Undo can do a time-aware partial clawback.
-  function markFouledOut(jersey, { skipUndo = false } = {}) {
+  function _doFoulOut(jersey, { skipUndo = false } = {}) {
     if (fouledOut.has(jersey) || injured.has(jersey)) return;
-    withActionLock(() => {
     if (!skipUndo) pushUndo("Foul out #" + jersey);
     setActiveMenu(null);
     setBenchMenu(null);
+    // Ensure foul count shows 5 even when called from manual Foul Out button
+    setFouls(prev => ({ ...prev, [jersey]: Math.max(prev[jersey] || 0, 5) }));
 
     const wasOnCourt = onCourt.includes(jersey);
     const now = gameSecs;
@@ -2010,6 +2250,10 @@ function App() {
 
     setFouledOut(prev => new Set([...prev, jersey]));
     setOffSince(prev => { const n = { ...prev }; delete n[jersey]; return n; });
+    // Clear any stale pending sub — lineup has changed
+    setPendingSub(null);
+    setDelayedSegId(null);
+    setPlanDelayUntilSecs(null);
 
     if (wasOnCourt) {
       setOnCourt(prev => prev.filter(j => j !== jersey));
@@ -2027,7 +2271,10 @@ function App() {
       currentOnCourt: wasOnCourt ? onCourt.filter(j => j !== jersey) : onCourt,
       targetMinutesOverride: nextTargets,
     });
-    }); // withActionLock
+  }
+  // Public wrapper — action-locked for UI button calls
+  function markFouledOut(jersey, { skipUndo = false } = {}) {
+    withActionLock(() => _doFoulOut(jersey, { skipUndo }));
   }
 
   // Mark player injured.
@@ -2081,6 +2328,10 @@ function App() {
 
     setInjured(prev => new Set([...prev, jersey]));
     setOffSince(prev => { const n = { ...prev }; delete n[jersey]; return n; });
+    // Clear any stale pending sub — lineup has changed
+    setPendingSub(null);
+    setDelayedSegId(null);
+    setPlanDelayUntilSecs(null);
 
     if (wasOnCourt) {
       setOnCourt(prev => prev.filter(j => j !== jersey));
@@ -2145,33 +2396,37 @@ function App() {
 
   // Foul add / remove
   function addFoul(jersey) {
-    const cur = fouls[jersey] || 0;
-    if (cur >= 5) return;
-    if (cur === 4) {
-      // 5th foul — ask BEFORE mutating any state
-      const p = PLAYERS_DB.find(pl => pl.jersey === jersey);
-      const name = p ? `#${p.jersey} ${p.name}` : `#${jersey}`;
-      if (window.confirm(`5th foul for ${name}. Foul out this player?`)) {
-        pushUndo("5th foul + foul out #" + jersey);
-        setFouls(prev => ({ ...prev, [jersey]: Math.max(prev[jersey] || 0, 5) }));
-        setTimeout(() => markFouledOut(jersey, { skipUndo: true }), 0);
+    withActionLock(() => {
+      const cur = fouls[jersey] || 0;
+      if (cur >= 5) return;
+      if (cur === 4) {
+        // 5th foul — ask BEFORE mutating any state
+        const p = PLAYERS_DB.find(pl => pl.jersey === jersey);
+        const name = p ? `#${p.jersey} ${p.name}` : `#${jersey}`;
+        if (window.confirm(`5th foul for ${name}. Foul out this player?`)) {
+          pushUndo("5th foul + foul out #" + jersey);
+          setFouls(prev => ({ ...prev, [jersey]: Math.max(prev[jersey] || 0, 5) }));
+          _doFoulOut(jersey, { skipUndo: true });
+        }
+      } else {
+        pushUndo("Foul #" + jersey);
+        // Use functional updater to avoid stale closure under rapid taps
+        setFouls(prev => {
+          const c = prev[jersey] || 0;
+          if (c >= 4) return prev; // 5th foul handled above with confirm
+          return { ...prev, [jersey]: c + 1 };
+        });
       }
-    } else {
-      pushUndo("Foul #" + jersey);
-      // Use functional updater to avoid stale closure under rapid taps
-      setFouls(prev => {
-        const c = prev[jersey] || 0;
-        if (c >= 4) return prev; // 5th foul handled above with confirm
-        return { ...prev, [jersey]: c + 1 };
-      });
-    }
+    });
   }
   function removeFoul(jersey) {
-    pushUndo("Remove foul #" + jersey);
-    setFouls(prev => {
-      const cur = prev[jersey] || 0;
-      if (cur <= 0) return prev;
-      return { ...prev, [jersey]: cur - 1 };
+    withActionLock(() => {
+      pushUndo("Remove foul #" + jersey);
+      setFouls(prev => {
+        const cur = prev[jersey] || 0;
+        if (cur <= 0) return prev;
+        return { ...prev, [jersey]: cur - 1 };
+      });
     });
   }
 
@@ -2191,42 +2446,37 @@ function App() {
       // Returning player goes to bench: start their bench-stint clock now.
       setOffSince(prev => ({ ...prev, [jersey]: gameSecs }));
 
-      // Helper: reroute plan to re-include returning player
-      const rerouteReturn = () => {
-        if (rotationPlan) {
-          setTimeout(() => {
-            const p = pObj(jersey);
-            triggerReroute(`#${jersey} ${p?.name || ""} returned from injury`, { addJersey: jersey });
-          }, 0);
-        }
-      };
+      // Build local targets so triggerReroute sees fresh values (not stale closure)
+      let nextTargets = { ...adjustedTargetMins };
 
-      if (!info || info.remainingMins <= 0 || info.others.length === 0) {
-        setInjuryInfo(prev => { const n = { ...prev }; delete n[jersey]; return n; });
-        rerouteReturn();
-        return;
-      }
+      if (info && info.remainingMins > 0 && info.others.length > 0) {
+        const elapsedMins = Math.max(0, (gameSecs - info.startSecs) / 60);
+        const unusedMins = Math.max(0, info.remainingMins - elapsedMins);
+        const N = info.others.length;
+        const pullBackPerOther = unusedMins / N;
 
-      const elapsedMins = Math.max(0, (gameSecs - info.startSecs) / 60);
-      const unusedMins = Math.max(0, info.remainingMins - elapsedMins);
-      const N = info.others.length;
-      const pullBackPerOther = unusedMins / N;
-
-      if (unusedMins > 0) {
-        setAdjustedTargetMins(prev => {
-          const next = { ...prev };
+        if (unusedMins > 0) {
           // Give the unused chunk back to the returning player
-          next[jersey] = (next[jersey] || 0) + unusedMins;
+          nextTargets[jersey] = (nextTargets[jersey] || 0) + unusedMins;
           // Pull the same share back from each teammate who received it
           info.others.forEach(j => {
-            next[j] = Math.max(0, (next[j] || 0) - pullBackPerOther);
+            nextTargets[j] = Math.max(0, (nextTargets[j] || 0) - pullBackPerOther);
           });
-          return next;
-        });
+          setAdjustedTargetMins(nextTargets);
+        }
       }
 
       setInjuryInfo(prev => { const n = { ...prev }; delete n[jersey]; return n; });
-      rerouteReturn();
+      // Reroute with locally computed targets — avoids stale closure
+      if (rotationPlan) {
+        setTimeout(() => {
+          const p = pObj(jersey);
+          triggerReroute(`#${jersey} ${p?.name || ""} returned from injury`, {
+            addJersey: jersey,
+            targetMinutesOverride: nextTargets,
+          });
+        }, 0);
+      }
     });
   }
 
@@ -2246,40 +2496,35 @@ function App() {
       setFouls(prev => ({ ...prev, [jersey]: 4 }));
       setOffSince(prev => ({ ...prev, [jersey]: gameSecs }));
 
-      // Helper: reroute plan to re-include returning player
-      const rerouteReturn = () => {
-        if (rotationPlan) {
-          setTimeout(() => {
-            const p = pObj(jersey);
-            triggerReroute(`#${jersey} ${p?.name || ""} returned from foul-out`, { addJersey: jersey });
-          }, 0);
-        }
-      };
+      // Build local targets so triggerReroute sees fresh values (not stale closure)
+      let nextTargets = { ...adjustedTargetMins };
 
-      if (!info || info.remainingMins <= 0 || info.others.length === 0) {
-        setFouloutInfo(prev => { const n = { ...prev }; delete n[jersey]; return n; });
-        rerouteReturn();
-        return;
-      }
+      if (info && info.remainingMins > 0 && info.others.length > 0) {
+        const elapsedMins = Math.max(0, (gameSecs - info.startSecs) / 60);
+        const unusedMins = Math.max(0, info.remainingMins - elapsedMins);
+        const N = info.others.length;
+        const pullBackPerOther = unusedMins / N;
 
-      const elapsedMins = Math.max(0, (gameSecs - info.startSecs) / 60);
-      const unusedMins = Math.max(0, info.remainingMins - elapsedMins);
-      const N = info.others.length;
-      const pullBackPerOther = unusedMins / N;
-
-      if (unusedMins > 0) {
-        setAdjustedTargetMins(prev => {
-          const next = { ...prev };
-          next[jersey] = (next[jersey] || 0) + unusedMins;
+        if (unusedMins > 0) {
+          nextTargets[jersey] = (nextTargets[jersey] || 0) + unusedMins;
           info.others.forEach(j => {
-            next[j] = Math.max(0, (next[j] || 0) - pullBackPerOther);
+            nextTargets[j] = Math.max(0, (nextTargets[j] || 0) - pullBackPerOther);
           });
-          return next;
-        });
+          setAdjustedTargetMins(nextTargets);
+        }
       }
 
       setFouloutInfo(prev => { const n = { ...prev }; delete n[jersey]; return n; });
-      rerouteReturn();
+      // Reroute with locally computed targets — avoids stale closure
+      if (rotationPlan) {
+        setTimeout(() => {
+          const p = pObj(jersey);
+          triggerReroute(`#${jersey} ${p?.name || ""} returned from foul-out`, {
+            addJersey: jersey,
+            targetMinutesOverride: nextTargets,
+          });
+        }, 0);
+      }
     });
   }
 
@@ -2302,12 +2547,23 @@ function App() {
       }]);
       setReplacingJersey(null);
       setLastSubTime(now);
+      setShortHandedDismissedAt(null); // clear short-handed grace on real sub
       markNearbyWindowHandled();
       setPendingSub(null);
       markActiveWindowHandled();
       // Carousel memory: the incoming player just rested on the bench, so mark
       // them in restedThisHalf to prevent the engine from yo-yoing them right off.
       setRestedThisHalf(prev => { const next = new Set(prev); next.add(inJersey); return next; });
+      // Reroute plan to reflect manual lineup override — without this, the plan
+      // executor sees court != plan and suggests reverting the coach's decision.
+      // Must be inside withActionLock so a double-tap that gets blocked doesn't
+      // reroute with the wrong player. Called synchronously (no setTimeout) so
+      // React 18 batches setRotationPlan with setOnCourt, preventing a phantom
+      // beep from the plan executor seeing a momentary mismatch.
+      if (rotationPlan) {
+        const newOnCourt = [...onCourt.filter(j => j !== replacingJersey), inJersey];
+        triggerReroute("Manual lineup override", { currentOnCourt: newOnCourt });
+      }
     });
   }
 
@@ -2397,6 +2653,12 @@ function App() {
   useEffect(() => {
     if (!rotationPlan || !plan || gameOver || showHalftime || screen !== "game" || replacingJersey != null) return;
 
+    // Don't overwrite a mandatory emergency prompt with a routine plan sub
+    if (pendingSub && pendingSub.mandatory) return;
+
+    // Grace period: if coach explicitly chose to play short-handed, suppress plan executor too
+    if (shortHandedDismissedAt != null && gameSecs - shortHandedDismissedAt < 60) return;
+
     const segs = rotationPlan.segments;
     if (!segs || segs.length === 0) return;
 
@@ -2479,7 +2741,8 @@ function App() {
     };
 
     setPendingSub(next);
-  }, [rotationPlan, gameSecs, onCourt, plan, gameOver, showHalftime, screen, replacingJersey, lastExecutedSegId, delayedSegId, planDelayUntilSecs]);
+    notifySub();
+  }, [rotationPlan, gameSecs, onCourt, plan, gameOver, showHalftime, screen, replacingJersey, lastExecutedSegId, delayedSegId, planDelayUntilSecs, pendingSub, shortHandedDismissedAt]);
 
   // When plan sub is confirmed, update lastExecutedSegId
   const confirmPlanSub = () => {
@@ -2501,6 +2764,9 @@ function App() {
     const benchAvail = available.filter(p =>
       !onCourt.includes(p.jersey) && !unavailableJerseys.has(p.jersey));
 
+    // Grace period: if coach explicitly chose to play short-handed, suppress for 60s
+    if (shortHandedDismissedAt != null && gameSecs - shortHandedDismissedAt < 60) return;
+
     if (onCourtPlayers.length < 5 && benchAvail.length > 0) {
       const courtNow = [...onCourtPlayers];
       const hasSkillVio = !meetsSkillRequirements(courtNow);
@@ -2520,8 +2786,9 @@ function App() {
         addOnly: true,
         whyDetails: [[`Only ${onCourtPlayers.length} on court, need 5`, `Best available: #${inP.jersey} ${inP.name}`]],
       });
+      notifySub();
     }
-  }, [rotationPlan, onCourt, available, unavailableJerseys, plan, gameOver, showHalftime, screen, replacingJersey, pendingSub]);
+  }, [rotationPlan, onCourt, available, unavailableJerseys, plan, gameOver, showHalftime, screen, replacingJersey, pendingSub, shortHandedDismissedAt, gameSecs]);
 
   useEffect(() => {
     if (!plan || gameOver || showHalftime) {
@@ -2711,7 +2978,11 @@ function App() {
     };
 
     // ── 0. SHORT-HANDED REPAIR: add player when fewer than 5 on court ───
-    if (!inStartBlock && onCourtPlayers.length < 5 && benchAvail.length > 0) {
+    // Grace period: if coach explicitly chose to play short-handed, suppress for 60s
+    if (shortHandedDismissedAt != null && gameSecs - shortHandedDismissedAt < 60) {
+      if (pendingSub !== null && pendingSub.addOnly) setPendingSub(null);
+      // fall through to mandatory triggers below (skill violations, stint cap still fire)
+    } else if (!inStartBlock && onCourtPlayers.length < 5 && benchAvail.length > 0) {
       // Prefer players that fix a skill violation, then by least court time
       const courtNow = [...onCourtPlayers];
       const hasSkillVio = !meetsSkillRequirements(courtNow);
@@ -3391,7 +3662,8 @@ function App() {
   // ── PLAN SCREEN (EDITABLE ROTATION GRID) ────────────────────────────────────
   if (screen === "plan") return (
     <div style={{ minHeight: "100vh", backgroundColor: "#0f172a", padding: "16px", fontFamily: "-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif", color: "#e2e8f0" }}
-      onMouseUp={() => { gridPainting.current = false; }}>
+      onPointerUp={() => { gridPainting.current = false; }}
+      onPointerLeave={() => { gridPainting.current = false; }}>
       <div style={{ maxWidth: 700, margin: "0 auto" }}>
         {/* Header */}
         <h1 style={{ textAlign: "center", fontSize: "1.3rem", marginBottom: 12, color: "#f8fafc" }}>
@@ -3400,7 +3672,7 @@ function App() {
 
         {/* Controls — Row 1: Grid tools */}
         <div style={{ display: "flex", justifyContent: "center", gap: 8, marginBottom: 8, flexWrap: "wrap" }}>
-          <button onClick={() => { if (gameIsLive) { syncGridToPlan(); setScreen("game"); } else { setScreen("setup"); } }}
+          <button onClick={() => { setSwapSelectedIdx(null); if (gameIsLive) { if (gridHasInvalidRows()) return; syncGridToPlan(); setScreen("game"); } else { setScreen("setup"); } }}
             style={{ background: "#334155", border: "1px solid #475569", color: "#e2e8f0", padding: "6px 14px", borderRadius: 6, cursor: "pointer", fontSize: "0.85rem" }}>
             ← Back
           </button>
@@ -3491,9 +3763,9 @@ function App() {
               </button>
             </div>
             {/* Show existing templates with same name warning */}
-            {templateNameInput.trim() && savedTemplates.some(t => t.name === templateNameInput.trim() && t.playerCount === gridPlayerOrder.length) && (
+            {templateNameInput.trim() && (() => { const sig = gridPlayerOrder.map(p => p.jersey).sort((a, b) => a - b).join("-"); return savedTemplates.some(t => t.name === templateNameInput.trim() && t.playerCount === gridPlayerOrder.length && t.attendanceSignature === sig); })() && (
               <div style={{ color: "#fbbf24", fontSize: 11, marginTop: 6 }}>
-                ⚠ A template with this name exists for {gridPlayerOrder.length} players — saving will replace it
+                ⚠ A template with this name exists for this exact roster — saving will replace it
               </div>
             )}
           </div>
@@ -3606,10 +3878,11 @@ function App() {
           const spread = maxMins - minMins;
           const idealTarget = (5 * totalMins) / players.length;
 
-          // Cell handlers
+          // Cell handlers (pointer events for mouse + touch)
           const cellDown = (e, m, pIdx) => {
             e.preventDefault();
             gridPainting.current = true;
+            gridPainting.lastCell = `${m},${pIdx}`;
             if (gridPaintMode) {
               gridPaintValue.current = !grid[m][pIdx];
               setEditableGrid(prev => {
@@ -3628,6 +3901,9 @@ function App() {
 
           const cellEnter = (e, m, pIdx) => {
             if (!gridPainting.current || !gridPaintMode) return;
+            const key = `${m},${pIdx}`;
+            if (gridPainting.lastCell === key) return;
+            gridPainting.lastCell = key;
             setEditableGrid(prev => {
               const next = prev.map(r => [...r]);
               next[m][pIdx] = gridPaintValue.current;
@@ -3635,10 +3911,24 @@ function App() {
             });
           };
 
+          // Touch-move handler: find cell under finger and paint it
+          // Stored in ref so useEffect can attach as non-passive listener
+          gridTouchMoveRef.current = (e) => {
+            if (!gridPainting.current || !gridPaintMode) return;
+            if (e.cancelable) e.preventDefault();
+            const touch = e.touches[0];
+            const el = document.elementFromPoint(touch.clientX, touch.clientY);
+            if (el && el.dataset.gridM != null && el.dataset.gridP != null) {
+              const m = parseInt(el.dataset.gridM);
+              const pIdx = parseInt(el.dataset.gridP);
+              cellEnter(e, m, pIdx);
+            }
+          };
+
           return (
             <>
               <div style={{ overflowX: "auto", display: "flex", justifyContent: "center" }}>
-                <table style={{ borderCollapse: "collapse", userSelect: "none" }}>
+                <table ref={gridTableRef} style={{ borderCollapse: "collapse", userSelect: "none", touchAction: "none" }}>
                   <thead>
                     <tr>
                       <th style={{ padding: "4px 6px", fontSize: "0.75rem", color: "#94a3b8", fontWeight: 600, textAlign: "center", minWidth: 40, position: "sticky", top: 0, background: "#0f172a" }}></th>
@@ -3727,12 +4017,14 @@ function App() {
                             const filled = grid[m] && grid[m][pIdx];
                             return (
                               <td key={p.jersey}
-                                onMouseDown={e => cellDown(e, m, pIdx)}
-                                onMouseEnter={e => cellEnter(e, m, pIdx)}
+                                data-grid-m={m} data-grid-p={pIdx}
+                                onPointerDown={e => cellDown(e, m, pIdx)}
+                                onPointerEnter={e => cellEnter(e, m, pIdx)}
                                 style={{
                                   width: 52, height: 22, border: "1px solid #1e293b", textAlign: "center",
                                   cursor: "pointer", transition: "background 0.05s",
                                   background: filled ? "#16a34a" : "transparent",
+                                  touchAction: "none",
                                 }}></td>
                             );
                           })}
@@ -3794,7 +4086,7 @@ function App() {
         <div style={{ marginTop: 16 }}>
           {gameIsLive ? (
             <>
-              <button onClick={() => { syncGridToPlan(); setScreen("game"); }}
+              <button onClick={() => { setSwapSelectedIdx(null); if (gridHasInvalidRows()) return; syncGridToPlan(); setScreen("game"); }}
                 style={{ width: "100%", padding: "16px", borderRadius: 16, border: "none", cursor: "pointer",
                   background: "linear-gradient(135deg,#1d4ed8,#3b82f6)", color: "#fff", fontSize: 17, fontWeight: 700,
                   display: "flex", alignItems: "center", justifyContent: "center", gap: 10, marginBottom: 8 }}>
@@ -3845,7 +4137,18 @@ function App() {
                   if (rotationPlan && rotationPlan.segments) {
                     const h2Start = rotationPlan.segments.find(s => s.half === 2);
                     if (h2Start && h2Start.onCourt) {
-                      return h2Start.onCourt.map(j => {
+                      // Filter unavailable players and backfill, matching handleStartSecondHalf
+                      const unavail = j => fouledOut.has(j) || injured.has(j);
+                      let previewJerseys = h2Start.onCourt.filter(j => !unavail(j));
+                      if (previewJerseys.length < 5) {
+                        const activeBench = available.filter(p =>
+                          !previewJerseys.includes(p.jersey) && !unavail(p.jersey));
+                        for (const p of activeBench) {
+                          if (previewJerseys.length >= 5) break;
+                          previewJerseys.push(p.jersey);
+                        }
+                      }
+                      return previewJerseys.map(j => {
                         const p = available.find(pl => pl.jersey === j) || PLAYERS_DB.find(pl => pl.jersey === j);
                         if (!p) return null;
                         return (
@@ -3890,12 +4193,12 @@ function App() {
                 </div>
               ))}
               {benchPlayers.length === 0 ? (
-                <button onClick={() => setReplacingJersey(null)}
+                <button onClick={() => { setShortHandedDismissedAt(gameSecs); setPendingSub(null); setDelayedSegId(null); setPlanDelayUntilSecs(null); setReplacingJersey(null); }}
                   style={{ width: "100%", marginTop: 8, background: "#334155", border: "none", color: "#94a3b8", borderRadius: 10, padding: "10px", cursor: "pointer", fontSize: 14 }}>
                   Play with {onCourt.length} — no bench available
                 </button>
               ) : (
-                <button onClick={() => { if (window.confirm(`${benchPlayers.length} bench player${benchPlayers.length > 1 ? "s" : ""} available. Play short-handed anyway?`)) setReplacingJersey(null); }}
+                <button onClick={() => { if (window.confirm(`${benchPlayers.length} bench player${benchPlayers.length > 1 ? "s" : ""} available. Play short-handed anyway?`)) { setShortHandedDismissedAt(gameSecs); setReplacingJersey(null); } }}
                   style={{ width: "100%", marginTop: 8, background: "transparent", border: "1px solid #991b1b", color: "#f87171", borderRadius: 10, padding: "10px", cursor: "pointer", fontSize: 13 }}>
                   Play with {onCourt.length} despite available bench
                 </button>
@@ -3912,22 +4215,37 @@ function App() {
             <div style={{ color: "#60a5fa", fontSize: 12 }}>{gameOver ? "Game over" : `${fmt(halfRemaining)} left in H${half}`}</div>
           </div>
           <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
-            {!gameOver && !showHalftime && (
+            {!showHalftime && (
               <>
-                <button onClick={() => setClockSecs(Math.max(halftimeDone ? halfMins * 60 : 0, gameSecs - 10))}
+                <button onClick={() => adjustClock(-10)}
                   title="Rewind 10s"
                   style={{ padding: "8px 10px", borderRadius: 10, border: "1px solid #1e40af", cursor: "pointer", background: "#1e3a8a", color: "#dbeafe", fontSize: 12, fontWeight: 700 }}>−10s</button>
-                <button onClick={() => setRunning(r => !r)}
-                  style={{ padding: "10px 18px", borderRadius: 12, border: "none", cursor: "pointer", fontWeight: 700, fontSize: 15,
-                    background: running ? "#ef4444" : "#16a34a", color: "#fff" }}>
-                  {running ? "⏸" : "▶"}
-                </button>
-                <button onClick={() => setClockSecs(Math.min(totalGameSecs, gameSecs + 10))}
-                  title="Forward 10s"
-                  style={{ padding: "8px 10px", borderRadius: 10, border: "1px solid #1e40af", cursor: "pointer", background: "#1e3a8a", color: "#dbeafe", fontSize: 12, fontWeight: 700 }}>+10s</button>
+                {!gameOver && (
+                  <button onClick={() => setRunning(r => !r)}
+                    style={{ padding: "10px 18px", borderRadius: 12, border: "none", cursor: "pointer", fontWeight: 700, fontSize: 15,
+                      background: running ? "#ef4444" : "#16a34a", color: "#fff" }}>
+                    {running ? "⏸" : "▶"}
+                  </button>
+                )}
+                {!gameOver && (
+                  <button onClick={() => adjustClock(+10)}
+                    title="Forward 10s"
+                    style={{ padding: "8px 10px", borderRadius: 10, border: "1px solid #1e40af", cursor: "pointer", background: "#1e3a8a", color: "#dbeafe", fontSize: 12, fontWeight: 700 }}>+10s</button>
+                )}
               </>
             )}
-            <button onClick={() => { setRunning(false); setScreen("plan"); }}
+            <button onClick={() => {
+              setRunning(false);
+              // Rebuild grid from current (possibly rerouted) plan so stale grids don't overwrite reroutes
+              if (rotationPlan && rotationPlan.segments) {
+                const activePlayers = available.filter(p => !unavailableJerseys.has(p.jersey));
+                const gridPlayers = activePlayers.length > 0 ? activePlayers : available;
+                const { grid, order } = buildEditableGridFromPlan(rotationPlan, gridPlayers);
+                setEditableGrid(grid);
+                setGridPlayerOrder(order);
+              }
+              setScreen("plan");
+            }}
               style={{ padding: "10px 14px", borderRadius: 12, border: "none", cursor: "pointer", background: "#334155", color: "#fff", fontSize: 14 }}>Plan</button>
           </div>
         </div>
@@ -4103,37 +4421,56 @@ function App() {
               <div style={{ display: "flex", gap: 8, marginTop: 8 }}>
                 <button
                   onClick={() => withActionLock(() => {
-                    pushUndo(pendingSub.addOnly ? "Add player" : "Confirm sub");
                     if (pendingSub.addOnly) {
-                      // Add-only: bring player onto court without removing anyone
-                      const inJersey = pendingSub.subs[0].in.jersey;
-                      if (onCourt.includes(inJersey) || onCourt.length >= 5) return;
-                      if (unavailableJerseys.has(inJersey)) return; // injured/fouled out since suggestion
+                      // Add-only: bring player(s) onto court without removing anyone
                       const now = gameSecs;
-                      setStintStart(prev => ({ ...prev, [inJersey]: now }));
-                      setOffSince(prev => { const n = { ...prev }; delete n[inJersey]; return n; });
-                      setOnCourt(prev => [...prev, inJersey]);
-                      setSubLog(prev => [...prev, {
-                        time: now, half, timeInHalf,
-                        subs: [{ out: null, in: pObj(inJersey) }],
-                      }]);
-                      setLastSubTime(now);
-                      markNearbyWindowHandled();
+                      let currentCount = onCourt.length;
+                      let addedAny = false;
+                      const addedJerseys = [];
+                      for (const sub of pendingSub.subs) {
+                        const inJersey = sub.in.jersey;
+                        if (onCourt.includes(inJersey) || currentCount >= 5) continue;
+                        if (unavailableJerseys.has(inJersey)) continue;
+                        if (!addedAny) pushUndo("Add player");
+                        addedAny = true;
+                        currentCount++;
+                        addedJerseys.push(inJersey);
+                        setStintStart(prev => ({ ...prev, [inJersey]: now }));
+                        setOffSince(prev => { const n = { ...prev }; delete n[inJersey]; return n; });
+                        setOnCourt(prev => [...prev, inJersey]);
+                        setSubLog(prev => [...prev, {
+                          time: now, half, timeInHalf,
+                          subs: [{ out: null, in: pObj(inJersey) }],
+                        }]);
+                        setRestedThisHalf(prev => { const next = new Set(prev); next.add(inJersey); return next; });
+                      }
+                      if (addedAny) {
+                        setLastSubTime(now);
+                        markNearbyWindowHandled();
+                        markActiveWindowHandled();
+                      }
                       setPendingSub(null);
-                      setRestedThisHalf(prev => { const next = new Set(prev); next.add(inJersey); return next; });
-                      markActiveWindowHandled();
                     } else {
                       // Process swaps (out+in pairs)
                       const swaps = pendingSub.subs.filter(s => s.out);
-                      const applied = swaps.length > 0
-                        ? doSubs(swaps.map(s => ({ outJersey: s.out.jersey, inJersey: s.in.jersey })))
-                        : 0;
-                      // Process any adds in a mixed array (out: null entries)
                       const adds = pendingSub.subs.filter(s => !s.out);
+                      // Safety: reject mixed swap+add confirmations — lineup may have
+                      // changed since the suggestion was generated, making the simulated
+                      // court unreliable. Force a fresh re-check instead.
+                      if (adds.length > 0 && swaps.length > 0) {
+                        alert("Lineup changed. Rechecking plan.");
+                        setPendingSub(null);
+                        return;
+                      }
+                      pushUndo("Confirm sub");
+                      const appliedSubs = swaps.length > 0
+                        ? doSubs(swaps.map(s => ({ outJersey: s.out.jersey, inJersey: s.in.jersey })))
+                        : [];
+                      // Build post-sub court from ACTUALLY applied subs (not all requested)
                       let courtAfterSwaps = [...onCourt];
-                      for (const sw of swaps) {
-                        courtAfterSwaps = courtAfterSwaps.filter(j => j !== sw.out.jersey);
-                        if (!courtAfterSwaps.includes(sw.in.jersey)) courtAfterSwaps.push(sw.in.jersey);
+                      for (const sw of appliedSubs) {
+                        courtAfterSwaps = courtAfterSwaps.filter(j => j !== sw.outJersey);
+                        if (!courtAfterSwaps.includes(sw.inJersey)) courtAfterSwaps.push(sw.inJersey);
                       }
                       let addedCount = 0;
                       for (const addSub of adds) {
@@ -4151,21 +4488,27 @@ function App() {
                           subs: [{ out: null, in: pObj(inJersey) }],
                         }]);
                       }
-                      if (applied > 0 || addedCount > 0) {
-                        if (pendingSub.windowTarget != null && pendingSub.windowRoster != null) {
-                          const k = wKey(pendingSub.windowRoster, pendingSub.windowTarget);
-                          setHandledWindows(prev => new Set([...prev, k]));
-                        }
-                        // For mandatory subs without a windowTarget, still mark the
-                        // active rotation window so it doesn't reappear after quiet period.
-                        if (pendingSub.windowTarget == null && !pendingSub.reason?.startsWith("Closer")) {
-                          markActiveWindowHandled();
-                        }
-                        setLastSubTime(gameSecs);
+                      if (appliedSubs.length === 0 && addedCount === 0) {
+                        // Nothing actually changed — pop the no-op undo entry
+                        setUndoStack(prev => prev.slice(0, -1));
                       }
-                      // Only advance plan if actual changes happened
-                      if (applied > 0 || addedCount > 0) {
-                        confirmPlanSub();
+                      if (appliedSubs.length > 0 || addedCount > 0) {
+                        setLastSubTime(gameSecs);
+                        // Only mark window/segment as handled if post-sub court matches plan
+                        const seg = rotationPlan?.segments?.find(s => s.id === pendingSub._planSegId);
+                        const courtSet = new Set(courtAfterSwaps);
+                        const matchesPlan = seg && seg.onCourt.length === courtSet.size && seg.onCourt.every(j => courtSet.has(j));
+                        if (matchesPlan) {
+                          confirmPlanSub();
+                          if (pendingSub.windowTarget != null && pendingSub.windowRoster != null) {
+                            const k = wKey(pendingSub.windowRoster, pendingSub.windowTarget);
+                            setHandledWindows(prev => new Set([...prev, k]));
+                          }
+                          if (pendingSub.windowTarget == null && !pendingSub.reason?.startsWith("Closer")) {
+                            markActiveWindowHandled();
+                          }
+                        }
+                        // If lineup doesn't match, don't mark — executor will re-prompt
                       }
                       setPendingSub(null);
                     }
@@ -4278,14 +4621,18 @@ function App() {
             // Find next segment with a lineup change
             const currentIdx = currentSeg ? segs.indexOf(currentSeg) : -1;
             let nextSubSeg = null;
-            let nextSubPlayers = [];
+            let nextSubPlayersIn = [];
+            let nextSubPlayersOut = [];
             for (let i = currentIdx + 1; i < segs.length; i++) {
               if (!currentSeg) break;
               const prevCourt = new Set(segs[i > 0 ? i - 1 : 0].onCourt);
-              const changes = segs[i].onCourt.filter(j => !prevCourt.has(j));
-              if (changes.length > 0) {
+              const nextCourt = new Set(segs[i].onCourt);
+              const comingIn = segs[i].onCourt.filter(j => !prevCourt.has(j));
+              const goingOut = segs[i > 0 ? i - 1 : 0].onCourt.filter(j => !nextCourt.has(j));
+              if (comingIn.length > 0 || goingOut.length > 0) {
                 nextSubSeg = segs[i];
-                nextSubPlayers = changes;
+                nextSubPlayersIn = comingIn;
+                nextSubPlayersOut = goingOut;
                 break;
               }
             }
@@ -4303,13 +4650,26 @@ function App() {
                     </span>
                   )}
                 </div>
-                {nextSubSeg && nextSubPlayers.length > 0 && (
-                  <div style={{ fontSize: 10, color: "#94a3b8", marginTop: 2 }}>
-                    <span style={{ color: "#64748b" }}>Next in: </span>
-                    {nextSubPlayers.map(j => {
-                      const p = available.find(pl => pl.jersey === j);
-                      return p ? `#${p.jersey} ${p.name}` : `#${j}`;
-                    }).join(", ")}
+                {nextSubSeg && (nextSubPlayersOut.length > 0 || nextSubPlayersIn.length > 0) && (
+                  <div style={{ marginTop: 4 }}>
+                    {nextSubPlayersOut.length > 0 && (
+                      <div style={{ fontSize: 11, color: "#fca5a5", marginBottom: 2, fontWeight: 600 }}>
+                        <span style={{ color: "#f87171" }}>▼ OUT: </span>
+                        {nextSubPlayersOut.map(j => {
+                          const p = available.find(pl => pl.jersey === j);
+                          return p ? `#${p.jersey} ${p.name}` : `#${j}`;
+                        }).join(", ")}
+                      </div>
+                    )}
+                    {nextSubPlayersIn.length > 0 && (
+                      <div style={{ fontSize: 11, color: "#86efac", fontWeight: 600 }}>
+                        <span style={{ color: "#4ade80" }}>▲ IN: </span>
+                        {nextSubPlayersIn.map(j => {
+                          const p = available.find(pl => pl.jersey === j);
+                          return p ? `#${p.jersey} ${p.name}` : `#${j}`;
+                        }).join(", ")}
+                      </div>
+                    )}
                   </div>
                 )}
                 {lastSub && !lastSub.skipped && lastSub.subs && (
@@ -4383,8 +4743,9 @@ function App() {
           {onCourt.map(jersey => {
             const p = pObj(jersey);
             if (!p) return null;
-            const mins = Math.floor(courtTime(jersey) / 60);
-            const secs = courtTime(jersey) % 60;
+            const ct = Math.max(0, courtTime(jersey));
+            const mins = Math.floor(ct / 60);
+            const secs = ct % 60;
             const target = fouledOut.has(jersey) ? 0 : targetMinsFor(jersey);
             const pct = target > 0 ? Math.min((courtTime(jersey) / (target * 60)) * 100, 100) : 0;
             const ou = overUnderSecs(jersey); // seconds over (+) or under (-) fair-share pace
@@ -4465,8 +4826,9 @@ function App() {
             onClick={() => benchMenu && setBenchMenu(null)}>
             <div style={{ color: "#60a5fa", fontSize: 11, fontWeight: 700, letterSpacing: 1, marginBottom: 8 }}>BENCH ({benchPlayers.length})</div>
             {benchPlayers.map(p => {
-              const mins = Math.floor(courtTime(p.jersey) / 60);
-              const secs = courtTime(p.jersey) % 60;
+              const ct = Math.max(0, courtTime(p.jersey));
+              const mins = Math.floor(ct / 60);
+              const secs = ct % 60;
               const target = targetMinsFor(p.jersey);
               const pct = target > 0 ? Math.min((courtTime(p.jersey) / (target * 60)) * 100, 100) : 0;
               const ou = overUnderSecs(p.jersey);
@@ -4836,7 +5198,6 @@ function App() {
 
 const root = ReactDOM.createRoot(document.getElementById("root"));
 root.render(React.createElement(App));
-
 </script>
 </body>
 </html>
