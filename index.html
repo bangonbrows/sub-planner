@@ -612,10 +612,16 @@ function reroutePlan(currentPlan, gameSecs, activePlayers, actualMinutesPlayed, 
   const totalGameSecs = halfMins * 2 * 60;
   const segments = currentPlan.segments;
 
-  // Freeze completed segments + capture partial past for the currently-playing segment
+  // Freeze completed segments + capture partial past for the currently-playing segment.
+  // Use <= for the playingSeg lookup so a segment that starts exactly at gameSecs
+  // (e.g. the boundary segment created by syncGridToPlan at halfSecs - CLOSE_BLOCK_SECS)
+  // is still recognised as the active segment instead of being dropped from the timeline.
   const frozen = segments.filter(s => s.endSecs <= gameSecs).map(s => ({ ...s }));
-  const playingSeg = segments.find(s => s.startSecs < gameSecs && s.endSecs > gameSecs);
-  if (playingSeg) {
+  const playingSeg = segments.find(s => s.startSecs <= gameSecs && s.endSecs > gameSecs);
+  // Only push a frozen partial when there's actual elapsed time inside this segment.
+  // (When startSecs === gameSecs, no time has elapsed yet — the segment is fully ahead
+  // of us and will be handled by the gap-fix / futureFresh path below.)
+  if (playingSeg && playingSeg.startSecs < gameSecs) {
     frozen.push({ ...playingSeg, endSecs: gameSecs, durationSecs: gameSecs - playingSeg.startSecs });
   }
   // Use >= so boundary segments (startSecs === gameSecs) are not lost
@@ -1109,6 +1115,13 @@ function App() {
   const [replacingJersey, setReplacingJersey] = useState(null); // jersey needing replacement
   const [shortHandedDismissedAt, setShortHandedDismissedAt] = useState(null); // coach chose to play short-handed
 
+  // ── PLAN-EXECUTOR STATE (declared early to avoid TDZ in the save effect's
+  //    dep array — these are referenced by useEffect deps that run before the
+  //    plan executor itself defines them later in the file.)
+  const [lastExecutedSegId, setLastExecutedSegId] = useState(null);
+  const [planDelayUntilSecs, setPlanDelayUntilSecs] = useState(null);
+  const [delayedSegId, setDelayedSegId] = useState(null);
+
   // Adjusted target minutes (redistributed when player fouls out)
   const [adjustedTargetMins, setAdjustedTargetMins] = useState({});
 
@@ -1186,6 +1199,12 @@ function App() {
       setTimeout(() => { actionLockRef.current = false; }, 300);
     }
   };
+  // Dedicated lock for performUndo. Kept SEPARATE from actionLockRef so a
+  // panic-recovery Undo tap right after a foul-out / injury / sub-out (which
+  // still holds actionLockRef for ~300 ms) is not silently dropped. Still
+  // protects against rapid double-undo popping two snapshots from a single
+  // closure read.
+  const undoLockRef = useRef(false);
 
   // ── UNDO INFRASTRUCTURE ──────────────────────────────────────────────────────
   // Capture all mutable game state into a plain object. Called BEFORE each
@@ -1222,8 +1241,10 @@ function App() {
   }
 
   function performUndo() {
-    withActionLock(() => {
-      if (undoStack.length === 0) return;
+    if (undoLockRef.current) return;
+    if (undoStack.length === 0) return;
+    undoLockRef.current = true;
+    try {
       const { snapshot: s } = undoStack[undoStack.length - 1];
       setUndoStack(prev => prev.slice(0, -1));
       setGameSecs(s.gameSecs);
@@ -1269,7 +1290,9 @@ function App() {
       if (s.running) {
         clockBaseRef.current = { wallMs: Date.now(), secs: s.gameSecs };
       }
-    }); // withActionLock
+    } finally {
+      setTimeout(() => { undoLockRef.current = false; }, 300);
+    }
   }
 
   // ── PERSISTENCE ─────────────────────────────────────────────────────────────
@@ -1278,12 +1301,31 @@ function App() {
   const [hydrated, setHydrated] = useState(false); // blocks save effect until restore commits
   const [hasSavedGame, setHasSavedGame] = useState(false); // whether restore found a live game
   const [confirmDiscard, setConfirmDiscard] = useState(false); // two-tap confirm for discard button
+  // If a saved snapshot uses a future schema we can't read, refuse to restore AND
+  // refuse to overwrite. Without this guard the save effect would clobber the
+  // newer save with a fresh v1 default snapshot on the next render.
+  const restoreBlockedRef = useRef(false);
+  const [saveError, setSaveError] = useState(false); // surfaces silent localStorage failures
 
   useEffect(() => {
     try {
       const raw = typeof localStorage !== "undefined" ? localStorage.getItem(STORAGE_KEY) : null;
       if (raw) {
         const s = JSON.parse(raw);
+
+        // Schema-version guard: a save from a newer build of the app may have
+        // a shape we don't recognise. Refuse to restore in that case (rather
+        // than partial-restoring into an impossible state). Saves without a
+        // schemaVersion field are treated as the original v1 shape.
+        const SUPPORTED_SCHEMA = 1;
+        const sv = typeof s.schemaVersion === "number" ? s.schemaVersion : 1;
+        if (sv > SUPPORTED_SCHEMA) {
+          // Block the save effect for the rest of this session so the newer save
+          // is preserved untouched (instead of getting overwritten with default v1 state).
+          restoreBlockedRef.current = true;
+          setHydrated(true);
+          return;
+        }
 
         // Validate critical fields before restoring — corrupted storage can
         // put the app into impossible states (negative gameSecs, unknown
@@ -1345,7 +1387,12 @@ function App() {
             .filter(Boolean);
           if (order.length > 0) setGridPlayerOrder(order);
         }
-        if (Array.isArray(s.editableGrid)) setEditableGrid(s.editableGrid);
+        if (Array.isArray(s.editableGrid)) {
+          // Deep-validate: every row must itself be an array. A corrupted save
+          // with non-array rows would crash the plan render at grid[m].filter().
+          const allRowsAreArrays = s.editableGrid.every(row => Array.isArray(row));
+          if (allRowsAreArrays) setEditableGrid(s.editableGrid);
+        }
         if (Array.isArray(s.plannedTimeouts)) setPlannedTimeouts(new Set(s.plannedTimeouts));
         if (Array.isArray(s.dismissedTimeouts)) setDismissedTimeouts(new Set(s.dismissedTimeouts));
         if (typeof s.timeoutRemindersOn === "boolean") setTimeoutRemindersOn(s.timeoutRemindersOn);
@@ -1363,9 +1410,11 @@ function App() {
 
   useEffect(() => {
     if (!hydrated) return; // don't overwrite saved state during initial restore
+    if (restoreBlockedRef.current) return; // refuse to overwrite a future-schema save
     // Save every tick — state is small, reliability beats battery savings.
     try {
       const snapshot = {
+        schemaVersion: 1,
         screen, halfMins,
         selected: [...selected], starters: [...starters],
         plan, planMode,
@@ -1393,7 +1442,12 @@ function App() {
         shortHandedDismissedAt: shortHandedDismissedAt ?? null,
       };
       localStorage.setItem(STORAGE_KEY, JSON.stringify(snapshot));
-    } catch (e) { /* quota or serialization issue */ }
+      if (saveError) setSaveError(false);
+    } catch (e) {
+      // Quota / private-mode / serialization failure. Surface it so the coach
+      // sees a banner instead of silently losing the game on the next refresh.
+      if (!saveError) setSaveError(true);
+    }
   }, [hydrated, screen, halfMins, selected, starters, plan, planMode, gameSecs, onCourt, accumulated, stintStart,
       halftimeDone, fouls, fouledOut, injured, adjustedTargetMins, subLog, injuryInfo, fouloutInfo,
       lastSubTime, offSince, handledWindows, restedThisHalf, replacingJersey,
@@ -1403,6 +1457,8 @@ function App() {
 
   function discardSavedGame() {
     try { localStorage.removeItem(STORAGE_KEY); } catch (e) {}
+    // Clear the future-schema lock so a fresh game on the same tab can save again.
+    restoreBlockedRef.current = false;
     // Reset to clean setup state
     setScreen("setup");
     setPlan(null);
@@ -1519,6 +1575,23 @@ function App() {
           onCourt.forEach(j => { next[j] = clamped; });
           return next;
         });
+      } else if (clamped < prevSecs) {
+        // General rewind (not from full-time): if the clock is moved back past
+        // a player's stintStart, snap that stintStart down to the new clock so
+        // gameSecs - stintStart never goes negative (which would corrupt
+        // accumulated minutes when that player is later subbed out / fouled
+        // out / used in a reroute calculation).
+        setStintStart(prev => {
+          let changed = false;
+          const next = { ...prev };
+          Object.keys(next).forEach(j => {
+            if (next[j] != null && next[j] > clamped) {
+              next[j] = clamped;
+              changed = true;
+            }
+          });
+          return changed ? next : prev;
+        });
       }
       return clamped;
     });
@@ -1544,6 +1617,22 @@ function App() {
           const next = { ...prev };
           onCourt.forEach(j => { next[j] = clamped; });
           return next;
+        });
+      } else if (clamped < prevSecs) {
+        // General rewind: snap any stintStart that now sits in the future down
+        // to the new clock so subsequent stint-duration math stays non-negative.
+        // (Without this, rewinding -10s across a recent sub corrupts accumulated
+        //  minutes when the sub-in player is later subbed/fouled out.)
+        setStintStart(prev => {
+          let changed = false;
+          const next = { ...prev };
+          Object.keys(next).forEach(j => {
+            if (next[j] != null && next[j] > clamped) {
+              next[j] = clamped;
+              changed = true;
+            }
+          });
+          return changed ? next : prev;
         });
       }
       if (running) {
@@ -2058,7 +2147,10 @@ function App() {
 
   function courtTime(jersey) {
     const base = accumulated[jersey] || 0;
-    if (stintStart[jersey] !== undefined) return base + (gameSecs - stintStart[jersey]);
+    // Clamp the live stint at 0 — adjustClock/setClockSecs already snap stintStart
+    // on rewind, but this is belt-and-suspenders against any other path that could
+    // leave stintStart > gameSecs.
+    if (stintStart[jersey] !== undefined) return base + Math.max(0, gameSecs - stintStart[jersey]);
     return base;
   }
 
@@ -2608,6 +2700,52 @@ function App() {
     };
   }, []);
 
+  // ── WAKE LOCK ──────────────────────────────────────────────────────────────
+  // Keep the phone screen on while the coach is on the game screen. iOS Safari
+  // drops the lock when the tab backgrounds, so we re-request on visibilitychange.
+  // Released automatically when the coach leaves the game screen or the game ends.
+  const wakeLockRef = useRef(null);
+  useEffect(() => {
+    let cancelled = false;
+    const requestWakeLock = async () => {
+      if (!("wakeLock" in navigator)) return;
+      try {
+        const lock = await navigator.wakeLock.request("screen");
+        // If the effect was already cleaned up while we were awaiting, release
+        // the lock immediately so we don't leak it across screen changes.
+        if (cancelled) { lock.release().catch(() => {}); return; }
+        // If a prior request resolved while this one was pending (e.g. rapid
+        // visibilitychange), release the older lock before overwriting the ref
+        // so it doesn't get orphaned and leak.
+        if (wakeLockRef.current && wakeLockRef.current !== lock) {
+          wakeLockRef.current.release().catch(() => {});
+        }
+        wakeLockRef.current = lock;
+      } catch (e) { /* unsupported, no permission, or page hidden */ }
+    };
+    const releaseWakeLock = () => {
+      if (wakeLockRef.current) {
+        wakeLockRef.current.release().catch(() => {});
+        wakeLockRef.current = null;
+      }
+    };
+    const onGameScreen = screen === "game" && !gameOver;
+    if (onGameScreen) {
+      requestWakeLock();
+      const onVisChange = () => {
+        if (document.visibilityState === "visible") requestWakeLock();
+      };
+      document.addEventListener("visibilitychange", onVisChange);
+      return () => {
+        cancelled = true;
+        document.removeEventListener("visibilitychange", onVisChange);
+        releaseWakeLock();
+      };
+    }
+    releaseWakeLock();
+    return () => { cancelled = true; };
+  }, [screen, gameOver]);
+
   const notifySub = () => {
     // Vibrate (Android only — not supported on iPhone)
     if (navigator.vibrate) navigator.vibrate([300, 100, 300]);
@@ -2646,9 +2784,8 @@ function App() {
   // When rotationPlan exists, this effect drives sub suggestions by comparing
   // the current on-court lineup to the plan's segment at the current gameSecs.
   // It fires at segment boundaries and shows Confirm/Delay/Skip.
-  const [lastExecutedSegId, setLastExecutedSegId] = useState(null);
-  const [planDelayUntilSecs, setPlanDelayUntilSecs] = useState(null);
-  const [delayedSegId, setDelayedSegId] = useState(null);
+  // (lastExecutedSegId / planDelayUntilSecs / delayedSegId are declared earlier
+  // alongside the other plan-execution state — see TDZ note above.)
 
   useEffect(() => {
     if (!rotationPlan || !plan || gameOver || showHalftime || screen !== "game" || replacingJersey != null) return;
@@ -2658,6 +2795,15 @@ function App() {
 
     // Grace period: if coach explicitly chose to play short-handed, suppress plan executor too
     if (shortHandedDismissedAt != null && gameSecs - shortHandedDismissedAt < 60) return;
+
+    // Quiet period: give the coach 30s of silence after every confirmed sub or
+    // emergency add. Without this the executor can re-prompt instantly when the
+    // player the coach just added doesn't exactly match the plan's intended one.
+    const PLAN_QUIET_SECS = 30;
+    if (gameSecs - lastSubTime < PLAN_QUIET_SECS) {
+      if (pendingSub !== null && !pendingSub.mandatory) setPendingSub(null);
+      return;
+    }
 
     const segs = rotationPlan.segments;
     if (!segs || segs.length === 0) return;
@@ -2742,7 +2888,7 @@ function App() {
 
     setPendingSub(next);
     notifySub();
-  }, [rotationPlan, gameSecs, onCourt, plan, gameOver, showHalftime, screen, replacingJersey, lastExecutedSegId, delayedSegId, planDelayUntilSecs, pendingSub, shortHandedDismissedAt]);
+  }, [rotationPlan, gameSecs, onCourt, plan, gameOver, showHalftime, screen, replacingJersey, lastExecutedSegId, delayedSegId, planDelayUntilSecs, pendingSub, shortHandedDismissedAt, lastSubTime]);
 
   // When plan sub is confirmed, update lastExecutedSegId
   const confirmPlanSub = () => {
@@ -3854,7 +4000,10 @@ function App() {
           const totalMins = halfMins * 2;
           const players = gridPlayerOrder;
           const grid = editableGrid;
-          const target = rotationPlan ? rotationPlan.targetMinutes : {};
+          // Prefer live adjusted targets (post foul-out / injury redistribution)
+          // and fall back to the plan's original targets so the grid display
+          // matches what the game screen shows the coach.
+          const target = { ...(rotationPlan ? rotationPlan.targetMinutes : {}), ...adjustedTargetMins };
 
           // Compute per-player totals
           const playerTotals = players.map((p, pIdx) => {
@@ -4180,9 +4329,17 @@ function App() {
           <div style={{ position: "fixed", inset: 0, background: "#000000cc", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 100 }}>
             <div style={{ background: "#1e293b", borderRadius: 24, padding: 24, maxWidth: 320, width: "90%", margin: "0 auto" }}>
               <div style={{ color: "#f87171", fontSize: 16, fontWeight: 700, marginBottom: 4 }}>⚠️ Player Off Court</div>
-              <div style={{ color: "#94a3b8", fontSize: 13, marginBottom: 16 }}>
+              <div style={{ color: "#94a3b8", fontSize: 13, marginBottom: 12 }}>
                 #{replacingJersey} {pObj(replacingJersey)?.name} is out. Pick a replacement:
               </div>
+              {/* Undo escape hatch — the overlay otherwise sits above the main
+                  Undo button and traps the coach into picking a replacement. */}
+              {undoStack.length > 0 && (
+                <button onClick={performUndo}
+                  style={{ width: "100%", marginBottom: 12, background: "#334155", border: "1px solid #475569", color: "#fbbf24", borderRadius: 10, padding: "10px", cursor: "pointer", fontSize: 13, fontWeight: 700 }}>
+                  ↩ Undo: {undoStack[undoStack.length - 1].label}
+                </button>
+              )}
               {benchPlayers.length === 0 ? (
                 <div style={{ color: "#64748b", fontSize: 13, marginBottom: 16 }}>No available bench players</div>
               ) : benchPlayers.map(p => (
@@ -4249,6 +4406,21 @@ function App() {
               style={{ padding: "10px 14px", borderRadius: 12, border: "none", cursor: "pointer", background: "#334155", color: "#fff", fontSize: 14 }}>Plan</button>
           </div>
         </div>
+
+        {/* SAVE ERROR BANNER — sticky, only shown when localStorage writes fail */}
+        {saveError && (
+          <div style={{
+            background: "#7f1d1d", border: "2px solid #ef4444", borderRadius: 12,
+            padding: "10px 14px", marginBottom: 10,
+            display: "flex", alignItems: "center", gap: 10,
+          }}>
+            <span style={{ fontSize: 18 }}>⚠</span>
+            <div>
+              <div style={{ color: "#fecaca", fontSize: 12, fontWeight: 700 }}>NOT SAVING TO THIS DEVICE</div>
+              <div style={{ color: "#fca5a5", fontSize: 11 }}>Storage failed — do NOT refresh or close the tab. Game state will be lost.</div>
+            </div>
+          </div>
+        )}
 
         {/* REROUTE BANNER — auto-dismisses, no OK button */}
         {rerouteBanner && (
