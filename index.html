@@ -4096,7 +4096,12 @@ function App() {
                                 // Second tap — swap columns
                                 const fromIdx = swapSelectedIdx;
                                 const toIdx = pIdx;
-                                // Swap player order
+                                // Swap ONLY the player order — keep the painted
+                                // cells in place so the new player inherits the
+                                // old player's rotation slot. (e.g. swap Aanya
+                                // [starter] with Armel [bench]: Armel now holds
+                                // the starter slot, Aanya takes Armel's bench
+                                // rotation. NOT a cosmetic relabel.)
                                 setGridPlayerOrder(prev => {
                                   const next = [...prev];
                                   const tmp = next[fromIdx];
@@ -4104,14 +4109,6 @@ function App() {
                                   next[toIdx] = tmp;
                                   return next;
                                 });
-                                // Swap grid columns
-                                setEditableGrid(prev => prev.map(row => {
-                                  const next = [...row];
-                                  const tmp = next[fromIdx];
-                                  next[fromIdx] = next[toIdx];
-                                  next[toIdx] = tmp;
-                                  return next;
-                                }));
                                 setSwapSelectedIdx(null);
                               }
                             }}
