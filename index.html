@@ -1074,6 +1074,97 @@ function App() {
     showToast("Template deleted");
   }
 
+  // ── TEMPLATE BACKUP: export / import as JSON file ──────────────────────────
+  // Solves the localStorage-loss problem: PWA reinstall, browser-data clear,
+  // and origin change all wipe localStorage. Exporting to a file (which the
+  // phone's file picker can place anywhere — iCloud Drive, OneDrive, Google
+  // Drive, Files) gives the coach a durable backup that survives anything.
+  const fileImportRef = useRef(null);
+
+  function exportTemplates() {
+    if (savedTemplates.length === 0) {
+      showToast("No templates to back up");
+      return;
+    }
+    const payload = {
+      app: "coachk-subplanner",
+      kind: "templates",
+      schemaVersion: 1,
+      exportedAt: new Date().toISOString(),
+      templates: savedTemplates,
+    };
+    try {
+      const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      const d = new Date();
+      const stamp = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+      a.href = url;
+      a.download = `subplanner-templates-${stamp}.json`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      // Defer URL revoke so the download has a chance to start on slower browsers
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+      showToast(`Backed up ${savedTemplates.length} template${savedTemplates.length === 1 ? "" : "s"}`);
+    } catch (e) {
+      showToast("Backup failed — try again");
+    }
+  }
+
+  function importTemplatesFromFile(file) {
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = (e) => {
+      try {
+        const text = e.target.result;
+        const parsed = JSON.parse(text);
+        // Accept either the wrapped payload format OR a bare templates array,
+        // so older / hand-edited backups still import cleanly.
+        const incomingRaw = Array.isArray(parsed)
+          ? parsed
+          : Array.isArray(parsed?.templates) ? parsed.templates : null;
+        if (!incomingRaw) {
+          showToast("File doesn't look like a templates backup");
+          return;
+        }
+        const incoming = sanitizeTemplates(incomingRaw);
+        if (incoming.length === 0) {
+          showToast("No valid templates found in file");
+          return;
+        }
+        // Merge with existing: dedupe by name+playerCount+attendanceSignature
+        // (same key the save flow uses). Incoming wins on conflict so a fresh
+        // restore overwrites any matching local entry.
+        const incomingKeys = new Set(
+          incoming.map(t => `${t.name}|${t.playerCount}|${t.attendanceSignature || ""}`)
+        );
+        const kept = savedTemplates.filter(t =>
+          !incomingKeys.has(`${t.name}|${t.playerCount}|${t.attendanceSignature || ""}`)
+        );
+        const merged = [...kept, ...incoming];
+        persistTemplates(merged);
+        const replaced = savedTemplates.length - kept.length;
+        const added = incoming.length - replaced;
+        const parts = [];
+        if (added > 0) parts.push(`${added} added`);
+        if (replaced > 0) parts.push(`${replaced} replaced`);
+        showToast(`Restored: ${parts.join(", ") || `${incoming.length} templates`}`);
+      } catch (err) {
+        showToast("Couldn't read file — is it a valid backup?");
+      }
+    };
+    reader.onerror = () => showToast("Failed to read file");
+    reader.readAsText(file);
+  }
+
+  function triggerImport() {
+    if (fileImportRef.current) {
+      fileImportRef.current.value = ""; // allow re-importing the same file
+      fileImportRef.current.click();
+    }
+  }
+
   function showToast(msg) {
     setTemplateToast(msg);
     setTimeout(() => setTemplateToast(null), 3000);
@@ -3845,6 +3936,24 @@ function App() {
             style={{ background: "#1e3a8a", border: "1px solid #3b82f6", color: "#93c5fd", padding: "6px 14px", borderRadius: 6, cursor: "pointer", fontSize: "0.85rem", fontWeight: 600 }}>
             📂 Load Template
           </button>
+          {/* File-backup buttons: durable storage that survives PWA reinstall / origin change. */}
+          <button onClick={exportTemplates}
+            title="Save a backup file of all templates (pick anywhere — iCloud Drive, OneDrive, etc.)"
+            style={{ background: "#3f3f46", border: "1px solid #71717a", color: "#e4e4e7", padding: "6px 14px", borderRadius: 6, cursor: "pointer", fontSize: "0.85rem", fontWeight: 600 }}>
+            ⬇ Backup
+          </button>
+          <button onClick={triggerImport}
+            title="Restore templates from a backup file"
+            style={{ background: "#3f3f46", border: "1px solid #71717a", color: "#e4e4e7", padding: "6px 14px", borderRadius: 6, cursor: "pointer", fontSize: "0.85rem", fontWeight: 600 }}>
+            ⬆ Restore
+          </button>
+          <input
+            ref={fileImportRef}
+            type="file"
+            accept="application/json,.json"
+            style={{ display: "none" }}
+            onChange={e => { const f = e.target.files?.[0]; if (f) importTemplatesFromFile(f); }}
+          />
           {(() => {
             const matching = getMatchingTemplates();
             if (matching.length === 0) return null;
