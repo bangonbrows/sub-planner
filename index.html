@@ -29,6 +29,425 @@ const PLAYERS_DB = [
   { jersey: 40, name: "Armelle",   rating: 2.1, asthma: false, foulProne: false, color: "#FF5722", pos: ["SG", "SF"],       skills: ["Passing", "Perimeter"] },
 ];
 
+// ═════════════════════════════════════════════════════════════════════════════
+// WAVE 1 DATA FOUNDATION — build contract: MULTI-TEAM-SPEC.md Revision 16 (frozen)
+// PLAYERS_DB above is retained ONLY as the one-time migration seed (D-5 cleanup
+// deletes it once the game-day phone is confirmed migrated).
+// ═════════════════════════════════════════════════════════════════════════════
+const TEAMS_KEY = "coachk-subplanner-teams";
+const SETTINGS_KEY = "coachk-subplanner-settings";
+const HISTORY_KEY = "coachk-subplanner-history";
+const TPL_KEY = "coachk_rotation_templates"; // same key App uses; module-scope alias
+const SEED_TEAM_ID = "team_seed_lakeside_lakers";
+// Fixed literal timestamps make two independent migrations byte-identical (spec W1.c).
+const SEED_TS = "2026-07-18T00:00:00.000Z";
+const MAX_PARTICIPANTS = 10; // D-9
+
+function newId() {
+  try { if (crypto && crypto.randomUUID) return crypto.randomUUID(); } catch (e) {}
+  return "id_" + Date.now().toString(36) + "_" + Math.random().toString(36).slice(2, 10);
+}
+const nowIso = () => new Date().toISOString();
+const plus1ms = (iso) => new Date(new Date(iso).getTime() + 1).toISOString();
+const maxIso = (...ts) => ts.filter(Boolean).sort().pop() || null;
+
+// Per-key write blocks (§5.1/§5.3) + user-facing storage notices, read by App.
+const storageBlocks = {};   // key -> reason string; presence blocks writes to that key
+const storageNotices = [];  // { text, action?: { label, run } }
+
+function safeGet(key) { try { return localStorage.getItem(key); } catch (e) { return null; } }
+function safeSet(key, val) {
+  if (storageBlocks[key]) return false;
+  try { localStorage.setItem(key, val); return localStorage.getItem(key) === val; } catch (e) { return false; }
+}
+
+// Verbatim raw download — used by quarantine/deferral notices (§5.1: opaque bytes, .txt).
+function downloadRawText(filename, raw) {
+  const blob = new Blob([raw], { type: "text/plain" });
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = filename;
+  a.click();
+  setTimeout(() => URL.revokeObjectURL(a.href), 5000);
+}
+
+// §5.1 quarantine: copy raw to <key>-quarantine-<ts>, read-back verify, keep newest 3.
+function quarantineRaw(key, raw) {
+  const qkey = key + "-quarantine-" + Date.now();
+  try {
+    localStorage.setItem(qkey, raw);
+    if (localStorage.getItem(qkey) !== raw) return false;
+    const mine = [];
+    for (let i = 0; i < localStorage.length; i++) {
+      const k = localStorage.key(i);
+      if (k && k.startsWith(key + "-quarantine-")) mine.push(k);
+    }
+    mine.sort().slice(0, -3).forEach((k) => { try { localStorage.removeItem(k); } catch (e) {} });
+    return true;
+  } catch (e) { return false; }
+}
+
+// §5.1 quarantine-then-heal for a whole key. Returns "healed" | "blocked".
+function quarantineAndHeal(key, raw, healValue, noticeText) {
+  const copied = quarantineRaw(key, raw);
+  if (copied) {
+    try {
+      localStorage.setItem(key, healValue);
+      if (localStorage.getItem(key) === healValue) {
+        storageNotices.push({ text: noticeText + " Damaged data was preserved.", action: { label: "Save damaged data to a file", run: () => downloadRawText(key + "-damaged.txt", raw) } });
+        return "healed";
+      }
+    } catch (e) {}
+  }
+  // Copy or heal-reset failed → the untouched active key IS the forensic copy: block writes.
+  storageBlocks[key] = "storage-damaged";
+  storageNotices.push({ text: noticeText + " NOT SAVING to this area — storage needs attention.", action: { label: "Save damaged data to a file", run: () => downloadRawText(key + "-damaged.txt", raw) } });
+  return "blocked";
+}
+
+// ── Team / player model validation ──────────────────────────────────────────
+function validPlayer(p) {
+  return p && typeof p === "object" && typeof p.playerId === "string" && p.playerId &&
+    (p.jersey === null || (Number.isInteger(p.jersey) && p.jersey >= 0 && p.jersey <= 99)) &&
+    typeof p.name === "string" && typeof p.rating === "number" &&
+    Array.isArray(p.pos) && Array.isArray(p.skills) &&
+    typeof p.rev === "number" && typeof p.createdAt === "string" && typeof p.updatedAt === "string";
+}
+function validTeam(t) {
+  return t && typeof t === "object" && t.schemaVersion === 1 && typeof t.id === "string" && t.id &&
+    typeof t.name === "string" && typeof t.rev === "number" &&
+    typeof t.createdAt === "string" && typeof t.updatedAt === "string" && typeof t.aggregateUpdatedAt === "string" &&
+    Array.isArray(t.players) && t.players.every(validPlayer);
+}
+function validTeamsEnvelope(env) {
+  return env && typeof env === "object" && typeof env.schemaVersion === "number" &&
+    Array.isArray(env.teams) && env.teams.every(validTeam);
+}
+
+// ── Deterministic seed (spec W1.c) ──────────────────────────────────────────
+function buildSeedPlayer(src) {
+  return {
+    playerId: "player_seed_" + src.jersey,
+    jersey: src.jersey, name: src.name, rating: src.rating, color: src.color,
+    pos: src.pos.slice(), skills: src.skills.slice(),
+    asthma: !!src.asthma, foulProne: !!src.foulProne, isGuest: false, needsJersey: false,
+    rev: 1, createdAt: SEED_TS, updatedAt: SEED_TS, deletedAt: null, restoredAt: null,
+  };
+}
+function buildSeedEnvelope() {
+  return {
+    schemaVersion: 1, updatedAt: SEED_TS,
+    teams: [{
+      schemaVersion: 1, id: SEED_TEAM_ID, name: "Lakeside Lakers", rev: 1,
+      createdAt: SEED_TS, updatedAt: SEED_TS, aggregateUpdatedAt: SEED_TS,
+      deletedAt: null, restoredAt: null,
+      players: PLAYERS_DB.map(buildSeedPlayer),
+    }],
+  };
+}
+
+// ── §5.5 merge machinery ────────────────────────────────────────────────────
+// Freshness: rev, then updatedAt, then lexicographically greater serialization.
+function fresher(a, b) {
+  if (a.rev !== b.rev) return a.rev > b.rev ? a : b;
+  if (a.updatedAt !== b.updatedAt) return a.updatedAt > b.updatedAt ? a : b;
+  return JSON.stringify(a) >= JSON.stringify(b) ? a : b;
+}
+// Sticky tombstones: deletedAt survives unless an explicit restore (restoredAt > deletedAt).
+function mergeTombstone(winner, a, b) {
+  const del = maxIso(a.deletedAt, b.deletedAt);
+  if (!del) return winner;
+  const res = maxIso(a.restoredAt, b.restoredAt);
+  if (res && res > del) return { ...winner, deletedAt: null, restoredAt: res };
+  return { ...winner, deletedAt: del, restoredAt: res || null };
+}
+function mergePlayers(aPlayers, bPlayers) {
+  const byId = new Map();
+  for (const p of aPlayers) byId.set(p.playerId, p);
+  for (const p of bPlayers) {
+    const mine = byId.get(p.playerId);
+    byId.set(p.playerId, mine ? mergeTombstone(fresher(mine, p), mine, p) : p);
+  }
+  return [...byId.values()];
+}
+function mergeTeam(a, b) {
+  // Scalars by team (rev, updatedAt) — SCALAR-scoped (player edits touch neither).
+  const scalarWinner = fresher(a, b);
+  const merged = { ...scalarWinner, players: mergePlayers(a.players, b.players) };
+  const withTomb = mergeTombstone(merged, a, b);
+  // Sync cursor: max of both; strictly advanced by the caller when content changed.
+  withTomb.aggregateUpdatedAt = maxIso(a.aggregateUpdatedAt, b.aggregateUpdatedAt);
+  return withTomb;
+}
+function canonicalizeEnvelope(env) {
+  env.teams.sort((x, y) => (x.createdAt + x.id).localeCompare(y.createdAt + y.id));
+  for (const t of env.teams) t.players.sort((x, y) => (x.createdAt + x.playerId).localeCompare(y.createdAt + y.playerId));
+  return env;
+}
+// Post-merge cross-record invariants (§5.5): deterministic collision resolution.
+function enforceInvariants(env) {
+  for (const t of env.teams) {
+    const seen = new Map(); // jersey -> keeper player
+    const order = [...t.players].sort((x, y) => (x.createdAt + x.playerId).localeCompare(y.createdAt + y.playerId));
+    for (const p of order) {
+      if (p.deletedAt || p.jersey === null) continue;
+      if (seen.has(p.jersey)) { p.jersey = null; p.needsJersey = true; p.updatedAt = nowIso(); p.rev++; }
+      else seen.set(p.jersey, p);
+    }
+  }
+  const names = new Map(); // normalized name -> keeper team
+  const tOrder = [...env.teams].sort((x, y) => (x.createdAt + x.id).localeCompare(y.createdAt + y.id));
+  for (const t of tOrder) {
+    if (t.deletedAt) continue;
+    let key = t.name.trim().toLowerCase(), n = 2;
+    while (names.has(key)) { t.name = t.name.replace(/ \(\d+\)$/, "") + " (" + n + ")"; key = t.name.trim().toLowerCase(); n++; t.updatedAt = nowIso(); t.rev++; }
+    names.set(key, t);
+  }
+  return env;
+}
+function mergeTeamsEnvelopes(mine, theirs) {
+  if (!theirs) return canonicalizeEnvelope(enforceInvariants(mine));
+  const byId = new Map();
+  for (const t of theirs.teams) byId.set(t.id, t);
+  for (const t of mine.teams) {
+    const other = byId.get(t.id);
+    byId.set(t.id, other ? mergeTeam(other, t) : t);
+  }
+  const out = { schemaVersion: 1, updatedAt: maxIso(mine.updatedAt, theirs.updatedAt) || nowIso(), teams: [...byId.values()] };
+  return canonicalizeEnvelope(enforceInvariants(out));
+}
+// Strictly-monotonic aggregate cursor advance for teams whose content changed vs storage.
+function advanceAggregates(merged, stored) {
+  const prevById = new Map((stored ? stored.teams : []).map((t) => [t.id, t]));
+  for (const t of merged.teams) {
+    const prev = prevById.get(t.id);
+    // A record with NO stored counterpart keeps its authored mark — advancing it
+    // would break the seed's byte-identical determinism (spec W1.c / round-5 fold).
+    if (!prev) continue;
+    if (JSON.stringify({ ...t, aggregateUpdatedAt: 0 }) !== JSON.stringify({ ...prev, aggregateUpdatedAt: 0 })) {
+      let next = maxIso(t.aggregateUpdatedAt, prev.aggregateUpdatedAt, nowIso());
+      if (next <= prev.aggregateUpdatedAt) next = plus1ms(prev.aggregateUpdatedAt);
+      if (next <= t.aggregateUpdatedAt) next = plus1ms(t.aggregateUpdatedAt);
+      t.aggregateUpdatedAt = next;
+    }
+  }
+  return merged;
+}
+// §5.5 merge-on-write with bounded write-verify. Returns true on verified persist.
+function writeTeamsEnvelope(candidate) {
+  for (let attempt = 0; attempt < 3; attempt++) {
+    let stored = null;
+    try { const raw = safeGet(TEAMS_KEY); stored = raw ? JSON.parse(raw) : null; } catch (e) { stored = null; }
+    if (stored && !validTeamsEnvelope(stored)) stored = null; // corrupt handled by migrateTeams
+    let merged = mergeTeamsEnvelopes(JSON.parse(JSON.stringify(candidate)), stored);
+    merged = advanceAggregates(merged, stored);
+    const out = JSON.stringify(merged);
+    if (!safeSet(TEAMS_KEY, out)) return false;
+    if (safeGet(TEAMS_KEY) === out) return true; // verified; residual window documented in spec
+  }
+  return false;
+}
+
+// ── Template envelope merge-on-write (§5.5 scope widened to templates) ──────
+// Stable content hash (djb2) over the canonical core — used for derived copy /
+// legacy import identities so repeated merges and re-imports are idempotent.
+function tplCore(t) { return { name: t.name, playerCount: t.playerCount, halfMins: t.halfMins, grid: t.grid }; }
+function contentHash(obj) {
+  const s = JSON.stringify(obj);
+  let h = 5381;
+  for (let i = 0; i < s.length; i++) h = ((h * 33) ^ s.charCodeAt(i)) >>> 0;
+  return h.toString(36);
+}
+const EPOCH = "1970-01-01T00:00:00.000Z";
+function tplFresh(a, b) {
+  const ar = a.rev || 0, br = b.rev || 0; // legacy entries rank (rev 0, epoch)
+  if (ar !== br) return ar > br ? a : b;
+  const au = a.updatedAt || EPOCH, bu = b.updatedAt || EPOCH;
+  if (au !== bu) return au > bu ? a : b;
+  return JSON.stringify(a) >= JSON.stringify(b) ? a : b;
+}
+function canonTemplates(arr) {
+  arr.sort((x, y) => ((x.createdAt || EPOCH) + String(x.id)).localeCompare((y.createdAt || EPOCH) + String(y.id)));
+  return arr;
+}
+function mergeTemplatesEnvelopes(mine, theirs) {
+  const base = theirs && Array.isArray(theirs.templates) ? theirs.templates : [];
+  const byId = new Map();
+  for (const t of base) byId.set(String(t.id), t);
+  for (const t of mine.templates) {
+    const o = byId.get(String(t.id));
+    byId.set(String(t.id), o ? mergeTombstone(tplFresh(o, t), o, t) : t);
+  }
+  return { schemaVersion: 1, updatedAt: maxIso(mine.updatedAt, theirs && theirs.updatedAt) || nowIso(), templates: canonTemplates([...byId.values()]) };
+}
+// Pass ONLY changed/new records — the union merge preserves everything else.
+function writeTemplatesEnvelope(candidate) {
+  for (let attempt = 0; attempt < 3; attempt++) {
+    let stored = null;
+    try { const r = safeGet(TPL_KEY); stored = r ? JSON.parse(r) : null; } catch (e) { stored = null; }
+    if (stored && (Array.isArray(stored) || !Array.isArray(stored.templates))) stored = null; // raw arrays are migration/deferral territory, never merged here
+    const merged = mergeTemplatesEnvelopes(JSON.parse(JSON.stringify(candidate)), stored);
+    const out = JSON.stringify(merged);
+    if (!safeSet(TPL_KEY, out)) return false;
+    if (safeGet(TPL_KEY) === out) return true;
+  }
+  return false;
+}
+
+// ── Template migration (§6 under D-8 + D-9 grid validation) ─────────────────
+function validTemplateEntry(t) {
+  return t && typeof t === "object" && typeof t.name === "string" &&
+    Number.isFinite(t.playerCount) && t.playerCount >= 1 && t.playerCount <= MAX_PARTICIPANTS &&
+    Number.isFinite(t.halfMins) && t.halfMins > 0 &&
+    Array.isArray(t.grid) && t.grid.length === t.halfMins * 2 &&
+    t.grid.every((row) => Array.isArray(row) && row.length === t.playerCount && row.every((c) => typeof c === "boolean"));
+}
+// D-8: strip legacy identity fields — templates are anonymous slot patterns.
+function stripTemplateEntry(t) {
+  const { playerOrder, attendanceSignature, ...rest } = t;
+  return rest;
+}
+let templatesDeferredRaw = null; // non-null => deferred READ-ONLY mode (§6 round-15/16)
+
+function migrateTemplates() {
+  const raw = safeGet(TPL_KEY);
+  if (raw === null) {
+    safeSet(TPL_KEY, JSON.stringify({ schemaVersion: 1, updatedAt: nowIso(), templates: [] }));
+    return;
+  }
+  let parsed;
+  try { parsed = JSON.parse(raw); } catch (e) {
+    quarantineAndHeal(TPL_KEY, raw, JSON.stringify({ schemaVersion: 1, updatedAt: nowIso(), templates: [] }), "Saved rotation templates were damaged.");
+    return;
+  }
+  if (parsed && !Array.isArray(parsed) && typeof parsed === "object") {
+    // Already an envelope. Higher-schema refusal (§5.2).
+    if (typeof parsed.schemaVersion === "number" && parsed.schemaVersion > 1) {
+      storageBlocks[TPL_KEY] = "future-schema";
+      storageNotices.push({ text: "Templates were saved by a newer app version — template saving is off to protect them." });
+      return;
+    }
+    if (!Array.isArray(parsed.templates)) {
+      quarantineAndHeal(TPL_KEY, raw, JSON.stringify({ schemaVersion: 1, updatedAt: nowIso(), templates: [] }), "Saved rotation templates were damaged.");
+    }
+    return;
+  }
+  if (!Array.isArray(parsed)) {
+    quarantineAndHeal(TPL_KEY, raw, JSON.stringify({ schemaVersion: 1, updatedAt: nowIso(), templates: [] }), "Saved rotation templates were damaged.");
+    return;
+  }
+  // Legacy array → ordered migration contract (§6, round-14/15/16).
+  const healthy = [], malformed = [];
+  for (const t of parsed) (validTemplateEntry(t) ? healthy : malformed).push(t);
+  if (malformed.length > 0) {
+    // Verified stash REQUIRED before any drop.
+    const stashKey = TPL_KEY + "-premigration";
+    let stashed = false;
+    try { localStorage.setItem(stashKey, raw); stashed = localStorage.getItem(stashKey) === raw; } catch (e) { stashed = false; }
+    if (!stashed) {
+      // DEFER: read-only legacy mode for the session; raw stays untouched.
+      templatesDeferredRaw = raw;
+      storageBlocks[TPL_KEY] = "migration-deferred";
+      storageNotices.push({ text: "NOT SAVING templates — storage needs attention before the app can safely upgrade them.", action: { label: "Save original template data", run: () => downloadRawText("templates-original.txt", raw) } });
+      return;
+    }
+  }
+  const envelope = { schemaVersion: 1, updatedAt: nowIso(), templates: healthy.map(stripTemplateEntry) };
+  if (safeSet(TPL_KEY, JSON.stringify(envelope))) {
+    if (malformed.length > 0) {
+      storageNotices.push({ text: malformed.length + " damaged template(s) couldn't be kept. The originals were preserved.", action: { label: "Save original template data", run: () => downloadRawText("templates-original.txt", raw) } });
+    }
+  } else {
+    templatesDeferredRaw = raw;
+    storageBlocks[TPL_KEY] = "migration-deferred";
+    storageNotices.push({ text: "NOT SAVING templates — storage needs attention before the app can safely upgrade them.", action: { label: "Save original template data", run: () => downloadRawText("templates-original.txt", raw) } });
+  }
+}
+
+// ── Teams / settings / history migrations (per-key, idempotent — spec W1.c/W1.e) ──
+function migrateTeams() {
+  const raw = safeGet(TEAMS_KEY);
+  if (raw === null) { writeTeamsEnvelope(buildSeedEnvelope()); return; }
+  let parsed;
+  try { parsed = JSON.parse(raw); } catch (e) { parsed = null; }
+  if (parsed && typeof parsed.schemaVersion === "number" && parsed.schemaVersion > 1) {
+    storageBlocks[TEAMS_KEY] = "future-schema";
+    storageNotices.push({ text: "Team data was saved by a newer app version — team saving is off to protect it." });
+    return;
+  }
+  if (!validTeamsEnvelope(parsed)) {
+    quarantineAndHeal(TEAMS_KEY, raw, JSON.stringify(canonicalizeEnvelope(buildSeedEnvelope())), "Saved team data was damaged.");
+  }
+}
+const SETTINGS_DEFAULTS = {
+  schemaVersion: 1, updatedAt: SEED_TS,
+  defaultHalfMins: 20, defaultFormat: "halves", defaultPlanMode: "balanced",
+  deadBallLookaheadSecs: 60, foulTroubleWarning: true, benchReadinessLabels: true,
+  playerStatusTags: false, whatsAppFormatting: false, reportStyle: "coach",
+  defaultTrackingToggles: { individualFouls: true, teamFouls: false, rebounds: false, points: false, gameNotes: false },
+};
+function migrateSimpleKey(key, defaults, label) {
+  const raw = safeGet(key);
+  if (raw === null) { safeSet(key, JSON.stringify(defaults)); return; }
+  let parsed;
+  try { parsed = JSON.parse(raw); } catch (e) { parsed = null; }
+  if (parsed && typeof parsed.schemaVersion === "number" && parsed.schemaVersion > 1) {
+    storageBlocks[key] = "future-schema"; return;
+  }
+  if (!parsed || typeof parsed !== "object") {
+    quarantineAndHeal(key, raw, JSON.stringify(defaults), label + " data was damaged.");
+  }
+}
+
+// Run all migrations before the app renders (localStorage is synchronous).
+migrateTeams();
+migrateSimpleKey(SETTINGS_KEY, SETTINGS_DEFAULTS, "Settings");
+migrateSimpleKey(HISTORY_KEY, { schemaVersion: 1, updatedAt: SEED_TS, games: [] }, "Game history");
+migrateTemplates();
+
+// ── Active roster (W1.d): the app reads THIS, never PLAYERS_DB ──────────────
+function getActiveTeam() {
+  try {
+    const env = JSON.parse(safeGet(TEAMS_KEY));
+    if (validTeamsEnvelope(env)) {
+      const t = env.teams.find((x) => !x.deletedAt);
+      if (t) return t;
+    }
+  } catch (e) {}
+  // Blocked/corrupt storage: run the session on the in-memory seed (§5.1).
+  return buildSeedEnvelope().teams[0];
+}
+const ACTIVE_TEAM = getActiveTeam();
+// Display order = jersey ascending (matches today's PLAYERS_DB order; storage order is canonical, not display).
+const ROSTER = ACTIVE_TEAM.players
+  .filter((p) => !p.deletedAt && !p.needsJersey && p.jersey !== null)
+  .sort((a, b) => a.jersey - b.jersey);
+
+// Sticky storage-health banner, rendered at the top of every screen. The notices
+// array is populated during migration/restore (before/at first render) — static
+// content for the session, so no state subscription is needed.
+function StorageNoticesBanner() {
+  if (storageNotices.length === 0) return null;
+  return (
+    <div style={{ background: "#7f1d1d", border: "1px solid #ef4444", borderRadius: 12, padding: 12, marginBottom: 12 }}>
+      {storageNotices.map((n, i) => (
+        <div key={i} style={{ marginBottom: i < storageNotices.length - 1 ? 8 : 0 }}>
+          <div style={{ color: "#fecaca", fontSize: 12, fontWeight: 700 }}>⚠ {n.text}</div>
+          {n.action && (
+            <button onClick={n.action.run}
+              style={{ marginTop: 6, padding: "6px 10px", borderRadius: 8, border: "1px solid #ef4444", background: "#450a0a", color: "#fecaca", cursor: "pointer", fontSize: 12, fontWeight: 700 }}>
+              {n.action.label}
+            </button>
+          )}
+        </div>
+      ))}
+    </div>
+  );
+}
+
+// Minimal internals surface for the sentinel harness (inert in normal use).
+window.__SP_INTERNALS__ = { TEAMS_KEY, SETTINGS_KEY, HISTORY_KEY, TPL_KEY, SEED_TEAM_ID, mergeTeamsEnvelopes, writeTeamsEnvelope, writeTemplatesEnvelope, buildSeedEnvelope, storageBlocks, storageNotices, validTemplateEntry, contentHash, tplCore, MAX_PARTICIPANTS };
+
 // Minimum skill coverage required on court at all times
 // Skills: Scoring, BallHandle, Passing, Interior, Perimeter
 const SKILL_MINIMUMS = [
@@ -936,7 +1355,7 @@ function CoachKLogo({ size = 40 }) {
 function App() {
   const [screen, setScreen] = useState("setup");
   const [halfMins, setHalfMins] = useState(20);
-  const [selected, setSelected] = useState(new Set(PLAYERS_DB.map(p => p.jersey)));
+  const [selected, setSelected] = useState(new Set(ROSTER.map(p => p.jersey)));
   const [starters, setStarters] = useState(new Set());
   const [plan, setPlan] = useState(null);
   const [planMode, setPlanMode] = useState("balanced"); // balanced | competitive | development
@@ -975,103 +1394,80 @@ function App() {
 
   // ── ROTATION TEMPLATES ──────────────────────────────────────────────────────
   // Stored in localStorage. Each template: { name, playerCount, halfMins, grid (2D bool array) }
-  const TEMPLATES_KEY = "coachk_rotation_templates";
-  // Sanitize templates from localStorage to prevent corrupt data
-  function sanitizeTemplates(raw) {
-    if (!Array.isArray(raw)) return [];
-    return raw.filter(t =>
-      t &&
-      typeof t.name === "string" &&
-      Number.isFinite(t.playerCount) &&
-      Array.isArray(t.grid) &&
-      t.grid.every(row => Array.isArray(row))
-    );
-  }
-  const [savedTemplates, setSavedTemplates] = useState(() => {
+  const TEMPLATES_KEY = TPL_KEY; // module-scope key (single definition)
+  // D-8 (frozen spec): templates are ANONYMOUS SLOT PATTERNS — no playerOrder,
+  // no attendanceSignature, no team binding. Stored in a §5.5-merged envelope.
+  // Active = non-tombstoned. Deferred migration mode = read-only legacy view.
+  function readActiveTemplates() {
+    if (templatesDeferredRaw !== null) {
+      try {
+        const arr = JSON.parse(templatesDeferredRaw);
+        return Array.isArray(arr) ? arr.filter(validTemplateEntry).map(stripTemplateEntry) : [];
+      } catch { return []; }
+    }
     try {
-      const raw = localStorage.getItem(TEMPLATES_KEY);
-      return raw ? sanitizeTemplates(JSON.parse(raw)) : [];
+      const parsed = JSON.parse(localStorage.getItem(TEMPLATES_KEY));
+      const list = Array.isArray(parsed) ? parsed.filter(validTemplateEntry).map(stripTemplateEntry)
+        : (parsed && Array.isArray(parsed.templates)) ? parsed.templates : [];
+      return list.filter(t => !t.deletedAt);
     } catch { return []; }
-  });
+  }
+  const [savedTemplates, setSavedTemplates] = useState(readActiveTemplates);
   const [templateNameInput, setTemplateNameInput] = useState("");
   const [showSaveDialog, setShowSaveDialog] = useState(false);
   const [showLoadDialog, setShowLoadDialog] = useState(false);
   const [templateToast, setTemplateToast] = useState(null);
 
-  function persistTemplates(templates) {
-    setSavedTemplates(templates);
-    try { localStorage.setItem(TEMPLATES_KEY, JSON.stringify(templates)); } catch {}
+  const templatesBlocked = () => !!storageBlocks[TEMPLATES_KEY];
+
+  // Single write path: pass ONLY the changed/new records; §5.5 merge keeps the rest.
+  function persistTemplateChange(changedRecords, toast) {
+    if (templatesBlocked()) { showToast("⚠ Template saving is off — storage needs attention"); return false; }
+    if (!writeTemplatesEnvelope({ schemaVersion: 1, updatedAt: nowIso(), templates: changedRecords })) {
+      showToast("⚠ Couldn't save templates — storage failed"); return false;
+    }
+    setSavedTemplates(readActiveTemplates());
+    if (toast) showToast(toast);
+    return true;
   }
 
   function saveTemplate(name) {
     if (!editableGrid || gridPlayerOrder.length === 0 || !name.trim()) return;
     const playerCount = gridPlayerOrder.length;
-    const entry = {
-      id: Date.now(),
-      name: name.trim(),
-      playerCount,
-      halfMins,
-      grid: editableGrid,
-      playerOrder: gridPlayerOrder.map(p => p.jersey),
-      attendanceSignature: gridPlayerOrder.map(p => p.jersey).sort((a, b) => a - b).join("-"),
-      createdAt: new Date().toISOString(),
-    };
-    // Replace if same name + playerCount + attendanceSignature exists, otherwise add
-    const existing = savedTemplates.filter(t => !(t.name === entry.name && t.playerCount === playerCount && t.attendanceSignature === entry.attendanceSignature));
-    persistTemplates([...existing, entry]);
-    setShowSaveDialog(false);
-    setTemplateNameInput("");
-    showToast(`Saved "${entry.name}" (${playerCount} players)`);
+    const ts = nowIso();
+    // D-8 replace rule: same name + playerCount + halfMins = an edit of that pattern.
+    const existing = savedTemplates.find(t => t.name === name.trim() && t.playerCount === playerCount && t.halfMins === halfMins);
+    const entry = existing
+      ? { ...existing, grid: editableGrid.map(r => r.slice()), rev: (existing.rev || 0) + 1, updatedAt: ts }
+      : { id: newId(), name: name.trim(), playerCount, halfMins, grid: editableGrid.map(r => r.slice()),
+          rev: 1, createdAt: ts, updatedAt: ts, deletedAt: null, restoredAt: null };
+    if (persistTemplateChange([entry], `Saved "${entry.name}" (${playerCount} players)`)) {
+      setShowSaveDialog(false);
+      setTemplateNameInput("");
+    }
   }
 
   function loadTemplate(template) {
     if (!template || !template.grid) return;
-    const totalMins = halfMins * 2;
     const playerCount = gridPlayerOrder.length;
-
-    // If template has a saved playerOrder, remap columns to match current gridPlayerOrder
-    let grid = template.grid;
-    if (Array.isArray(template.playerOrder) && template.playerOrder.length > 0) {
-      const templateOrder = template.playerOrder; // jersey array from when template was saved
-      const currentOrder = gridPlayerOrder.map(p => p.jersey);
-      // Build mapping: templateColIdx -> currentColIdx
-      const colMap = templateOrder.map(tj => currentOrder.indexOf(tj));
-      grid = grid.map(row => {
-        const newRow = new Array(playerCount).fill(false);
-        for (let ti = 0; ti < templateOrder.length; ti++) {
-          const ci = colMap[ti];
-          if (ci >= 0 && ci < playerCount && ti < row.length) {
-            newRow[ci] = row[ti];
-          }
-        }
-        return newRow;
-      });
+    // FROZEN compatibility rules (§6): both dimensions must match — no rescaling,
+    // no padding. The pattern applies POSITIONALLY (column i → grid column i).
+    if (template.playerCount !== playerCount) {
+      showToast(`Template is for ${template.playerCount} players — today has ${playerCount}`); return;
     }
-
-    // Template grid might be for different halfMins — scale if needed
-    if (grid.length !== totalMins) {
-      const scaled = [];
-      for (let m = 0; m < totalMins; m++) {
-        scaled[m] = m < grid.length ? grid[m].slice(0, playerCount) : new Array(playerCount).fill(false);
-      }
-      grid = scaled;
+    if (template.halfMins !== halfMins) {
+      showToast(`Template is for ${template.halfMins}-min halves — this game is ${halfMins}-min`); return;
     }
-    // If player count differs, pad/truncate columns
-    if (grid[0] && grid[0].length !== playerCount) {
-      grid = grid.map(row => {
-        const newRow = new Array(playerCount).fill(false);
-        for (let i = 0; i < Math.min(row.length, playerCount); i++) newRow[i] = row[i];
-        return newRow;
-      });
-    }
-    setEditableGrid(grid);
+    setEditableGrid(template.grid.map(row => row.slice()));
     setShowLoadDialog(false);
-    showToast(`Loaded "${template.name}"`);
+    showToast("Pattern loaded — swap columns to put the right girls in the right slots");
   }
 
   function deleteTemplate(id) {
-    persistTemplates(savedTemplates.filter(t => t.id !== id));
-    showToast("Template deleted");
+    const t = savedTemplates.find(x => String(x.id) === String(id));
+    if (!t) return;
+    // §6: deletion is a sticky tombstone (kept indefinitely; GC deferred to sync phase).
+    persistTemplateChange([{ ...t, deletedAt: nowIso(), rev: (t.rev || 0) + 1, updatedAt: nowIso() }], "Template deleted");
   }
 
   // ── TEMPLATE BACKUP: export / import as JSON file ──────────────────────────
@@ -1082,16 +1478,25 @@ function App() {
   const fileImportRef = useRef(null);
 
   function exportTemplates() {
+    // §6 deferral guard: an export taken in deferred mode would embed the malformed
+    // entry and be un-restorable (all-or-nothing import) — blocked with the rest.
+    if (templatesBlocked()) { showToast("⚠ Backup is off — storage needs attention"); return; }
     if (savedTemplates.length === 0) {
       showToast("No templates to back up");
       return;
     }
+    // Export the FULL stored envelope (tombstones included) so restores honour deletes.
+    let envelope = { schemaVersion: 1, updatedAt: nowIso(), templates: savedTemplates };
+    try {
+      const stored = JSON.parse(localStorage.getItem(TEMPLATES_KEY));
+      if (stored && Array.isArray(stored.templates)) envelope = stored;
+    } catch (e) {}
     const payload = {
       app: "coachk-subplanner",
       kind: "templates",
       schemaVersion: 1,
       exportedAt: new Date().toISOString(),
-      templates: savedTemplates,
+      templates: envelope.templates,
     };
     try {
       const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
@@ -1114,42 +1519,85 @@ function App() {
 
   function importTemplatesFromFile(file) {
     if (!file) return;
+    if (templatesBlocked()) { showToast("⚠ Restore is off — storage needs attention"); return; }
     const reader = new FileReader();
     reader.onload = (e) => {
       try {
-        const text = e.target.result;
-        const parsed = JSON.parse(text);
-        // Accept either the wrapped payload format OR a bare templates array,
-        // so older / hand-edited backups still import cleanly.
-        const incomingRaw = Array.isArray(parsed)
-          ? parsed
+        const parsed = JSON.parse(e.target.result);
+        // Accept the export wrapper, a bare array (legacy backups), or a raw envelope.
+        const incomingRaw = Array.isArray(parsed) ? parsed
           : Array.isArray(parsed?.templates) ? parsed.templates : null;
-        if (!incomingRaw) {
-          showToast("File doesn't look like a templates backup");
-          return;
+        if (!incomingRaw) { showToast("File doesn't look like a templates backup"); return; }
+
+        // §6 ALL-OR-NOTHING: every non-tombstoned entry must validate (grid dimensions
+        // included, after stripping legacy identity fields) or nothing is imported.
+        const entries = incomingRaw.map(stripTemplateEntry);
+        for (const t of entries) {
+          if (t && t.deletedAt) continue; // tombstones pass through to the merge
+          if (!validTemplateEntry(t)) { showToast("File contains damaged template data — nothing imported"); return; }
         }
-        const incoming = sanitizeTemplates(incomingRaw);
-        if (incoming.length === 0) {
-          showToast("No valid templates found in file");
-          return;
+
+        // Full stored set (incl. tombstones) for identity checks.
+        let storedAll = [];
+        try {
+          const st = JSON.parse(localStorage.getItem(TEMPLATES_KEY));
+          if (st && Array.isArray(st.templates)) storedAll = st.templates;
+        } catch (err) {}
+        const byId = new Map(storedAll.map(t => [String(t.id), t]));
+        const activeCores = new Set(storedAll.filter(t => !t.deletedAt).map(t => contentHash(tplCore(t))));
+        const coreEq = (a, b) => contentHash(tplCore(a)) === contentHash(tplCore(b));
+        const ts = nowIso();
+        const changes = [];
+        let added = 0, restored = 0, copies = 0, skipped = 0;
+
+        const restoreRecord = (local, src) => ({ ...local, ...tplCore(src),
+          deletedAt: null, restoredAt: ts, rev: (local.rev || 0) + 1, updatedAt: ts });
+        const freshRecord = (id, src, nameSuffix) => ({ id, name: src.name + (nameSuffix || ""),
+          playerCount: src.playerCount, halfMins: src.halfMins, grid: src.grid,
+          rev: 1, createdAt: ts, updatedAt: ts, deletedAt: null, restoredAt: null });
+
+        for (const inc of entries) {
+          if (inc.deletedAt) continue; // deletion intent flows via export/merge, not via restore-import
+          const local = inc.id !== undefined ? byId.get(String(inc.id)) : undefined;
+          if (local) {
+            if (!local.deletedAt && coreEq(local, inc)) { skipped++; continue; }        // re-import no-op
+            if (local.deletedAt) { changes.push(restoreRecord(local, inc)); restored++; continue; } // intentional import = validated restore
+            // Active + different content → §5.5 derived conflict copy, dedupe first.
+            const derivedId = "copy_" + String(inc.id) + "_" + contentHash(tplCore(inc));
+            const derived = byId.get(derivedId);
+            if (derived) {
+              if (derived.deletedAt) { changes.push(restoreRecord(derived, inc)); restored++; }
+              else skipped++; // derived id exists active → skip by ID, preserving local edits
+              continue;
+            }
+            if (activeCores.has(contentHash(tplCore(inc)))) { skipped++; continue; }
+            changes.push(freshRecord(derivedId, inc, " (imported)")); copies++;
+            continue;
+          }
+          if (inc.id !== undefined) { // unknown id → bring it in as-is (record fields ensured)
+            changes.push({ deletedAt: null, restoredAt: null, createdAt: ts, updatedAt: ts, rev: 1, ...inc });
+            added++;
+            continue;
+          }
+          // No id (legacy) → stable derived identity; same three-branch lifecycle.
+          const lid = "legacy_" + contentHash(tplCore(inc));
+          const lex = byId.get(lid);
+          if (lex) {
+            if (lex.deletedAt) { changes.push(restoreRecord(lex, inc)); restored++; }
+            else skipped++;
+            continue;
+          }
+          if (activeCores.has(contentHash(tplCore(inc)))) { skipped++; continue; }
+          changes.push(freshRecord(lid, inc)); added++;
         }
-        // Merge with existing: dedupe by name+playerCount+attendanceSignature
-        // (same key the save flow uses). Incoming wins on conflict so a fresh
-        // restore overwrites any matching local entry.
-        const incomingKeys = new Set(
-          incoming.map(t => `${t.name}|${t.playerCount}|${t.attendanceSignature || ""}`)
-        );
-        const kept = savedTemplates.filter(t =>
-          !incomingKeys.has(`${t.name}|${t.playerCount}|${t.attendanceSignature || ""}`)
-        );
-        const merged = [...kept, ...incoming];
-        persistTemplates(merged);
-        const replaced = savedTemplates.length - kept.length;
-        const added = incoming.length - replaced;
+
+        if (changes.length === 0) { showToast("Backup already matches — nothing to import"); return; }
         const parts = [];
-        if (added > 0) parts.push(`${added} added`);
-        if (replaced > 0) parts.push(`${replaced} replaced`);
-        showToast(`Restored: ${parts.join(", ") || `${incoming.length} templates`}`);
+        if (added) parts.push(`${added} added`);
+        if (restored) parts.push(`${restored} restored`);
+        if (copies) parts.push(`${copies} imported as copies`);
+        if (skipped) parts.push(`${skipped} already present`);
+        persistTemplateChange(changes, `Restored: ${parts.join(", ")}`);
       } catch (err) {
         showToast("Couldn't read file — is it a valid backup?");
       }
@@ -1159,6 +1607,7 @@ function App() {
   }
 
   function triggerImport() {
+    if (templatesBlocked()) { showToast("⚠ Restore is off — storage needs attention"); return; }
     if (fileImportRef.current) {
       fileImportRef.current.value = ""; // allow re-importing the same file
       fileImportRef.current.click();
@@ -1170,20 +1619,11 @@ function App() {
     setTimeout(() => setTemplateToast(null), 3000);
   }
 
-  // Get templates matching current attendance (player count + exact roster)
-  function currentAttendanceSignature() {
-    return gridPlayerOrder.map(p => p.jersey).sort((a, b) => a - b).join("-");
-  }
+  // D-8: templates are anonymous slot patterns — "matching" means loadable for
+  // today's game: participating-player count AND half length both equal (§6 frozen).
   function getMatchingTemplates() {
     const playerCount = gridPlayerOrder.length;
-    const sig = currentAttendanceSignature();
-    return savedTemplates.filter(t => {
-      if (t.playerCount !== playerCount) return false;
-      // Require attendance signature — legacy templates without one skip auto-matching
-      if (!t.attendanceSignature) return false;
-      if (t.attendanceSignature !== sig) return false;
-      return true;
-    });
+    return savedTemplates.filter(t => t.playerCount === playerCount && t.halfMins === halfMins);
   }
 
   // Live state
@@ -1397,35 +1837,96 @@ function App() {
   // newer save with a fresh v1 default snapshot on the next render.
   const restoreBlockedRef = useRef(false);
   const [saveError, setSaveError] = useState(false); // surfaces silent localStorage failures
+  // W1.f: the game's roster COPY (v2 snapshot field). Fresh sessions use the active
+  // team's roster; hydrated v1/v2 saves adopt the snapshot's own roster. Wave 2 moves
+  // capture to the team-selection event per the frozen contract.
+  const gameRosterSnapshotRef = useRef(ROSTER);
 
   useEffect(() => {
-    try {
-      const raw = typeof localStorage !== "undefined" ? localStorage.getItem(STORAGE_KEY) : null;
-      if (raw) {
-        const s = JSON.parse(raw);
+    // §5.1 quarantine for the game key: preserve the damaged/invalid payload, then
+    // heal (clear) the key so the app starts fresh and can save again. Copy failure
+    // → the untouched key IS the forensic copy: block writes for the session.
+    const quarantineGameKey = (raw, reason) => {
+      const copied = quarantineRaw(STORAGE_KEY, raw);
+      if (copied) {
+        try { localStorage.removeItem(STORAGE_KEY); } catch (e) {}
+        storageNotices.push({ text: "A saved game couldn't be read (" + reason + "). It was preserved for recovery.", action: { label: "Save damaged data to a file", run: () => downloadRawText("saved-game-damaged.txt", raw) } });
+      } else {
+        restoreBlockedRef.current = true;
+        storageNotices.push({ text: "A saved game couldn't be read (" + reason + ") — NOT SAVING games this session to protect it.", action: { label: "Save damaged data to a file", run: () => downloadRawText("saved-game-damaged.txt", raw) } });
+      }
+    };
+    const raw = typeof localStorage !== "undefined" ? (() => { try { return localStorage.getItem(STORAGE_KEY); } catch (e) { return null; } })() : null;
+    restoreattempt: if (raw) {
+      let s;
+      try { s = JSON.parse(raw); } catch (e) { quarantineGameKey(raw, "unreadable"); break restoreattempt; }
+      if (!s || typeof s !== "object") { quarantineGameKey(raw, "unreadable"); break restoreattempt; }
+      try {
 
-        // Schema-version guard: a save from a newer build of the app may have
-        // a shape we don't recognise. Refuse to restore in that case (rather
-        // than partial-restoring into an impossible state). Saves without a
-        // schemaVersion field are treated as the original v1 shape.
-        const SUPPORTED_SCHEMA = 1;
+        // Schema-version guard (W1.f): v2 is current; saves without a schemaVersion
+        // field are the original v1 shape. Newer-than-us → refuse to restore AND
+        // refuse to overwrite (save effect blocked for the session).
+        const SUPPORTED_SCHEMA = 2;
         const sv = typeof s.schemaVersion === "number" ? s.schemaVersion : 1;
         if (sv > SUPPORTED_SCHEMA) {
-          // Block the save effect for the rest of this session so the newer save
-          // is preserved untouched (instead of getting overwritten with default v1 state).
           restoreBlockedRef.current = true;
           setHydrated(true);
           return;
         }
 
-        // Validate critical fields before restoring — corrupted storage can
-        // put the app into impossible states (negative gameSecs, unknown
-        // jersey numbers on court, etc.)
-        const validJerseys = new Set(PLAYERS_DB.map(p => p.jersey));
+        // ── Stage 1: screen-branched structural validation (shared by v1 AND native v2;
+        // spec W1.f rounds 3/13/14). A save's required structures depend on the screen
+        // it was taken from — the app saves on every change from all three screens.
+        // BUILD-TIME SPEC CORRECTION (flagged for audit): the app has FOUR screens —
+        // "start5" (Pick Starting 5) also persists; the frozen spec's branch table
+        // listed three. start5 uses the setup-level validation branch.
+        const scr = s.screen;
+        const fail = (why) => { quarantineGameKey(raw, why); return true; };
+        if (scr !== "setup" && scr !== "start5" && scr !== "plan" && scr !== "game") { fail("unknown screen"); break restoreattempt; }
+        if (!(typeof s.halfMins === "number" && s.halfMins > 0) || !Array.isArray(s.selected) || !Array.isArray(s.starters)) { fail("setup state malformed"); break restoreattempt; }
+        if (s.selected.length > MAX_PARTICIPANTS) { fail("too many participants"); break restoreattempt; }
+        if (scr === "plan" || scr === "game") {
+          if (s.editableGrid !== null && s.editableGrid !== undefined && !(Array.isArray(s.editableGrid) && s.editableGrid.every(row => Array.isArray(row)))) { fail("plan grid malformed"); break restoreattempt; }
+        }
+        if (scr === "game") {
+          if (!s.plan && !s.rotationPlan) { fail("live game missing plan"); break restoreattempt; }
+          if (!(typeof s.gameSecs === "number" && isFinite(s.gameSecs))) { fail("live game clock malformed"); break restoreattempt; }
+          if (!Array.isArray(s.onCourt) || !(s.accumulated && typeof s.accumulated === "object") || !(s.stintStart && typeof s.stintStart === "object")) { fail("live game state malformed"); break restoreattempt; }
+          // D-9: Start Game guarantees 5–10 — a live save outside that range is corruption.
+          if (s.selected.length < 5) { fail("live game participant count impossible"); break restoreattempt; }
+        }
+
+        // ── v1→v2 adapter (in memory): inject the roster copy + game config from the
+        // v1 snapshot's flat legacy fields (code-verified: halfMins/planMode are flat).
+        if (sv < 2) {
+          s.selectedTeamId = SEED_TEAM_ID; // v1 games by definition ran on PLAYERS_DB = the seed team
+          s.teamNameAtGameTime = "Lakeside Lakers";
+          s.gameRosterSnapshot = getActiveTeam().players.filter(p => !p.deletedAt && p.jersey !== null);
+          s.gameConfig = {
+            halfMins: s.halfMins,
+            planMode: (typeof s.planMode === "string" && PLAN_MODES[s.planMode]) ? s.planMode : "balanced",
+            trackingToggles: { ...SETTINGS_DEFAULTS.defaultTrackingToggles },
+          };
+        }
+
+        // ── Stage 2: v2 deep-shape validation.
+        if (!Array.isArray(s.gameRosterSnapshot) || s.gameRosterSnapshot.length === 0 ||
+            !s.gameRosterSnapshot.every(p => p && typeof p.jersey === "number" && typeof p.name === "string")) { fail("roster copy malformed"); break restoreattempt; }
+        if (!s.gameConfig || typeof s.gameConfig.halfMins !== "number" || s.gameConfig.halfMins <= 0 ||
+            typeof s.gameConfig.planMode !== "string" || !s.gameConfig.trackingToggles) { fail("game settings malformed"); break restoreattempt; }
+
+        // Jersey arrays are sanitized against the SNAPSHOT'S OWN roster (never the
+        // saved team, never PLAYERS_DB) — the game runs entirely on its copy.
+        const snapRoster = s.gameRosterSnapshot;
+        gameRosterSnapshotRef.current = snapRoster;
+        const validJerseys = new Set(snapRoster.map(p => p.jersey));
         const sanitizeJerseyArray = (arr) =>
           Array.isArray(arr) ? arr.filter(j => validJerseys.has(j)) : [];
         const sanitizeNumSecs = (v) =>
           typeof v === "number" && v >= 0 && isFinite(v) ? v : 0;
+        // Config is authoritative on v2 (v1 flat fields were mapped into it above).
+        s.halfMins = s.gameConfig.halfMins;
+        s.planMode = s.gameConfig.planMode;
 
         // A saved game is only meaningful if we got past setup
         if (s.plan && s.screen && s.screen !== "setup") setHasSavedGame(true);
@@ -1474,7 +1975,7 @@ function App() {
         }
         if (Array.isArray(s.gridPlayerOrderJerseys)) {
           const order = s.gridPlayerOrderJerseys
-            .map(j => PLAYERS_DB.find(p => p.jersey === j))
+            .map(j => snapRoster.find(p => p.jersey === j))
             .filter(Boolean);
           if (order.length > 0) setGridPlayerOrder(order);
         }
@@ -1494,8 +1995,11 @@ function App() {
         // pendingSub is NOT persisted — always recomputed from current state
         // undoStack is NOT persisted — starts fresh on reload
         // Always start paused — never auto-resume the clock after a refresh
+      } catch (e) {
+        // Structurally valid but hydration still threw: preserve the payload, never crash.
+        quarantineGameKey(raw, "restore error");
       }
-    } catch (e) { /* ignore corrupted storage */ }
+    }
     setHydrated(true); // batched with restore setState calls — save effect won't fire until next render
   }, []);
 
@@ -1505,7 +2009,12 @@ function App() {
     // Save every tick — state is small, reliability beats battery savings.
     try {
       const snapshot = {
-        schemaVersion: 1,
+        schemaVersion: 2,
+        // W1.f v2 fields — the game's own roster copy + per-game config (frozen spec).
+        selectedTeamId: ACTIVE_TEAM.id,
+        teamNameAtGameTime: ACTIVE_TEAM.name,
+        gameRosterSnapshot: gameRosterSnapshotRef.current,
+        gameConfig: { halfMins, planMode, trackingToggles: { ...SETTINGS_DEFAULTS.defaultTrackingToggles } },
         screen, halfMins,
         selected: [...selected], starters: [...starters],
         plan, planMode,
@@ -1637,7 +2146,7 @@ function App() {
     }
   }, [gameSecs, halfMins, running, onCourt, stintStart]);
 
-  const available = useMemo(() => PLAYERS_DB.filter(p => selected.has(p.jersey)), [selected]);
+  const available = useMemo(() => ROSTER.filter(p => selected.has(p.jersey)), [selected]);
   const totalGameSecs = halfMins * 2 * 60;
   // Clock adjustment helper — updates both gameSecs AND the timestamp anchor
   // so the running interval doesn't snap the clock back to its old position.
@@ -1926,53 +2435,11 @@ function App() {
     });
     setGridPlayerOrder(order);
 
-    // Check for saved template matching this exact roster (attendance signature)
-    const sig = order.map(p => p.jersey).sort((a, b) => a - b).join("-");
-    const matching = savedTemplates.filter(t => {
-      if (t.playerCount !== available.length) return false;
-      if (!t.attendanceSignature) return false; // reject legacy templates
-      if (t.attendanceSignature !== sig) return false;
-      return true;
-    });
-    if (matching.length > 0) {
-      // Auto-load the most recent matching template
-      const best = matching[matching.length - 1];
-      const totalMins = halfMins * 2;
-      let grid = best.grid;
-      // If template has playerOrder, remap columns to match current order
-      if (Array.isArray(best.playerOrder) && best.playerOrder.length > 0) {
-        const currentOrder = order.map(p => p.jersey);
-        const colMap = best.playerOrder.map(tj => currentOrder.indexOf(tj));
-        grid = grid.map(row => {
-          const newRow = new Array(available.length).fill(false);
-          for (let ti = 0; ti < best.playerOrder.length; ti++) {
-            const ci = colMap[ti];
-            if (ci >= 0 && ci < available.length && ti < row.length) {
-              newRow[ci] = row[ti];
-            }
-          }
-          return newRow;
-        });
-      }
-      // Scale rows if halfMins differs
-      if (grid.length !== totalMins) {
-        const scaled = [];
-        for (let m = 0; m < totalMins; m++) {
-          scaled[m] = m < grid.length ? grid[m].slice(0, available.length) : new Array(available.length).fill(false);
-        }
-        grid = scaled;
-      }
-      if (grid[0] && grid[0].length !== available.length) {
-        grid = grid.map(row => {
-          const newRow = new Array(available.length).fill(false);
-          for (let i = 0; i < Math.min(row.length, available.length); i++) newRow[i] = row[i];
-          return newRow;
-        });
-      }
-      setEditableGrid(grid);
-      showToast(`Loaded "${best.name}" template`);
-    } else if (rp && rp.segments) {
-      // No template — fall back to algorithm-generated grid
+    // D-8: no roster-signature auto-load — templates carry no roster identity, so the
+    // app never silently applies a pattern. The plan screen always starts from the
+    // algorithm-generated grid; the coach loads a slot pattern explicitly and then
+    // arranges girls into columns (column swap).
+    if (rp && rp.segments) {
       const { grid } = buildEditableGridFromPlan(rp, available);
       setEditableGrid(grid);
     }
@@ -2584,7 +3051,7 @@ function App() {
       if (cur >= 5) return;
       if (cur === 4) {
         // 5th foul — ask BEFORE mutating any state
-        const p = PLAYERS_DB.find(pl => pl.jersey === jersey);
+        const p = ROSTER.find(pl => pl.jersey === jersey);
         const name = p ? `#${p.jersey} ${p.name}` : `#${jersey}`;
         if (window.confirm(`5th foul for ${name}. Foul out this player?`)) {
           pushUndo("5th foul + foul out #" + jersey);
@@ -2997,7 +3464,7 @@ function App() {
     if (!rotationPlan) return; // reactive engine handles its own short-handed check
     if (pendingSub && pendingSub.mandatory) return; // already showing an emergency prompt
 
-    const onCourtPlayers = onCourt.map(j => PLAYERS_DB.find(p => p.jersey === j)).filter(Boolean);
+    const onCourtPlayers = onCourt.map(j => ROSTER.find(p => p.jersey === j)).filter(Boolean);
     const benchAvail = available.filter(p =>
       !onCourt.includes(p.jersey) && !unavailableJerseys.has(p.jersey));
 
@@ -3622,7 +4089,7 @@ function App() {
     return courtTime(jersey) - paceFor(jersey);
   }
 
-  const pObj = (jersey) => PLAYERS_DB.find(p => p.jersey === jersey);
+  const pObj = (jersey) => ROSTER.find(p => p.jersey === jersey);
 
   // ── SCORE HELPERS ──────────────────────────────────────────────────────────
   function addScore(team, pts) {
@@ -3663,6 +4130,7 @@ function App() {
   if (screen === "setup") return (
     <div style={{ minHeight: "100vh", backgroundColor: "#0f172a", padding: "16px", fontFamily: "system-ui, sans-serif" }}>
       <div style={{ maxWidth: 400, margin: "0 auto" }}>
+        <StorageNoticesBanner />
         <div style={{ background: "linear-gradient(135deg,#1e3a8a,#1d4ed8)", borderRadius: 20, padding: "20px 20px 16px", marginBottom: 16, textAlign: "center" }}>
           <div style={{ display: "flex", justifyContent: "center", marginBottom: 10 }}>
             <CoachKLogo size={88} />
@@ -3756,7 +4224,7 @@ function App() {
             <div style={{ color: "#94a3b8", fontSize: 12, fontWeight: 700, letterSpacing: 1 }}>AVAILABLE PLAYERS</div>
             <div style={{ color: "#60a5fa", fontSize: 13, fontWeight: 600 }}>{selected.size} selected</div>
           </div>
-          {PLAYERS_DB.map(p => {
+          {ROSTER.map(p => {
             const isOn = selected.has(p.jersey);
             return (
               <div key={p.jersey} onClick={() => togglePlayer(p.jersey)}
@@ -3792,6 +4260,7 @@ function App() {
   if (screen === "start5") return (
     <div style={{ minHeight: "100vh", backgroundColor: "#0f172a", padding: "16px", fontFamily: "system-ui, sans-serif" }}>
       <div style={{ maxWidth: 400, margin: "0 auto" }}>
+        <StorageNoticesBanner />
         <div style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 16 }}>
           <button onClick={() => setScreen("setup")}
             style={{ background: "#334155", border: "none", color: "#fff", borderRadius: 10, padding: "8px 14px", cursor: "pointer", fontSize: 14 }}>← Back</button>
@@ -3902,6 +4371,7 @@ function App() {
       onPointerUp={() => { gridPainting.current = false; }}
       onPointerLeave={() => { gridPainting.current = false; }}>
       <div style={{ maxWidth: 700, margin: "0 auto" }}>
+        <StorageNoticesBanner />
         {/* Header */}
         <h1 style={{ textAlign: "center", fontSize: "1.3rem", marginBottom: 12, color: "#f8fafc" }}>
           🏀 Rotation Planner
@@ -4018,9 +4488,9 @@ function App() {
               </button>
             </div>
             {/* Show existing templates with same name warning */}
-            {templateNameInput.trim() && (() => { const sig = gridPlayerOrder.map(p => p.jersey).sort((a, b) => a - b).join("-"); return savedTemplates.some(t => t.name === templateNameInput.trim() && t.playerCount === gridPlayerOrder.length && t.attendanceSignature === sig); })() && (
+            {templateNameInput.trim() && savedTemplates.some(t => t.name === templateNameInput.trim() && t.playerCount === gridPlayerOrder.length && t.halfMins === halfMins) && (
               <div style={{ color: "#fbbf24", fontSize: 11, marginTop: 6 }}>
-                ⚠ A template with this name exists for this exact roster — saving will replace it
+                ⚠ A pattern with this name exists for this player count and half length — saving will replace it
               </div>
             )}
           </div>
@@ -4039,7 +4509,7 @@ function App() {
             {/* Matching templates (same player count) */}
             {(() => {
               const matching = getMatchingTemplates();
-              const others = savedTemplates.filter(t => t.playerCount !== gridPlayerOrder.length);
+              const others = savedTemplates.filter(t => !(t.playerCount === gridPlayerOrder.length && t.halfMins === halfMins));
               return (
                 <>
                   {matching.length > 0 && (
@@ -4374,6 +4844,7 @@ function App() {
     <div style={{ minHeight: "100vh", backgroundColor: "#0f172a", padding: "12px", fontFamily: "system-ui, sans-serif" }}
       onClick={() => { if (activeMenu) setActiveMenu(null); if (benchMenu) setBenchMenu(null); }}>
       <div style={{ maxWidth: 400, margin: "0 auto" }}>
+        <StorageNoticesBanner />
 
         {/* HALFTIME OVERLAY */}
         {showHalftime && (
@@ -4404,7 +4875,7 @@ function App() {
                         }
                       }
                       return previewJerseys.map(j => {
-                        const p = available.find(pl => pl.jersey === j) || PLAYERS_DB.find(pl => pl.jersey === j);
+                        const p = available.find(pl => pl.jersey === j) || ROSTER.find(pl => pl.jersey === j);
                         if (!p) return null;
                         return (
                           <div key={j} style={{ background: p.color + "44", border: `1px solid ${p.color}`, borderRadius: 8, padding: "4px 10px", color: "#fff", fontSize: 13, fontWeight: 600 }}>
@@ -4990,7 +5461,7 @@ function App() {
             {(() => {
               const w3 = activeWeakest3;
               if (w3.length < 3) return null;
-              const courtObjs = onCourt.map(j => PLAYERS_DB.find(p => p.jersey === j)).filter(Boolean);
+              const courtObjs = onCourt.map(j => ROSTER.find(p => p.jersey === j)).filter(Boolean);
               const onCount = courtObjs.filter(p => w3.includes(p.jersey)).length;
               const violated = onCount >= 3;
               // If violated, check whether any of the weakest-3 on court is

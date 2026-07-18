@@ -26,15 +26,58 @@ const CASES = [
   },
   {
     id: "SAB-003", plants: "saveTemplate silently drops the new entry",
-    find: "persistTemplates([...existing, entry]);",
-    replace: "persistTemplates(existing);",
+    find: "if (persistTemplateChange([entry], `Saved \"${entry.name}\" (${playerCount} players)`)) {",
+    replace: "if (persistTemplateChange([], `Saved \"${entry.name}\" (${playerCount} players)`)) {",
     mustFail: "S-006",
   },
   {
     id: "SAB-004", plants: "one player vanishes from the setup roster",
-    find: "{PLAYERS_DB.map(p => {",
-    replace: "{PLAYERS_DB.slice(0, 8).map(p => {",
+    find: "{ROSTER.map(p => {",
+    replace: "{ROSTER.slice(0, 8).map(p => {",
     mustFail: "S-002",
+  },
+  // ── Wave 1 cases (one planted bug per new behaviour) ──
+  {
+    id: "SAB-101", plants: "seed migration uses live timestamps (breaks byte-identical determinism)",
+    find: "rev: 1, createdAt: SEED_TS, updatedAt: SEED_TS, deletedAt: null, restoredAt: null,",
+    replace: "rev: 1, createdAt: nowIso(), updatedAt: SEED_TS, deletedAt: null, restoredAt: null,",
+    mustFail: "S-101",
+  },
+  {
+    id: "SAB-102", plants: "v1→v2 adapter drops the legacy game's halfMins (16-min game resumes as 20)",
+    find: "            halfMins: s.halfMins,",
+    replace: "            halfMins: 20,",
+    mustFail: "S-103",
+  },
+  {
+    id: "SAB-103", plants: "template migration keeps the abolished playerOrder/attendanceSignature fields",
+    find: "  const { playerOrder, attendanceSignature, ...rest } = t;\n  return rest;",
+    replace: "  const { playerOrder, attendanceSignature, ...rest } = t;\n  return t;",
+    mustFail: "S-104",
+  },
+  {
+    id: "SAB-104", plants: "quarantine heals WITHOUT preserving the damaged payload first",
+    find: "  const copied = quarantineRaw(key, raw);\n  if (copied) {",
+    replace: "  const copied = true;\n  if (copied) {",
+    mustFail: "S-105",
+  },
+  {
+    id: "SAB-105", plants: "roster silently falls back to the hardcoded seed (ignores stored team edits)",
+    find: "const ACTIVE_TEAM = getActiveTeam();",
+    replace: "const ACTIVE_TEAM = buildSeedEnvelope().teams[0];",
+    mustFail: "S-102",
+  },
+  {
+    id: "SAB-106", plants: "template delete regresses to a splice (no tombstone in storage)",
+    find: "    persistTemplateChange([{ ...t, deletedAt: nowIso(), rev: (t.rev || 0) + 1, updatedAt: nowIso() }], \"Template deleted\");",
+    replace: "    persistTemplateChange([{ ...t, deletedAt: null, rev: (t.rev || 0) + 1, updatedAt: nowIso() }], \"Template deleted\");",
+    mustFail: "S-107",
+  },
+  {
+    id: "SAB-107", plants: "D-9 participant cap removed from hydration validation",
+    find: "        if (s.selected.length > MAX_PARTICIPANTS) { fail(\"too many participants\"); break restoreattempt; }",
+    replace: "        if (false) { fail(\"too many participants\"); break restoreattempt; }",
+    mustFail: "S-108",
   },
 ];
 
