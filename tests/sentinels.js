@@ -544,6 +544,114 @@ const SENTINELS = [
       H.expect(pageErrors.length === 0, "page errors while listing templates: " + pageErrors.join(" | "));
     },
   },
+  // ── W1 audit round-4 sentinels (Codex full-run findings) ──
+  {
+    id: "S-124", name: "Future-schema envelopes appearing MID-SESSION are refused by every write path",
+    run: async ({ page, url }) => {
+      await page.goto(url);
+      await H.driveToPlanScreen(page);
+      const tplCanary = JSON.stringify({ schemaVersion: 99, canary: "TPL-FUTURE", templates: [] });
+      const teamCanary = JSON.stringify({ schemaVersion: 99, canary: "TEAM-FUTURE", teams: [] });
+      await page.evaluate(([a, b]) => {
+        localStorage.setItem("coachk_rotation_templates", a);
+        localStorage.setItem("coachk-subplanner-teams", b);
+      }, [tplCanary, teamCanary]);
+      // Template write path via the real UI:
+      await page.getByText("💾 Save Template").click();
+      await page.getByPlaceholder("e.g. Standard 8-Player").fill("Should Not Persist");
+      await page.getByText("Save", { exact: true }).click();
+      await page.waitForTimeout(400);
+      H.expect((await H.getStorage(page, H.TEMPLATES_KEY)) === tplCanary, "a template save overwrote a newer-version envelope");
+      // Teams write path via internals:
+      const res = await page.evaluate(() => window.__SP_INTERNALS__.writeTeamsEnvelope(window.__SP_INTERNALS__.buildSeedEnvelope()));
+      H.expect(res === false, "writeTeamsEnvelope did not refuse a newer-version envelope");
+      H.expect((await H.getStorage(page, "coachk-subplanner-teams")) === teamCanary, "a teams write overwrote a newer-version envelope");
+    },
+  },
+  {
+    id: "S-125", name: "v2 save with incomplete tracking toggles or missing identity is quarantined",
+    run: async ({ page, url }) => {
+      await page.goto(url);
+      await H.driveToGameScreen(page);
+      await page.evaluate(() => {
+        const s = JSON.parse(localStorage.getItem("coachk-subplanner-v9"));
+        s.gameConfig.trackingToggles = {};
+        localStorage.setItem("coachk-subplanner-v9", JSON.stringify(s));
+      });
+      await page.reload();
+      await H.waitForMount(page);
+      H.expect((await page.getByText(/ON COURT \(/).count()) === 0, "empty tracking toggles hydrated into a live game");
+      // Second case: identity removed.
+      await H.driveToGameScreen(page);
+      await page.evaluate(() => {
+        const s = JSON.parse(localStorage.getItem("coachk-subplanner-v9"));
+        delete s.selectedTeamId; delete s.teamNameAtGameTime;
+        localStorage.setItem("coachk-subplanner-v9", JSON.stringify(s));
+      });
+      await page.reload();
+      await H.waitForMount(page);
+      H.expect((await page.getByText(/ON COURT \(/).count()) === 0, "identity-less v2 save hydrated into a live game");
+    },
+  },
+  {
+    id: "S-126", name: "v2 roster entry without playerId is quarantined",
+    run: async ({ page, url }) => {
+      await page.goto(url);
+      await H.driveToGameScreen(page);
+      await page.evaluate(() => {
+        const s = JSON.parse(localStorage.getItem("coachk-subplanner-v9"));
+        delete s.gameRosterSnapshot[0].playerId;
+        localStorage.setItem("coachk-subplanner-v9", JSON.stringify(s));
+      });
+      await page.reload();
+      await H.waitForMount(page);
+      H.expect((await page.getByText(/ON COURT \(/).count()) === 0, "roster entry without playerId hydrated");
+    },
+  },
+  {
+    id: "S-127", name: "v1 adapter injects the IMMUTABLE seed roster, not today's edited team",
+    run: async ({ page, url }) => {
+      await page.goto(url);
+      await H.waitForMount(page);
+      // Edit the stored team AFTER the (simulated) legacy save era. Jersey 40
+      // (Armelle) is not one of the drive's starters, so the flow still works.
+      await page.evaluate(() => {
+        const env = JSON.parse(localStorage.getItem("coachk-subplanner-teams"));
+        const p = env.teams[0].players.find((x) => x.jersey === 40);
+        p.name = "EDITED-AFTER-LEGACY"; p.rev++; p.updatedAt = new Date().toISOString();
+        localStorage.setItem("coachk-subplanner-teams", JSON.stringify(env));
+      });
+      await page.reload();
+      await H.driveToGameScreen(page);
+      await page.evaluate(() => {
+        const s = JSON.parse(localStorage.getItem("coachk-subplanner-v9"));
+        delete s.gameRosterSnapshot; delete s.gameConfig; delete s.selectedTeamId; delete s.teamNameAtGameTime;
+        s.schemaVersion = 1;
+        localStorage.setItem("coachk-subplanner-v9", JSON.stringify(s));
+      });
+      await page.reload();
+      await page.getByText(/ON COURT \(/).waitFor({ timeout: 20000 });
+      await page.waitForTimeout(1200);
+      const s2 = JSON.parse(await H.getStorage(page, H.STORAGE_KEY));
+      const names = s2.gameRosterSnapshot.map((p) => p.name);
+      H.expect(names.includes("Armelle"), "v1 adapter lost the seed-era roster: " + JSON.stringify(names));
+      H.expect(!names.includes("EDITED-AFTER-LEGACY"), "post-save team edits leaked into a legacy game's roster copy");
+    },
+  },
+  {
+    id: "S-128", name: "Import: a tombstone carrying junk core fields aborts the whole import",
+    run: async ({ page, url }) => {
+      const fs = require("fs"), os = require("os"), path = require("path");
+      await page.goto(url);
+      await H.driveToPlanScreen(page);
+      const file = path.join(os.tmpdir(), "sp-badtomb-backup.json");
+      fs.writeFileSync(file, JSON.stringify({ schemaVersion: 1, templates: [{ id: "bad-tomb", name: "Bad Tomb", deletedAt: "2026-01-01T00:00:00.000Z", grid: "bad-grid" }] }));
+      const before = await H.getStorage(page, H.TEMPLATES_KEY);
+      await page.locator('input[type="file"]').setInputFiles(file);
+      await page.getByText(/damaged template data — nothing imported/i).first().waitFor({ timeout: 5000 });
+      H.expect((await H.getStorage(page, H.TEMPLATES_KEY)) === before, "junk tombstone import still changed storage");
+    },
+  },
 ];
 
 async function main() {

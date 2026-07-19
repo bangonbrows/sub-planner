@@ -238,6 +238,16 @@ function writeTeamsEnvelope(candidate) {
   for (let attempt = 0; attempt < 3; attempt++) {
     let stored = null;
     try { const raw = safeGet(TEAMS_KEY); stored = raw ? JSON.parse(raw) : null; } catch (e) { stored = null; }
+    // §5.2 applies at EVERY write, not only startup (Codex W1-R4: a future-schema
+    // envelope appearing mid-session was merged over and downgraded to v1).
+    if (stored && ((typeof stored.schemaVersion === "number" && stored.schemaVersion > 1) ||
+        (Array.isArray(stored.teams) && stored.teams.some((t) => t && typeof t.schemaVersion === "number" && t.schemaVersion > 1)))) {
+      if (!storageBlocks[TEAMS_KEY]) {
+        storageBlocks[TEAMS_KEY] = "future-schema";
+        storageNotices.push({ text: "Team data was saved by a newer app version — team saving is off to protect it." });
+      }
+      return false;
+    }
     if (stored && !validTeamsEnvelope(stored)) stored = null; // corrupt handled by migrateTeams
     let merged = mergeTeamsEnvelopes(JSON.parse(JSON.stringify(candidate)), stored);
     merged = advanceAggregates(merged, stored);
@@ -298,6 +308,15 @@ function writeTemplatesEnvelope(candidate) {
   for (let attempt = 0; attempt < 3; attempt++) {
     let stored = null;
     try { const r = safeGet(TPL_KEY); stored = r ? JSON.parse(r) : null; } catch (e) { stored = null; }
+    // §5.2 at every write (Codex W1-R4): a newer-version envelope must be refused,
+    // never merged over.
+    if (stored && !Array.isArray(stored) && typeof stored.schemaVersion === "number" && stored.schemaVersion > 1) {
+      if (!storageBlocks[TPL_KEY]) {
+        storageBlocks[TPL_KEY] = "future-schema";
+        storageNotices.push({ text: "Templates were saved by a newer app version — template saving is off to protect them." });
+      }
+      return false;
+    }
     if (stored && (Array.isArray(stored) || !Array.isArray(stored.templates))) stored = null; // raw arrays are migration/deferral territory, never merged here
     const merged = mergeTemplatesEnvelopes(JSON.parse(JSON.stringify(candidate)), stored);
     const out = JSON.stringify(merged);
@@ -1613,7 +1632,13 @@ function App() {
         for (const t of entries) {
           if (!t || typeof t !== "object") { showToast("File contains damaged template data — nothing imported"); return; }
           if (t.deletedAt) {
+            // Tombstones validate FULLY too (Codex W1-R4: a tombstone carrying
+            // grid:"bad-grid" persisted junk into storage). A tombstoned entry is
+            // either a minimal deletion record (id + deletedAt, NO core payload) or
+            // a complete record whose core validates.
             if (!(typeof t.deletedAt === "string" && t.id !== undefined)) { showToast("File contains damaged template data — nothing imported"); return; }
+            const hasCore = t.grid !== undefined || t.playerCount !== undefined || t.halfMins !== undefined;
+            if (hasCore && !validTemplateEntry({ ...t, deletedAt: null })) { showToast("File contains damaged template data — nothing imported"); return; }
             continue;
           }
           if (!validTemplateEntry(t)) { showToast("File contains damaged template data — nothing imported"); return; }
@@ -2011,7 +2036,10 @@ function App() {
         if (sv < 2) {
           s.selectedTeamId = SEED_TEAM_ID; // v1 games by definition ran on PLAYERS_DB = the seed team
           s.teamNameAtGameTime = "Lakeside Lakers";
-          s.gameRosterSnapshot = getActiveTeam().players.filter(p => !p.deletedAt && p.jersey !== null);
+          // The IMMUTABLE seed copy, not today's possibly-edited stored team — the v1
+          // game ran against PLAYERS_DB as it was, and the spec mandates exactly that
+          // roster (Codex W1-R4: post-save team edits were leaking into legacy games).
+          s.gameRosterSnapshot = buildSeedEnvelope().teams[0].players;
           s.gameConfig = {
             halfMins: s.halfMins,
             planMode: (typeof s.planMode === "string" && PLAN_MODES[s.planMode]) ? s.planMode : "balanced",
@@ -2019,11 +2047,14 @@ function App() {
           };
         }
 
-        // ── Stage 2: v2 deep-shape validation.
+        // ── Stage 2: v2 deep-shape validation (Codex W1-R4: identity, playerId, and
+        // toggle COMPLETENESS were unchecked — an empty toggles object hydrated fine).
         if (!Array.isArray(s.gameRosterSnapshot) || s.gameRosterSnapshot.length === 0 ||
-            !s.gameRosterSnapshot.every(p => p && typeof p.jersey === "number" && typeof p.name === "string")) { fail("roster copy malformed"); break restoreattempt; }
+            !s.gameRosterSnapshot.every(p => p && typeof p.jersey === "number" && typeof p.name === "string" && typeof p.playerId === "string" && p.playerId)) { fail("roster copy malformed"); break restoreattempt; }
+        if (!(typeof s.selectedTeamId === "string" && s.selectedTeamId && typeof s.teamNameAtGameTime === "string" && s.teamNameAtGameTime)) { fail("game team identity malformed"); break restoreattempt; }
         if (!s.gameConfig || typeof s.gameConfig.halfMins !== "number" || s.gameConfig.halfMins <= 0 ||
-            typeof s.gameConfig.planMode !== "string" || !s.gameConfig.trackingToggles) { fail("game settings malformed"); break restoreattempt; }
+            typeof s.gameConfig.planMode !== "string" || !s.gameConfig.trackingToggles ||
+            !["individualFouls", "teamFouls", "rebounds", "points", "gameNotes"].every(k => typeof s.gameConfig.trackingToggles[k] === "boolean")) { fail("game settings malformed"); break restoreattempt; }
 
         // Jersey arrays are sanitized against the SNAPSHOT'S OWN roster (never the
         // saved team, never PLAYERS_DB) — the game runs entirely on its copy.

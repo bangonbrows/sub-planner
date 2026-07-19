@@ -149,6 +149,36 @@ const CASES = [
     replace: "        : (parsed && Array.isArray(parsed.templates)) ? parsed.templates : [];",
     mustFail: "S-123",
   },
+  {
+    id: "MUT-119", mutates: "teams write-path future-schema guard removed (mid-session downgrade returns)",
+    find: "    if (stored && ((typeof stored.schemaVersion === \"number\" && stored.schemaVersion > 1) ||\n        (Array.isArray(stored.teams) && stored.teams.some((t) => t && typeof t.schemaVersion === \"number\" && t.schemaVersion > 1)))) {",
+    replace: "    if (false) {",
+    mustFail: "S-124",
+  },
+  {
+    id: "MUT-120", mutates: "tracking-toggle completeness check removed from v2 validation",
+    find: "            ![\"individualFouls\", \"teamFouls\", \"rebounds\", \"points\", \"gameNotes\"].every(k => typeof s.gameConfig.trackingToggles[k] === \"boolean\")) { fail(\"game settings malformed\"); break restoreattempt; }",
+    replace: "            false) { fail(\"game settings malformed\"); break restoreattempt; }",
+    mustFail: "S-125",
+  },
+  {
+    id: "MUT-121", mutates: "v1 adapter regresses to today's edited team roster",
+    find: "          s.gameRosterSnapshot = buildSeedEnvelope().teams[0].players;",
+    replace: "          s.gameRosterSnapshot = getActiveTeam().players.filter(p => !p.deletedAt && p.jersey !== null);",
+    mustFail: "S-127",
+  },
+  {
+    id: "MUT-122", mutates: "tombstone core-field validation removed from import",
+    find: "            const hasCore = t.grid !== undefined || t.playerCount !== undefined || t.halfMins !== undefined;\n            if (hasCore && !validTemplateEntry({ ...t, deletedAt: null })) { showToast(\"File contains damaged template data — nothing imported\"); return; }",
+    replace: "            ;",
+    mustFail: "S-128",
+  },
+  {
+    id: "MUT-123", mutates: "roster playerId requirement removed from v2 validation",
+    find: "            !s.gameRosterSnapshot.every(p => p && typeof p.jersey === \"number\" && typeof p.name === \"string\" && typeof p.playerId === \"string\" && p.playerId)) { fail(\"roster copy malformed\"); break restoreattempt; }",
+    replace: "            !s.gameRosterSnapshot.every(p => p && typeof p.jersey === \"number\" && typeof p.name === \"string\")) { fail(\"roster copy malformed\"); break restoreattempt; }",
+    mustFail: "S-126",
+  },
 ];
 
 function makeMutatedCopy(caseDef) {
