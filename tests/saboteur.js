@@ -86,10 +86,56 @@ const CASES = [
     mustFail: "S-111",
   },
   {
-    id: "SAB-109", plants: "plan-screen player-order validation removed",
-    find: "          if (!(Array.isArray(s.gridPlayerOrderJerseys) && s.gridPlayerOrderJerseys.length > 0 && s.gridPlayerOrderJerseys.every(j => typeof j === \"number\"))) { fail(\"plan player order malformed\"); break restoreattempt; }",
-    replace: "          if (false) { fail(\"plan player order malformed\"); break restoreattempt; }",
-    mustFail: "S-112",
+    // NOTE: removing the STAGE-1 order check alone is an equivalent mutant — the
+    // post-sanitization layer still quarantines the same states (defence in depth,
+    // verified 19 Jul). This case therefore targets the sanitized-check layer,
+    // whose removal IS observable (S-117).
+    id: "SAB-109", plants: "post-sanitization order/grid mismatch check removed",
+    find: "          if (sanOrder.length !== s.gridPlayerOrderJerseys.length || sanOrder.length !== gridCols) { fail(\"plan player order does not match its grid\"); break restoreattempt; }",
+    replace: "          if (false) { fail(\"plan player order does not match its grid\"); break restoreattempt; }",
+    mustFail: "S-117",
+  },
+  {
+    id: "SAB-110", plants: "future-version game save blocks silently again (no banner)",
+    find: "          storageNotices.push({ text: \"A game saved by a NEWER app version is stored here. NOT SAVING games this session to protect it — update the app or discard from the newer version.\" });",
+    replace: "          ;",
+    mustFail: "S-113",
+  },
+  {
+    id: "SAB-111", plants: "future per-Team schema detection removed (reset-to-seed returns)",
+    find: "  const hasFutureTeam = parsed && Array.isArray(parsed.teams) &&\n    parsed.teams.some((t) => t && typeof t.schemaVersion === \"number\" && t.schemaVersion > 1);",
+    replace: "  const hasFutureTeam = false && parsed && Array.isArray(parsed.teams) &&\n    parsed.teams.some((t) => t && typeof t.schemaVersion === \"number\" && t.schemaVersion > 1);",
+    mustFail: "S-114",
+  },
+  {
+    id: "SAB-112", plants: "settings/history deep validation dropped (object-ness accepted again)",
+    find: "  if (!parsed || typeof parsed !== \"object\" || (validator && !validator(parsed))) {",
+    replace: "  if (!parsed || typeof parsed !== \"object\") {",
+    mustFail: "S-115",
+  },
+  {
+    id: "SAB-113", plants: "post-sanitization participant check removed",
+    find: "        if (scr === \"game\" && sanSelected.length < 5) { fail(\"live game participant count impossible after sanitization\"); break restoreattempt; }",
+    replace: "        if (false) { fail(\"live game participant count impossible after sanitization\"); break restoreattempt; }",
+    mustFail: "S-116",
+  },
+  {
+    id: "SAB-114", plants: "v2 identity re-stamped by the current team on every save",
+    find: "        selectedTeamId: gameIdentityRef.current.selectedTeamId,\n        teamNameAtGameTime: gameIdentityRef.current.teamNameAtGameTime,",
+    replace: "        selectedTeamId: ACTIVE_TEAM.id,\n        teamNameAtGameTime: ACTIVE_TEAM.name,",
+    mustFail: "S-118",
+  },
+  {
+    id: "SAB-115", plants: "legacy same-id conflict copy dropped from the merge",
+    find: "      if (!byId.has(copyId)) byId.set(copyId, { ...loser, id: copyId });",
+    replace: "      ;",
+    mustFail: "S-119",
+  },
+  {
+    id: "SAB-116", plants: "import version gate removed (newer backups import again)",
+    find: "        if (parsed && !Array.isArray(parsed) && typeof parsed.schemaVersion === \"number\" && parsed.schemaVersion > 1) {\n          showToast(\"Backup is from a newer app version — nothing imported\"); return;\n        }",
+    replace: "        if (false) {\n          showToast(\"Backup is from a newer app version — nothing imported\"); return;\n        }",
+    mustFail: "S-121",
   },
 ];
 

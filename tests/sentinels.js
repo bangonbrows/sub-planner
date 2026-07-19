@@ -328,6 +328,181 @@ const SENTINELS = [
       H.expect(hasQuarantine, "plan save with missing player order was not quarantined");
     },
   },
+  // ── W1 audit round-2 sentinels (Codex findings) ──
+  {
+    id: "S-113", name: "Future-version game save blocks saving VISIBLY (banner, not silence)",
+    run: async ({ page, url }) => {
+      await page.goto(url);
+      await H.waitForMount(page);
+      const canary = JSON.stringify({ schemaVersion: 99, canary: "KEEP" });
+      await H.setStorage(page, H.STORAGE_KEY, canary);
+      await page.reload();
+      await H.waitForMount(page);
+      H.expect(await page.getByText(/NEWER app version is stored here/i).first().isVisible(), "no banner — coach could play an unsaved game without warning");
+      H.expect((await H.getStorage(page, H.STORAGE_KEY)) === canary, "future save altered");
+    },
+  },
+  {
+    id: "S-114", name: "Future per-Team schema is REFUSED (blocked), never reset to seed",
+    run: async ({ page, url }) => {
+      await page.goto(url);
+      await H.waitForMount(page);
+      const raw = await page.evaluate(() => {
+        const env = JSON.parse(localStorage.getItem("coachk-subplanner-teams"));
+        env.teams[0].schemaVersion = 2; env.teams[0].name = "FUTURE TEAM";
+        const out = JSON.stringify(env);
+        localStorage.setItem("coachk-subplanner-teams", out);
+        return out;
+      });
+      await page.reload();
+      await H.waitForMount(page);
+      await page.waitForTimeout(600);
+      H.expect((await H.getStorage(page, "coachk-subplanner-teams")) === raw, "future-schema team record was overwritten/reset");
+      H.expect(await page.getByText(/newer app version — team saving is off/i).first().isVisible(), "refusal banner missing");
+      const q = await page.evaluate(() => {
+        for (let i = 0; i < localStorage.length; i++) if (localStorage.key(i).startsWith("coachk-subplanner-teams-quarantine-")) return true;
+        return false;
+      });
+      H.expect(!q, "future-schema record wrongly quarantined as corruption");
+    },
+  },
+  {
+    id: "S-115", name: "Malformed settings/history envelopes are quarantined + healed, not accepted",
+    run: async ({ page, url }) => {
+      await page.goto(url);
+      await H.waitForMount(page);
+      await page.evaluate(() => {
+        localStorage.setItem("coachk-subplanner-settings", JSON.stringify({ schemaVersion: 1 }));
+        localStorage.setItem("coachk-subplanner-history", JSON.stringify({ schemaVersion: 1, games: "not-an-array" }));
+      });
+      await page.reload();
+      await H.waitForMount(page);
+      const st = await page.evaluate(() => ({
+        settings: JSON.parse(localStorage.getItem("coachk-subplanner-settings")),
+        history: JSON.parse(localStorage.getItem("coachk-subplanner-history")),
+      }));
+      H.expect(typeof st.settings.defaultHalfMins === "number", "empty settings shell was accepted as valid");
+      H.expect(Array.isArray(st.history.games), "history with non-array games was accepted as valid");
+    },
+  },
+  {
+    id: "S-116", name: "Live save whose participants shrink below 5 after sanitization is quarantined",
+    run: async ({ page, url }) => {
+      await page.goto(url);
+      await H.driveToGameScreen(page);
+      await page.evaluate(() => {
+        const s = JSON.parse(localStorage.getItem("coachk-subplanner-v9"));
+        s.selected = [4, 8, 10, 14, 999]; // 5 raw, 4 after unknown-jersey filtering
+        localStorage.setItem("coachk-subplanner-v9", JSON.stringify(s));
+      });
+      await page.reload();
+      await H.waitForMount(page);
+      H.expect((await page.getByText(/ON COURT \(/).count()) === 0, "impossible 4-participant live game hydrated");
+    },
+  },
+  {
+    id: "S-117", name: "Plan save whose order mismatches its grid after sanitization is quarantined",
+    run: async ({ page, url }) => {
+      await page.goto(url);
+      await H.driveToPlanScreen(page);
+      await page.waitForTimeout(800);
+      await page.evaluate(() => {
+        const s = JSON.parse(localStorage.getItem("coachk-subplanner-v9"));
+        s.gridPlayerOrderJerseys = [4, 999]; // sanitizes to [4] against a 9-column grid
+        localStorage.setItem("coachk-subplanner-v9", JSON.stringify(s));
+      });
+      await page.reload();
+      await H.waitForMount(page);
+      const hasQuarantine = await page.evaluate(() => {
+        for (let i = 0; i < localStorage.length; i++) if (localStorage.key(i).startsWith("coachk-subplanner-v9-quarantine-")) return true;
+        return false;
+      });
+      H.expect(hasQuarantine, "grid/order mismatch survived sanitization checks");
+    },
+  },
+  {
+    id: "S-118", name: "Native-v2 snapshot identity and tracking toggles survive a re-save",
+    run: async ({ page, url }) => {
+      await page.goto(url);
+      await H.driveToGameScreen(page);
+      await page.evaluate(() => {
+        const s = JSON.parse(localStorage.getItem("coachk-subplanner-v9"));
+        s.selectedTeamId = "team_other"; s.teamNameAtGameTime = "Other Team";
+        s.gameConfig.trackingToggles = { individualFouls: false, teamFouls: true, rebounds: true, points: true, gameNotes: true };
+        localStorage.setItem("coachk-subplanner-v9", JSON.stringify(s));
+      });
+      await page.reload();
+      await page.getByText(/ON COURT \(/).waitFor({ timeout: 20000 });
+      await page.waitForTimeout(1200);
+      const s2 = JSON.parse(await H.getStorage(page, H.STORAGE_KEY));
+      H.expect(s2.selectedTeamId === "team_other" && s2.teamNameAtGameTime === "Other Team", "snapshot identity re-stamped by the current team");
+      H.expect(s2.gameConfig.trackingToggles.teamFouls === true && s2.gameConfig.trackingToggles.individualFouls === false, "tracking toggles reset to defaults on re-save");
+    },
+  },
+  {
+    id: "S-119", name: "Two differing legacy templates sharing an id both survive the merge (conflict copy)",
+    run: async ({ page, url }) => {
+      await page.goto(url);
+      await H.waitForMount(page);
+      const result = await page.evaluate(() => {
+        const grid = (v) => Array.from({ length: 40 }, () => Array.from({ length: 9 }, () => v));
+        const A = { id: "same", name: "Legacy A", playerCount: 9, halfMins: 20, grid: grid(false) };
+        const B = { id: "same", name: "Legacy B", playerCount: 9, halfMins: 20, grid: grid(true) };
+        localStorage.setItem("coachk_rotation_templates", JSON.stringify({ schemaVersion: 1, updatedAt: "2026-01-01T00:00:00.000Z", templates: [A] }));
+        window.__SP_INTERNALS__.writeTemplatesEnvelope({ schemaVersion: 1, updatedAt: "2026-01-01T00:00:00.000Z", templates: [B] });
+        return JSON.parse(localStorage.getItem("coachk_rotation_templates")).templates.map((t) => t.name).sort();
+      });
+      H.expect(result.length === 2 && result.includes("Legacy A") && result.includes("Legacy B"), "a legacy same-id conflict lost a record: " + JSON.stringify(result));
+    },
+  },
+  {
+    id: "S-120", name: "Deferred migration: download completes the upgrade and unlocks templates",
+    run: async ({ page, url }) => {
+      // Force the pre-migration stash write to fail so the deferral path engages.
+      await page.addInitScript(() => {
+        const orig = Storage.prototype.setItem;
+        Storage.prototype.setItem = function (k, v) {
+          if (k === "coachk_rotation_templates-premigration") throw new Error("simulated quota");
+          return orig.call(this, k, v);
+        };
+        const good = { id: 1, name: "Healthy", playerCount: 9, halfMins: 20, grid: Array.from({ length: 40 }, () => Array.from({ length: 9 }, () => false)) };
+        const bad = { id: 2, name: "Broken", playerCount: 9, halfMins: 20, grid: [[true]] };
+        orig.call(localStorage, "coachk_rotation_templates", JSON.stringify([good, bad]));
+      });
+      await page.goto(url);
+      await H.waitForMount(page);
+      await page.getByText(/NOT SAVING templates/i).first().waitFor({ timeout: 5000 });
+      const dl = page.waitForEvent("download");
+      await page.getByText("Save original template data").first().click();
+      await dl;
+      await page.waitForTimeout(500);
+      const env = await page.evaluate(() => JSON.parse(localStorage.getItem("coachk_rotation_templates")));
+      H.expect(env && Array.isArray(env.templates), "migration did not complete after download");
+      H.expect(env.templates.some((t) => t.name === "Healthy"), "healthy template lost on deferred completion");
+      H.expect(await page.getByText(/Templates upgraded/i).first().isVisible(), "banner did not resolve after completion");
+      const blocked = await page.evaluate(() => !!window.__SP_INTERNALS__.storageBlocks["coachk_rotation_templates"]);
+      H.expect(!blocked, "template key still write-blocked after preservation + migration");
+    },
+  },
+  {
+    id: "S-121", name: "Import refuses newer-version backups and files with any damaged entry",
+    run: async ({ page, url }) => {
+      const fs = require("fs"), os = require("os"), path = require("path");
+      await page.goto(url);
+      await H.driveToPlanScreen(page);
+      const grid = Array.from({ length: 40 }, () => Array.from({ length: 9 }, () => false));
+      const futureFile = path.join(os.tmpdir(), "sp-future-backup.json");
+      fs.writeFileSync(futureFile, JSON.stringify({ app: "coachk-subplanner", kind: "templates", schemaVersion: 99, templates: [{ id: "x", name: "Future", playerCount: 9, halfMins: 20, grid }] }));
+      const brokenFile = path.join(os.tmpdir(), "sp-broken-backup.json");
+      fs.writeFileSync(brokenFile, JSON.stringify({ templates: [{ id: "ok", name: "Fine", playerCount: 9, halfMins: 20, grid }, { id: "t", deletedAt: 12345 }] }));
+      const before = await H.getStorage(page, H.TEMPLATES_KEY);
+      for (const [file, msg] of [[futureFile, /newer app version — nothing imported/i], [brokenFile, /damaged template data — nothing imported/i]]) {
+        await page.locator('input[type="file"]').setInputFiles(file);
+        await page.getByText(msg).first().waitFor({ timeout: 5000 });
+        H.expect((await H.getStorage(page, H.TEMPLATES_KEY)) === before, "a rejected import still changed storage");
+      }
+    },
+  },
 ];
 
 async function main() {

@@ -276,7 +276,20 @@ function mergeTemplatesEnvelopes(mine, theirs) {
   for (const t of base) byId.set(String(t.id), t);
   for (const t of mine.templates) {
     const o = byId.get(String(t.id));
-    byId.set(String(t.id), o ? mergeTombstone(tplFresh(o, t), o, t) : t);
+    if (!o) { byId.set(String(t.id), t); continue; }
+    // §5.5 no-freshness conflict (two DIFFERING legacy records sharing an id, neither
+    // carrying rev/updatedAt): deterministic winner keeps the id; the loser is
+    // PRESERVED as its derived copy — never silently dropped (Codex W1-R1).
+    const oFresh = (o.rev || 0) > 0 || o.updatedAt, tFresh = (t.rev || 0) > 0 || t.updatedAt;
+    if (!oFresh && !tFresh && contentHash(tplCore(o)) !== contentHash(tplCore(t))) {
+      const winner = JSON.stringify(o) >= JSON.stringify(t) ? o : t;
+      const loser = winner === o ? t : o;
+      byId.set(String(winner.id), winner);
+      const copyId = "copy_" + String(loser.id) + "_" + contentHash(tplCore(loser));
+      if (!byId.has(copyId)) byId.set(copyId, { ...loser, id: copyId });
+      continue;
+    }
+    byId.set(String(t.id), mergeTombstone(tplFresh(o, t), o, t));
   }
   return { schemaVersion: 1, updatedAt: maxIso(mine.updatedAt, theirs && theirs.updatedAt) || nowIso(), templates: canonTemplates([...byId.values()]) };
 }
@@ -308,6 +321,37 @@ function stripTemplateEntry(t) {
   return rest;
 }
 let templatesDeferredRaw = null; // non-null => deferred READ-ONLY mode (§6 round-15/16)
+
+// §6 order: preservation (verified stash OR user download) → migration completes →
+// mutations re-enable. Called after a successful "Save original template data"
+// download in deferred mode (Codex W1-R1: download previously never completed
+// migration, leaving templates locked forever).
+function completeDeferredTemplateMigration() {
+  if (templatesDeferredRaw === null) return false;
+  let parsed; try { parsed = JSON.parse(templatesDeferredRaw); } catch (e) { parsed = null; }
+  const arr = Array.isArray(parsed) ? parsed : [];
+  const healthy = arr.filter(validTemplateEntry);
+  delete storageBlocks[TPL_KEY];
+  const ok = safeSet(TPL_KEY, JSON.stringify({ schemaVersion: 1, updatedAt: nowIso(), templates: canonTemplates(healthy.map(stripTemplateEntry)) }));
+  if (!ok) { storageBlocks[TPL_KEY] = "migration-deferred"; return false; }
+  templatesDeferredRaw = null;
+  try { window.dispatchEvent(new Event("sp-templates-migrated")); } catch (e) {}
+  return true;
+}
+function makeDeferredTemplatesNotice(raw) {
+  const notice = { text: "NOT SAVING templates — storage needs attention before the app can safely upgrade them.", action: null };
+  notice.action = {
+    label: "Save original template data",
+    run: () => {
+      downloadRawText("templates-original.txt", raw);
+      if (completeDeferredTemplateMigration()) {
+        notice.text = "Templates upgraded — the original data was saved to your file.";
+        notice.action = null;
+      }
+    },
+  };
+  return notice;
+}
 
 function migrateTemplates() {
   const raw = safeGet(TPL_KEY);
@@ -348,7 +392,7 @@ function migrateTemplates() {
       // DEFER: read-only legacy mode for the session; raw stays untouched.
       templatesDeferredRaw = raw;
       storageBlocks[TPL_KEY] = "migration-deferred";
-      storageNotices.push({ text: "NOT SAVING templates — storage needs attention before the app can safely upgrade them.", action: { label: "Save original template data", run: () => downloadRawText("templates-original.txt", raw) } });
+      storageNotices.push(makeDeferredTemplatesNotice(raw));
       return;
     }
   }
@@ -360,7 +404,7 @@ function migrateTemplates() {
   } else {
     templatesDeferredRaw = raw;
     storageBlocks[TPL_KEY] = "migration-deferred";
-    storageNotices.push({ text: "NOT SAVING templates — storage needs attention before the app can safely upgrade them.", action: { label: "Save original template data", run: () => downloadRawText("templates-original.txt", raw) } });
+    storageNotices.push(makeDeferredTemplatesNotice(raw));
   }
 }
 
@@ -370,7 +414,11 @@ function migrateTeams() {
   if (raw === null) { writeTeamsEnvelope(buildSeedEnvelope()); return; }
   let parsed;
   try { parsed = JSON.parse(raw); } catch (e) { parsed = null; }
-  if (parsed && typeof parsed.schemaVersion === "number" && parsed.schemaVersion > 1) {
+  // §5.2 future-schema refusal — envelope OR any per-Team record (Codex W1-R1: a
+  // newer Team record was being misclassified as corruption and reset to seed).
+  const hasFutureTeam = parsed && Array.isArray(parsed.teams) &&
+    parsed.teams.some((t) => t && typeof t.schemaVersion === "number" && t.schemaVersion > 1);
+  if ((parsed && typeof parsed.schemaVersion === "number" && parsed.schemaVersion > 1) || hasFutureTeam) {
     storageBlocks[TEAMS_KEY] = "future-schema";
     storageNotices.push({ text: "Team data was saved by a newer app version — team saving is off to protect it." });
     return;
@@ -386,7 +434,7 @@ const SETTINGS_DEFAULTS = {
   playerStatusTags: false, whatsAppFormatting: false, reportStyle: "coach",
   defaultTrackingToggles: { individualFouls: true, teamFouls: false, rebounds: false, points: false, gameNotes: false },
 };
-function migrateSimpleKey(key, defaults, label) {
+function migrateSimpleKey(key, defaults, label, validator) {
   const raw = safeGet(key);
   if (raw === null) { safeSet(key, JSON.stringify(defaults)); return; }
   let parsed;
@@ -394,15 +442,20 @@ function migrateSimpleKey(key, defaults, label) {
   if (parsed && typeof parsed.schemaVersion === "number" && parsed.schemaVersion > 1) {
     storageBlocks[key] = "future-schema"; return;
   }
-  if (!parsed || typeof parsed !== "object") {
+  // Deep-shape validation, not mere object-ness (Codex W1-R1: {schemaVersion:1}
+  // with every field missing was being accepted as valid settings).
+  if (!parsed || typeof parsed !== "object" || (validator && !validator(parsed))) {
     quarantineAndHeal(key, raw, JSON.stringify(defaults), label + " data was damaged.");
   }
 }
 
 // Run all migrations before the app renders (localStorage is synchronous).
 migrateTeams();
-migrateSimpleKey(SETTINGS_KEY, SETTINGS_DEFAULTS, "Settings");
-migrateSimpleKey(HISTORY_KEY, { schemaVersion: 1, updatedAt: SEED_TS, games: [] }, "Game history");
+migrateSimpleKey(SETTINGS_KEY, SETTINGS_DEFAULTS, "Settings",
+  (s) => s.schemaVersion === 1 && typeof s.defaultHalfMins === "number" && s.defaultHalfMins > 0 &&
+    typeof s.defaultPlanMode === "string" && s.defaultTrackingToggles && typeof s.defaultTrackingToggles === "object");
+migrateSimpleKey(HISTORY_KEY, { schemaVersion: 1, updatedAt: SEED_TS, games: [] }, "Game history",
+  (h) => h.schemaVersion === 1 && Array.isArray(h.games));
 migrateTemplates();
 
 // ── Active roster (W1.d): the app reads THIS, never PLAYERS_DB ──────────────
@@ -427,6 +480,9 @@ const ROSTER = ACTIVE_TEAM.players
 // array is populated during migration/restore (before/at first render) — static
 // content for the session, so no state subscription is needed.
 function StorageNoticesBanner() {
+  // Actions may resolve a notice (e.g. deferred-migration download completes the
+  // upgrade) — the tick re-renders the banner to reflect the updated notice list.
+  const [, setTick] = useState(0);
   if (storageNotices.length === 0) return null;
   return (
     <div style={{ background: "#7f1d1d", border: "1px solid #ef4444", borderRadius: 12, padding: 12, marginBottom: 12 }}>
@@ -434,7 +490,7 @@ function StorageNoticesBanner() {
         <div key={i} style={{ marginBottom: i < storageNotices.length - 1 ? 8 : 0 }}>
           <div style={{ color: "#fecaca", fontSize: 12, fontWeight: 700 }}>⚠ {n.text}</div>
           {n.action && (
-            <button onClick={n.action.run}
+            <button onClick={() => { n.action.run(); setTick(t => t + 1); }}
               style={{ marginTop: 6, padding: "6px 10px", borderRadius: 8, border: "1px solid #ef4444", background: "#450a0a", color: "#fecaca", cursor: "pointer", fontSize: 12, fontWeight: 700 }}>
               {n.action.label}
             </button>
@@ -1420,6 +1476,14 @@ function App() {
 
   const templatesBlocked = () => !!storageBlocks[TEMPLATES_KEY];
 
+  // Deferred migration completing (via the banner's download action) unlocks
+  // templates mid-session — refresh the visible list when it fires.
+  useEffect(() => {
+    const onMigrated = () => setSavedTemplates(readActiveTemplates());
+    window.addEventListener("sp-templates-migrated", onMigrated);
+    return () => window.removeEventListener("sp-templates-migrated", onMigrated);
+  }, []);
+
   // Single write path: pass ONLY the changed/new records; §5.5 merge keeps the rest.
   function persistTemplateChange(changedRecords, toast) {
     if (templatesBlocked()) { showToast("⚠ Template saving is off — storage needs attention"); return false; }
@@ -1524,16 +1588,24 @@ function App() {
     reader.onload = (e) => {
       try {
         const parsed = JSON.parse(e.target.result);
+        // §5.2 version gate FIRST (Codex W1-R1: a schemaVersion-99 wrapper imported).
+        if (parsed && !Array.isArray(parsed) && typeof parsed.schemaVersion === "number" && parsed.schemaVersion > 1) {
+          showToast("Backup is from a newer app version — nothing imported"); return;
+        }
         // Accept the export wrapper, a bare array (legacy backups), or a raw envelope.
         const incomingRaw = Array.isArray(parsed) ? parsed
           : Array.isArray(parsed?.templates) ? parsed.templates : null;
         if (!incomingRaw) { showToast("File doesn't look like a templates backup"); return; }
 
-        // §6 ALL-OR-NOTHING: every non-tombstoned entry must validate (grid dimensions
-        // included, after stripping legacy identity fields) or nothing is imported.
+        // §6 ALL-OR-NOTHING: EVERY entry must validate or nothing is imported —
+        // tombstoned entries included (Codex W1-R1: they skipped validation).
         const entries = incomingRaw.map(stripTemplateEntry);
         for (const t of entries) {
-          if (t && t.deletedAt) continue; // tombstones pass through to the merge
+          if (!t || typeof t !== "object") { showToast("File contains damaged template data — nothing imported"); return; }
+          if (t.deletedAt) {
+            if (!(typeof t.deletedAt === "string" && t.id !== undefined)) { showToast("File contains damaged template data — nothing imported"); return; }
+            continue;
+          }
           if (!validTemplateEntry(t)) { showToast("File contains damaged template data — nothing imported"); return; }
         }
 
@@ -1556,8 +1628,15 @@ function App() {
           playerCount: src.playerCount, halfMins: src.halfMins, grid: src.grid,
           rev: 1, createdAt: ts, updatedAt: ts, deletedAt: null, restoredAt: null });
 
+        let tombstonesCarried = 0;
         for (const inc of entries) {
-          if (inc.deletedAt) continue; // deletion intent flows via export/merge, not via restore-import
+          if (inc.deletedAt) {
+            // Deletion intent from the backup flows into the merge; §5.5 sticky
+            // delete-wins / explicit-restore semantics arbitrate against local state.
+            changes.push({ restoredAt: null, createdAt: ts, updatedAt: ts, rev: 1, ...inc });
+            tombstonesCarried++;
+            continue;
+          }
           const local = inc.id !== undefined ? byId.get(String(inc.id)) : undefined;
           if (local) {
             if (!local.deletedAt && coreEq(local, inc)) { skipped++; continue; }        // re-import no-op
@@ -1596,6 +1675,7 @@ function App() {
         if (added) parts.push(`${added} added`);
         if (restored) parts.push(`${restored} restored`);
         if (copies) parts.push(`${copies} imported as copies`);
+        if (tombstonesCarried) parts.push(`${tombstonesCarried} deletion(s) applied`);
         if (skipped) parts.push(`${skipped} already present`);
         persistTemplateChange(changes, `Restored: ${parts.join(", ")}`);
       } catch (err) {
@@ -1847,6 +1927,11 @@ function App() {
   // (a start5/plan-stage save resumed straight into the game screen would have no
   // plan/lineup to run on).
   const savedScreenRef = useRef("game");
+  // v2 snapshot identity + per-game tracking config: adopted from a hydrated
+  // snapshot, else the active team + settings defaults. The save effect reads
+  // THESE — never re-stamps the current team over a snapshot's own identity.
+  const gameIdentityRef = useRef({ selectedTeamId: ACTIVE_TEAM.id, teamNameAtGameTime: ACTIVE_TEAM.name });
+  const trackingTogglesRef = useRef({ ...SETTINGS_DEFAULTS.defaultTrackingToggles });
 
   useEffect(() => {
     // §5.1 quarantine for the game key: preserve the damaged/invalid payload, then
@@ -1876,6 +1961,9 @@ function App() {
         const sv = typeof s.schemaVersion === "number" ? s.schemaVersion : 1;
         if (sv > SUPPORTED_SCHEMA) {
           restoreBlockedRef.current = true;
+          // §5.2: refusal must be VISIBLE — silent blocking let the coach play a whole
+          // "game" that was never being saved (Codex W1-R1 CRITICAL).
+          storageNotices.push({ text: "A game saved by a NEWER app version is stored here. NOT SAVING games this session to protect it — update the app or discard from the newer version." });
           setHydrated(true);
           return;
         }
@@ -1936,6 +2024,23 @@ function App() {
           Array.isArray(arr) ? arr.filter(j => validJerseys.has(j)) : [];
         const sanitizeNumSecs = (v) =>
           typeof v === "number" && v >= 0 && isFinite(v) ? v : 0;
+        // ── Post-SANITIZATION cardinality/membership checks (Codex W1-R1: raw-length
+        // checks passed while unknown jerseys were silently filtered — a "5-player"
+        // live game could hydrate with 4 real participants, or a 2-entry plan order
+        // could shrink to 1 against a 9-column grid).
+        const sanSelected = [...new Set(sanitizeJerseyArray(s.selected))];
+        if (sanSelected.length > MAX_PARTICIPANTS) { fail("too many participants"); break restoreattempt; }
+        if (scr === "game" && sanSelected.length < 5) { fail("live game participant count impossible after sanitization"); break restoreattempt; }
+        if (scr === "plan") {
+          const sanOrder = [...new Set(s.gridPlayerOrderJerseys.filter(j => validJerseys.has(j)))];
+          const gridCols = Array.isArray(s.editableGrid) && s.editableGrid[0] ? s.editableGrid[0].length : 0;
+          if (sanOrder.length !== s.gridPlayerOrderJerseys.length || sanOrder.length !== gridCols) { fail("plan player order does not match its grid"); break restoreattempt; }
+        }
+        // Native-v2 identity/config are ADOPTED, not overwritten by the current team
+        // (Codex W1-R1: re-save was stamping the seed team's id/name and default
+        // toggles over a snapshot that claimed a different team/config).
+        gameIdentityRef.current = { selectedTeamId: s.selectedTeamId, teamNameAtGameTime: s.teamNameAtGameTime };
+        trackingTogglesRef.current = { ...s.gameConfig.trackingToggles };
         // Config is authoritative on v2 (v1 flat fields were mapped into it above).
         s.halfMins = s.gameConfig.halfMins;
         s.planMode = s.gameConfig.planMode;
@@ -2026,10 +2131,10 @@ function App() {
       const snapshot = {
         schemaVersion: 2,
         // W1.f v2 fields — the game's own roster copy + per-game config (frozen spec).
-        selectedTeamId: ACTIVE_TEAM.id,
-        teamNameAtGameTime: ACTIVE_TEAM.name,
+        selectedTeamId: gameIdentityRef.current.selectedTeamId,
+        teamNameAtGameTime: gameIdentityRef.current.teamNameAtGameTime,
         gameRosterSnapshot: gameRosterSnapshotRef.current,
-        gameConfig: { halfMins, planMode, trackingToggles: { ...SETTINGS_DEFAULTS.defaultTrackingToggles } },
+        gameConfig: { halfMins, planMode, trackingToggles: { ...trackingTogglesRef.current } },
         screen, halfMins,
         selected: [...selected], starters: [...starters],
         plan, planMode,
@@ -2074,6 +2179,11 @@ function App() {
     try { localStorage.removeItem(STORAGE_KEY); } catch (e) {}
     // Clear the future-schema lock so a fresh game on the same tab can save again.
     restoreBlockedRef.current = false;
+    // Fresh game lifecycle: roster copy + identity + toggles return to the active team.
+    gameRosterSnapshotRef.current = ROSTER;
+    gameIdentityRef.current = { selectedTeamId: ACTIVE_TEAM.id, teamNameAtGameTime: ACTIVE_TEAM.name };
+    trackingTogglesRef.current = { ...SETTINGS_DEFAULTS.defaultTrackingToggles };
+    savedScreenRef.current = "game";
     // Reset to clean setup state
     setScreen("setup");
     setPlan(null);
