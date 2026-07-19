@@ -440,7 +440,11 @@ function migrateSimpleKey(key, defaults, label, validator) {
   let parsed;
   try { parsed = JSON.parse(raw); } catch (e) { parsed = null; }
   if (parsed && typeof parsed.schemaVersion === "number" && parsed.schemaVersion > 1) {
-    storageBlocks[key] = "future-schema"; return;
+    // §5.2: refusal must be VISIBLE here too (Codex W1-R3 probe: settings/history
+    // future-schema blocked with an EMPTY notices array — silent again).
+    storageBlocks[key] = "future-schema";
+    storageNotices.push({ text: label + " data was saved by a newer app version — its saving is off to protect it." });
+    return;
   }
   // Deep-shape validation, not mere object-ness (Codex W1-R1: {schemaVersion:1}
   // with every field missing was being accepted as valid settings).
@@ -1463,8 +1467,11 @@ function App() {
     }
     try {
       const parsed = JSON.parse(localStorage.getItem(TEMPLATES_KEY));
+      // BOTH storage formats validate per entry — the envelope path previously
+      // skipped validation, listing a corrupted entry that crashed loadTemplate
+      // with grid.map-is-not-a-function (Codex W1-R3 probe).
       const list = Array.isArray(parsed) ? parsed.filter(validTemplateEntry).map(stripTemplateEntry)
-        : (parsed && Array.isArray(parsed.templates)) ? parsed.templates : [];
+        : (parsed && Array.isArray(parsed.templates)) ? parsed.templates.filter(t => t && !t.deletedAt && validTemplateEntry(t)) : [];
       return list.filter(t => !t.deletedAt);
     } catch { return []; }
   }
@@ -1513,6 +1520,9 @@ function App() {
 
   function loadTemplate(template) {
     if (!template || !template.grid) return;
+    // Defence in depth: never apply a structurally-invalid pattern even if one
+    // slips into the visible list.
+    if (!validTemplateEntry(template)) { showToast("This template is damaged and can't be loaded"); return; }
     const playerCount = gridPlayerOrder.length;
     // FROZEN compatibility rules (§6): both dimensions must match — no rescaling,
     // no padding. The pattern applies POSITIONALLY (column i → grid column i).

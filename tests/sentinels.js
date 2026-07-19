@@ -503,6 +503,47 @@ const SENTINELS = [
       }
     },
   },
+  // ── W1 audit round-3 sentinels (Codex probe findings) ──
+  {
+    id: "S-122", name: "Future-schema settings/history refuse VISIBLY and stay untouched",
+    run: async ({ page, url }) => {
+      await page.goto(url);
+      await H.waitForMount(page);
+      const sCanary = JSON.stringify({ schemaVersion: 99, canary: "SETTINGS" });
+      const hCanary = JSON.stringify({ schemaVersion: 99, canary: "HISTORY" });
+      await page.evaluate(([s, h]) => {
+        localStorage.setItem("coachk-subplanner-settings", s);
+        localStorage.setItem("coachk-subplanner-history", h);
+      }, [sCanary, hCanary]);
+      await page.reload();
+      await H.waitForMount(page);
+      H.expect((await H.getStorage(page, "coachk-subplanner-settings")) === sCanary, "future settings altered");
+      H.expect((await H.getStorage(page, "coachk-subplanner-history")) === hCanary, "future history altered");
+      H.expect((await page.getByText(/Settings data was saved by a newer app version/i).count()) > 0, "settings refusal banner missing (silent block)");
+      H.expect((await page.getByText(/Game history data was saved by a newer app version/i).count()) > 0, "history refusal banner missing (silent block)");
+    },
+  },
+  {
+    id: "S-123", name: "Malformed entry inside the templates ENVELOPE is never listed or loadable (no crash)",
+    run: async ({ page, url, pageErrors }) => {
+      await page.goto(url);
+      await H.waitForMount(page);
+      await page.evaluate(() => {
+        const good = { id: "g", name: "Envelope Good", playerCount: 9, halfMins: 20,
+          grid: Array.from({ length: 40 }, () => Array.from({ length: 9 }, () => false)),
+          rev: 1, createdAt: "2026-01-01T00:00:00.000Z", updatedAt: "2026-01-01T00:00:00.000Z", deletedAt: null, restoredAt: null };
+        const bad = { id: "b", name: "Envelope Bad", playerCount: 9, halfMins: 20, grid: "not-an-array",
+          rev: 1, createdAt: "2026-01-01T00:00:00.000Z", updatedAt: "2026-01-01T00:00:00.000Z", deletedAt: null, restoredAt: null };
+        localStorage.setItem("coachk_rotation_templates", JSON.stringify({ schemaVersion: 1, updatedAt: "2026-01-01T00:00:00.000Z", templates: [good, bad] }));
+      });
+      await page.reload();
+      await H.driveToPlanScreen(page);
+      await page.getByText("📂 Load Template").click();
+      H.expect((await page.getByText("Envelope Good").count()) > 0, "healthy envelope template not listed");
+      H.expect((await page.getByText("Envelope Bad").count()) === 0, "malformed envelope entry was listed to the coach");
+      H.expect(pageErrors.length === 0, "page errors while listing templates: " + pageErrors.join(" | "));
+    },
+  },
 ];
 
 async function main() {

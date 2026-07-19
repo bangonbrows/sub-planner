@@ -137,6 +137,18 @@ const CASES = [
     replace: "        if (false) {\n          showToast(\"Backup is from a newer app version — nothing imported\"); return;\n        }",
     mustFail: "S-121",
   },
+  {
+    id: "MUT-117", mutates: "settings/history future-schema refusal goes silent again",
+    find: "    storageNotices.push({ text: label + \" data was saved by a newer app version — its saving is off to protect it.\" });",
+    replace: "    ;",
+    mustFail: "S-122",
+  },
+  {
+    id: "MUT-118", mutates: "envelope-path template entries skip validation (crashable entry listed)",
+    find: "        : (parsed && Array.isArray(parsed.templates)) ? parsed.templates.filter(t => t && !t.deletedAt && validTemplateEntry(t)) : [];",
+    replace: "        : (parsed && Array.isArray(parsed.templates)) ? parsed.templates : [];",
+    mustFail: "S-123",
+  },
 ];
 
 function makeMutatedCopy(caseDef) {
