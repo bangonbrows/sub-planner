@@ -1809,7 +1809,9 @@ function App() {
       if (s.rotationPlan !== undefined) setRotationPlan(s.rotationPlan);
       if (s.editableGrid !== undefined) setEditableGrid(s.editableGrid);
       if (Array.isArray(s.gridPlayerOrderJerseys)) {
-        const order = s.gridPlayerOrderJerseys.map(j => PLAYERS_DB.find(p => p.jersey === j)).filter(Boolean);
+        // Undo operates on the game's roster COPY (frozen spec) — never PLAYERS_DB,
+        // never the saved team. (W1 audit R1: missed W1.d rewire in the undo path.)
+        const order = s.gridPlayerOrderJerseys.map(j => gameRosterSnapshotRef.current.find(p => p.jersey === j)).filter(Boolean);
         if (order.length > 0) setGridPlayerOrder(order);
       }
       if (s.plannedTimeouts) setPlannedTimeouts(s.plannedTimeouts);
@@ -1841,6 +1843,10 @@ function App() {
   // team's roster; hydrated v1/v2 saves adopt the snapshot's own roster. Wave 2 moves
   // capture to the team-selection event per the frozen contract.
   const gameRosterSnapshotRef = useRef(ROSTER);
+  // The screen the saved game was on — Resume returns HERE, not hard-coded "game"
+  // (a start5/plan-stage save resumed straight into the game screen would have no
+  // plan/lineup to run on).
+  const savedScreenRef = useRef("game");
 
   useEffect(() => {
     // §5.1 quarantine for the game key: preserve the damaged/invalid payload, then
@@ -1888,6 +1894,12 @@ function App() {
         if (scr === "plan" || scr === "game") {
           if (s.editableGrid !== null && s.editableGrid !== undefined && !(Array.isArray(s.editableGrid) && s.editableGrid.every(row => Array.isArray(row)))) { fail("plan grid malformed"); break restoreattempt; }
         }
+        if (scr === "plan") {
+          // Spec W1.f plan branch (W1 audit R1: this check was missed): the grid and
+          // its player-order array are both required on the plan screen.
+          if (!Array.isArray(s.editableGrid)) { fail("plan grid missing"); break restoreattempt; }
+          if (!(Array.isArray(s.gridPlayerOrderJerseys) && s.gridPlayerOrderJerseys.length > 0 && s.gridPlayerOrderJerseys.every(j => typeof j === "number"))) { fail("plan player order malformed"); break restoreattempt; }
+        }
         if (scr === "game") {
           if (!s.plan && !s.rotationPlan) { fail("live game missing plan"); break restoreattempt; }
           if (!(typeof s.gameSecs === "number" && isFinite(s.gameSecs))) { fail("live game clock malformed"); break restoreattempt; }
@@ -1928,8 +1940,11 @@ function App() {
         s.halfMins = s.gameConfig.halfMins;
         s.planMode = s.gameConfig.planMode;
 
-        // A saved game is only meaningful if we got past setup
-        if (s.plan && s.screen && s.screen !== "setup") setHasSavedGame(true);
+        // A saved game is meaningful on ANY screen past setup — including start5,
+        // which has no plan yet. (W1 audit R1 CRITICAL: the old `s.plan &&` guard
+        // left start5 saves without the SAVED GAME banner, stranding a snapshot the
+        // coach could neither see nor discard — a Wave-2 Manage-Teams lockout.)
+        if (s.screen && s.screen !== "setup") { setHasSavedGame(true); savedScreenRef.current = s.screen; }
         if (s.screen) setScreen(s.screen);
         if (typeof s.halfMins === "number" && s.halfMins > 0) setHalfMins(s.halfMins);
         if (Array.isArray(s.selected)) setSelected(new Set(sanitizeJerseyArray(s.selected)));
@@ -4146,7 +4161,7 @@ function App() {
               A game is in progress. Tap Resume to jump back into it (clock stays paused), or discard to start fresh.
             </div>
             <div style={{ display: "flex", gap: 8 }}>
-              <button onClick={() => { setConfirmDiscard(false); setScreen("game"); }}
+              <button onClick={() => { setConfirmDiscard(false); setScreen(savedScreenRef.current); }}
                 style={{ flex: 1, padding: "10px", borderRadius: 10, border: "none", background: "#22c55e", color: "#052e16", fontSize: 14, fontWeight: 700, cursor: "pointer" }}>
                 ▶ Resume Game
               </button>

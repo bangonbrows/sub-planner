@@ -281,6 +281,53 @@ const SENTINELS = [
       await page.getByText("Pick Starting 5").first().waitFor({ timeout: 20000 });
     },
   },
+  {
+    id: "S-111", name: "start5 save is a visible, resumable, discardable saved game (audit R1 CRITICAL)",
+    run: async ({ page, url }) => {
+      await page.goto(url);
+      await H.waitForMount(page);
+      await page.getByText("Next: Pick Starting 5 →").click();
+      await page.getByText("Pick Starting 5").first().waitFor();
+      await page.waitForTimeout(800);
+      await page.reload();
+      await page.getByText("Pick Starting 5").first().waitFor({ timeout: 20000 });
+      await page.getByText("← Back").click();
+      // The trap: the banner must exist so the coach can see/discard the snapshot.
+      await page.getByText("SAVED GAME FOUND").waitFor({ timeout: 5000 });
+      // Resume must return to the SAVED screen (start5), not jump into a plan-less game.
+      await page.getByText("▶ Resume Game").click();
+      await page.getByText("Pick Starting 5").first().waitFor({ timeout: 5000 });
+      // And discard must actually clear the snapshot (two-tap confirm).
+      await page.getByText("← Back").click();
+      await page.getByText("🗑 Discard").click();
+      await page.getByText("⚠ Tap again to confirm").click();
+      await page.waitForTimeout(500);
+      const snap = await H.getStorage(page, H.STORAGE_KEY);
+      H.expect(!snap || JSON.parse(snap).screen === "setup", "discard did not clear the stranded snapshot");
+    },
+  },
+  {
+    id: "S-112", name: "Plan-screen save missing its player-order array is quarantined (audit R1 HIGH)",
+    run: async ({ page, url }) => {
+      await page.goto(url);
+      await H.driveToPlanScreen(page);
+      await page.waitForTimeout(800);
+      await page.evaluate(() => {
+        const s = JSON.parse(localStorage.getItem("coachk-subplanner-v9"));
+        delete s.gridPlayerOrderJerseys;
+        localStorage.setItem("coachk-subplanner-v9", JSON.stringify(s));
+      });
+      await page.reload();
+      await H.waitForMount(page); // must land on fresh setup, not a blank plan grid
+      const hasQuarantine = await page.evaluate(() => {
+        for (let i = 0; i < localStorage.length; i++) {
+          if (localStorage.key(i).startsWith("coachk-subplanner-v9-quarantine-")) return true;
+        }
+        return false;
+      });
+      H.expect(hasQuarantine, "plan save with missing player order was not quarantined");
+    },
+  },
 ];
 
 async function main() {

@@ -79,6 +79,18 @@ const CASES = [
     replace: "        if (false) { fail(\"too many participants\"); break restoreattempt; }",
     mustFail: "S-108",
   },
+  {
+    id: "SAB-108", plants: "hasSavedGame regresses to plan-only (start5 saves invisible again)",
+    find: "        if (s.screen && s.screen !== \"setup\") { setHasSavedGame(true); savedScreenRef.current = s.screen; }",
+    replace: "        if (s.plan && s.screen && s.screen !== \"setup\") { setHasSavedGame(true); savedScreenRef.current = s.screen; }",
+    mustFail: "S-111",
+  },
+  {
+    id: "SAB-109", plants: "plan-screen player-order validation removed",
+    find: "          if (!(Array.isArray(s.gridPlayerOrderJerseys) && s.gridPlayerOrderJerseys.length > 0 && s.gridPlayerOrderJerseys.every(j => typeof j === \"number\"))) { fail(\"plan player order malformed\"); break restoreattempt; }",
+    replace: "          if (false) { fail(\"plan player order malformed\"); break restoreattempt; }",
+    mustFail: "S-112",
+  },
 ];
 
 function makeMutatedCopy(caseDef) {
