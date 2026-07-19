@@ -35,9 +35,11 @@ async function launch(appDir) {
   return { page, url, pageErrors, close };
 }
 
-// Wait for the Babel-transpiled app to mount (setup screen header).
+// Wait for the Babel-transpiled app to mount (setup screen header). Generous
+// timeout: full-suite runs launch many Chromium instances back-to-back and
+// in-browser Babel transpilation slows under that load (S-125 flake, W1-R5).
 async function waitForMount(page) {
-  await page.getByText("Coach K Sub Planner").first().waitFor({ timeout: 20000 });
+  await page.getByText("Coach K Sub Planner").first().waitFor({ timeout: 45000 });
 }
 
 const STORAGE_KEY = "coachk-subplanner-v9";
@@ -62,7 +64,7 @@ async function driveToPlanScreen(page) {
 async function driveToGameScreen(page) {
   const starters = await driveToPlanScreen(page);
   await page.getByText("Start Game", { exact: false }).last().click();
-  await page.getByText(/ON COURT \(/).waitFor({ timeout: 15000 });
+  await page.getByText(/ON COURT \(/).waitFor({ timeout: 30000 });
   return starters;
 }
 

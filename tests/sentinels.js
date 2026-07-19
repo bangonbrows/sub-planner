@@ -569,7 +569,7 @@ const SENTINELS = [
     },
   },
   {
-    id: "S-125", name: "v2 save with incomplete tracking toggles or missing identity is quarantined",
+    id: "S-125", name: "v2 save with incomplete tracking toggles is quarantined",
     run: async ({ page, url }) => {
       await page.goto(url);
       await H.driveToGameScreen(page);
@@ -581,7 +581,12 @@ const SENTINELS = [
       await page.reload();
       await H.waitForMount(page);
       H.expect((await page.getByText(/ON COURT \(/).count()) === 0, "empty tracking toggles hydrated into a live game");
-      // Second case: identity removed.
+    },
+  },
+  {
+    id: "S-129", name: "v2 save without team identity is quarantined",
+    run: async ({ page, url }) => {
+      await page.goto(url);
       await H.driveToGameScreen(page);
       await page.evaluate(() => {
         const s = JSON.parse(localStorage.getItem("coachk-subplanner-v9"));
@@ -644,12 +649,19 @@ const SENTINELS = [
       const fs = require("fs"), os = require("os"), path = require("path");
       await page.goto(url);
       await H.driveToPlanScreen(page);
-      const file = path.join(os.tmpdir(), "sp-badtomb-backup.json");
-      fs.writeFileSync(file, JSON.stringify({ schemaVersion: 1, templates: [{ id: "bad-tomb", name: "Bad Tomb", deletedAt: "2026-01-01T00:00:00.000Z", grid: "bad-grid" }] }));
       const before = await H.getStorage(page, H.TEMPLATES_KEY);
-      await page.locator('input[type="file"]').setInputFiles(file);
-      await page.getByText(/damaged template data — nothing imported/i).first().waitFor({ timeout: 5000 });
-      H.expect((await H.getStorage(page, H.TEMPLATES_KEY)) === before, "junk tombstone import still changed storage");
+      const cases = [
+        { file: "sp-badtomb-backup.json", entry: { id: "bad-tomb", name: "Bad Tomb", deletedAt: "2026-01-01T00:00:00.000Z", grid: "bad-grid" } },
+        // Partial core: name present but no grid/counts — must also abort (W1-R5).
+        { file: "sp-partialtomb-backup.json", entry: { id: "name-tomb", name: "Partial Core Name", deletedAt: "2026-01-01T00:00:00.000Z" } },
+      ];
+      for (const c of cases) {
+        const file = path.join(os.tmpdir(), c.file);
+        fs.writeFileSync(file, JSON.stringify({ schemaVersion: 1, templates: [c.entry] }));
+        await page.locator('input[type="file"]').setInputFiles(file);
+        await page.getByText(/damaged template data — nothing imported/i).first().waitFor({ timeout: 5000 });
+        H.expect((await H.getStorage(page, H.TEMPLATES_KEY)) === before, "invalid tombstone import still changed storage: " + c.file);
+      }
     },
   },
 ];

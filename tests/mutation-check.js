@@ -169,8 +169,8 @@ const CASES = [
   },
   {
     id: "MUT-122", mutates: "tombstone core-field validation removed from import",
-    find: "            const hasCore = t.grid !== undefined || t.playerCount !== undefined || t.halfMins !== undefined;\n            if (hasCore && !validTemplateEntry({ ...t, deletedAt: null })) { showToast(\"File contains damaged template data — nothing imported\"); return; }",
-    replace: "            ;",
+    find: "            const hasCore = t.name !== undefined || t.grid !== undefined || t.playerCount !== undefined || t.halfMins !== undefined;\n            if (hasCore && !validTemplateEntry({ ...t, deletedAt: null })) { showToast(\"File contains damaged template data — nothing imported\"); return; }",
+    replace: "            const hasCore = false;\n            if (hasCore && !validTemplateEntry({ ...t, deletedAt: null })) { showToast(\"File contains damaged template data — nothing imported\"); return; }",
     mustFail: "S-128",
   },
   {

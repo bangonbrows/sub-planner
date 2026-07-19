@@ -1637,7 +1637,9 @@ function App() {
             // either a minimal deletion record (id + deletedAt, NO core payload) or
             // a complete record whose core validates.
             if (!(typeof t.deletedAt === "string" && t.id !== undefined)) { showToast("File contains damaged template data — nothing imported"); return; }
-            const hasCore = t.grid !== undefined || t.playerCount !== undefined || t.halfMins !== undefined;
+            // "Core" = every field tplCore() hashes — name included (Codex W1-R5:
+            // a name-only tombstone slipped through as 'minimal').
+            const hasCore = t.name !== undefined || t.grid !== undefined || t.playerCount !== undefined || t.halfMins !== undefined;
             if (hasCore && !validTemplateEntry({ ...t, deletedAt: null })) { showToast("File contains damaged template data — nothing imported"); return; }
             continue;
           }
