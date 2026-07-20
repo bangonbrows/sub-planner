@@ -35,9 +35,10 @@ async function launch(appDir) {
   return { page, url, pageErrors, close };
 }
 
-// Wait for the Babel-transpiled app to mount (setup screen header). Generous
-// timeout: full-suite runs launch many Chromium instances back-to-back and
-// in-browser Babel transpilation slows under that load (S-125 flake, W1-R5).
+// Wait for the Babel-transpiled app to mount (W2: the LANDING screen header —
+// the boot screen, always). Generous timeout: full-suite runs launch many
+// Chromium instances back-to-back and in-browser Babel transpilation slows
+// under that load (S-125 flake, W1-R5).
 async function waitForMount(page) {
   await page.getByText("Coach K Sub Planner").first().waitFor({ timeout: 45000 });
 }
@@ -48,10 +49,23 @@ const TEMPLATES_KEY = "coachk_rotation_templates";
 const getStorage = (page, key) => page.evaluate((k) => localStorage.getItem(k), key);
 const setStorage = (page, key, val) => page.evaluate(([k, v]) => localStorage.setItem(k, v), [key, val]);
 
-// Drive the real UI from fresh setup to the live game screen.
+// W2: from the landing screen, start a new game (implicit selection with the
+// single seed team) and wait for the setup screen to become editable.
+async function newGame(page) {
+  await waitForMount(page);
+  await page.getByText("🏀 New Game").click();
+  await page.getByText("AVAILABLE PLAYERS").waitFor({ timeout: 15000 });
+}
+// W2: from the landing screen, continue the saved game into its persisted screen.
+async function continueGame(page) {
+  await waitForMount(page);
+  await page.getByText("▶ Continue Game").click();
+}
+
+// Drive the real UI from the landing screen to the live game screen.
 // Uses the first 5 roster names as starters. Returns the starter names used.
 async function driveToPlanScreen(page) {
-  await waitForMount(page);
+  await newGame(page);
   await page.getByText("Next: Pick Starting 5 →").click();
   await page.getByText("Pick Starting 5").first().waitFor();
   const starters = ["Lola", "Aanya", "Katyayani", "Rosalie", "Alannah"];
@@ -71,4 +85,4 @@ async function driveToGameScreen(page) {
 // Minimal assert with sentinel-friendly messages.
 function expect(cond, msg) { if (!cond) throw new Error("ASSERT FAILED: " + msg); }
 
-module.exports = { launch, waitForMount, driveToPlanScreen, driveToGameScreen, expect, getStorage, setStorage, STORAGE_KEY, TEMPLATES_KEY };
+module.exports = { launch, waitForMount, newGame, continueGame, driveToPlanScreen, driveToGameScreen, expect, getStorage, setStorage, STORAGE_KEY, TEMPLATES_KEY };

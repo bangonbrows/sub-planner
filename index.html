@@ -42,6 +42,12 @@ const SEED_TEAM_ID = "team_seed_lakeside_lakers";
 // Fixed literal timestamps make two independent migrations byte-identical (spec W1.c).
 const SEED_TS = "2026-07-18T00:00:00.000Z";
 const MAX_PARTICIPANTS = 10; // D-9
+const GAME_KEY = "coachk-subplanner-v9";
+const REPAIR_KEY = "coachk-subplanner-repair"; // §4 W2 two-key protocol journal
+// Wave 2 validation vocab (spec §4 Wave 2 validation rules).
+const POSITIONS = ["PG", "SG", "SF", "PF", "C"];
+const SKILL_SET = ["Scoring", "BallHandle", "Passing", "Interior", "Perimeter"];
+const COLOR_PALETTE = ["#4A90E2", "#7B68EE", "#27AE60", "#E74C3C", "#F39C12", "#1ABC9C", "#E91E63", "#9C27B0", "#FF5722", "#0EA5E9", "#84CC16", "#F43F5E"];
 
 function newId() {
   try { if (crypto && crypto.randomUUID) return crypto.randomUUID(); } catch (e) {}
@@ -427,6 +433,226 @@ function migrateTemplates() {
   }
 }
 
+// ── §4 W2 repair journal (two-key protocol, two-phase ops) ──────────────────
+// Op lifecycle: prepared → committed → cleared. Only COMMITTED ops replay.
+// A prepared op found at load takes the two-branch recovery (round-6 fold):
+// snapshot effect absent → rolled back (terminal, never replays); effect
+// present → rolled FORWARD to committed and replayed. "Rolled back" is stored
+// as status "cleared" with outcome "rolledback" — a terminal marker rather than
+// a delete, because a deleted op could merge back in from a stale tab's copy
+// (the §5.5 resurrection defect pattern) while a cleared marker always wins.
+const OP_STATUS_RANK = { prepared: 0, committed: 1, cleared: 2 };
+function validRepairOp(o) {
+  return o && typeof o === "object" && typeof o.opId === "string" && o.opId &&
+    (o.type === "editPlayer" || o.type === "addPlayer" || o.type === "removePlayer") &&
+    typeof o.teamId === "string" && o.teamId && typeof o.targetPlayerId === "string" && o.targetPlayerId &&
+    o.payload && typeof o.payload === "object" &&
+    typeof o.rev === "number" && typeof o.ts === "string" &&
+    OP_STATUS_RANK[o.status] !== undefined && typeof o.statusAt === "string";
+}
+function validRepairEnvelope(env) {
+  return env && typeof env === "object" && typeof env.schemaVersion === "number" &&
+    Array.isArray(env.ops) && env.ops.every(validRepairOp);
+}
+function canonOps(ops) {
+  // (ts, opId) is both the canonical storage order AND the replay order (§5.5).
+  ops.sort((x, y) => (x.ts + x.opId).localeCompare(y.ts + y.opId));
+  return ops;
+}
+function mergeRepairEnvelopes(mine, theirs) {
+  const base = theirs && Array.isArray(theirs.ops) ? theirs.ops : [];
+  const byId = new Map();
+  for (const o of base) byId.set(o.opId, o);
+  for (const o of mine.ops) {
+    const other = byId.get(o.opId);
+    if (!other) { byId.set(o.opId, o); continue; }
+    // Union at max-progress status; equal progress → later statusAt, then
+    // lexicographic serialization (deterministic, convergent).
+    const ra = OP_STATUS_RANK[o.status], rb = OP_STATUS_RANK[other.status];
+    if (ra !== rb) { byId.set(o.opId, ra > rb ? o : other); continue; }
+    if (o.statusAt !== other.statusAt) { byId.set(o.opId, o.statusAt > other.statusAt ? o : other); continue; }
+    byId.set(o.opId, JSON.stringify(o) >= JSON.stringify(other) ? o : other);
+  }
+  return { schemaVersion: 1, updatedAt: maxIso(mine.updatedAt, theirs && theirs.updatedAt) || nowIso(), ops: canonOps([...byId.values()]) };
+}
+// Pass ONLY the changed/new ops — the union merge preserves the rest.
+function writeRepairEnvelope(changedOps) {
+  for (let attempt = 0; attempt < 3; attempt++) {
+    let stored = null;
+    try { const r = safeGet(REPAIR_KEY); stored = r ? JSON.parse(r) : null; } catch (e) { stored = null; }
+    if (stored && typeof stored.schemaVersion === "number" && stored.schemaVersion > 1) {
+      if (!storageBlocks[REPAIR_KEY]) {
+        storageBlocks[REPAIR_KEY] = "future-schema";
+        storageNotices.push({ text: "Pending team edits were saved by a newer app version — permanent edits are off to protect them." });
+      }
+      return false;
+    }
+    if (stored && !validRepairEnvelope(stored)) stored = null; // corrupt handled by migrateRepair
+    const merged = mergeRepairEnvelopes({ schemaVersion: 1, updatedAt: nowIso(), ops: changedOps }, stored);
+    const out = JSON.stringify(merged);
+    if (!safeSet(REPAIR_KEY, out)) return false;
+    if (safeGet(REPAIR_KEY) === out) return true;
+  }
+  return false;
+}
+function readRepairOps() {
+  try {
+    const env = JSON.parse(safeGet(REPAIR_KEY));
+    if (validRepairEnvelope(env)) return canonOps(env.ops.slice());
+  } catch (e) {}
+  return [];
+}
+function migrateRepair() {
+  const raw = safeGet(REPAIR_KEY);
+  if (raw === null) { safeSet(REPAIR_KEY, JSON.stringify({ schemaVersion: 1, updatedAt: nowIso(), ops: [] })); return; }
+  let parsed;
+  try { parsed = JSON.parse(raw); } catch (e) { parsed = null; }
+  if (parsed && typeof parsed.schemaVersion === "number" && parsed.schemaVersion > 1) {
+    storageBlocks[REPAIR_KEY] = "future-schema";
+    storageNotices.push({ text: "Pending team edits were saved by a newer app version — permanent edits are off to protect them." });
+    return;
+  }
+  if (!validRepairEnvelope(parsed)) {
+    quarantineAndHeal(REPAIR_KEY, raw, JSON.stringify({ schemaVersion: 1, updatedAt: nowIso(), ops: [] }), "Pending team-edit data was damaged.");
+  }
+}
+
+// Does the pending game snapshot carry this op's effect? (prepared-op recovery branch)
+function opEffectInSnapshot(op, snap) {
+  if (!snap || !Array.isArray(snap.gameRosterSnapshot)) return false;
+  const p = snap.gameRosterSnapshot.find((x) => x && x.playerId === op.targetPlayerId);
+  if (op.type === "addPlayer") return !!p;
+  if (op.type === "removePlayer") return !p;
+  if (!p) return false;
+  return Object.keys(op.payload).every((k) => JSON.stringify(p[k]) === JSON.stringify(op.payload[k]));
+}
+// Postcondition on the SAVED TEAM after replay (op clearing rule, round-4 fold):
+// "applied"    — the op's intended effect is present;
+// "superseded" — a conflicting edit with >= freshness exists (never silently dropped);
+// null         — neither yet (write did not land; keep the op committed and retry).
+function opTeamsPostcondition(op) {
+  let env = null;
+  try { env = JSON.parse(safeGet(TEAMS_KEY)); } catch (e) {}
+  if (!validTeamsEnvelope(env)) return null;
+  const team = env.teams.find((t) => t.id === op.teamId);
+  if (!team) return "superseded"; // team record gone — nothing to repair into
+  const p = team.players.find((x) => x.playerId === op.targetPlayerId);
+  if (op.type === "addPlayer") return p ? "applied" : null;
+  if (op.type === "removePlayer") {
+    if (!p) return "superseded";
+    if (p.deletedAt) return "applied";
+    if (p.restoredAt && p.restoredAt > op.ts) return "superseded";
+    return p.rev >= op.rev ? "superseded" : null;
+  }
+  if (!p) return "superseded";
+  const match = Object.keys(op.payload).every((k) => JSON.stringify(p[k]) === JSON.stringify(op.payload[k]));
+  if (match) return "applied";
+  // Covers both a genuinely fresher concurrent edit AND a post-merge invariant
+  // repair (enforceInvariants bumps rev) — either way the coach's op lost to a
+  // deterministic later state; surface it, don't retry forever.
+  return p.rev >= op.rev ? "superseded" : null;
+}
+// Replay ONE committed op into the teams envelope. Returns the postcondition
+// ("applied" | "superseded") or null when the write didn't land (retry later).
+function replayCommittedOp(op) {
+  const pre = opTeamsPostcondition(op);
+  if (pre) return pre; // idempotent: effect (or a fresher conflict) already present
+  let env = null;
+  try { env = JSON.parse(safeGet(TEAMS_KEY)); } catch (e) {}
+  if (!validTeamsEnvelope(env)) return null;
+  const team = env.teams.find((t) => t.id === op.teamId);
+  if (!team) return "superseded";
+  const target = team.players.find((x) => x.playerId === op.targetPlayerId);
+  let candidate;
+  if (op.type === "addPlayer") {
+    candidate = { ...op.payload, playerId: op.targetPlayerId, rev: 1, createdAt: op.ts, updatedAt: op.ts, deletedAt: null, restoredAt: null };
+  } else if (!target) {
+    return "superseded";
+  } else if (op.type === "removePlayer") {
+    candidate = { ...target, deletedAt: op.ts, rev: op.rev, updatedAt: op.ts };
+  } else {
+    candidate = { ...target, ...op.payload, rev: op.rev, updatedAt: op.ts };
+  }
+  if (!validPlayer(candidate)) return "superseded"; // payload no longer forms a valid player
+  // Candidate carries ONLY the affected player — the §5.5 union merge keeps the rest.
+  if (!writeTeamsEnvelope({ schemaVersion: 1, updatedAt: nowIso(), teams: [{ ...team, players: [candidate] }] })) return null;
+  return opTeamsPostcondition(op);
+}
+// Repair-on-load: two-branch prepared recovery, then replay committed ops in
+// (ts, opId) order. Runs before first render (localStorage is synchronous).
+function runRepairOnLoad() {
+  const ops = readRepairOps();
+  if (ops.length === 0) return;
+  let snap = null;
+  try { snap = JSON.parse(safeGet(GAME_KEY)); } catch (e) {}
+  const updates = [];
+  for (const op of ops) {
+    if (op.status === "cleared") continue;
+    let cur = op;
+    if (cur.status === "prepared") {
+      if (opEffectInSnapshot(cur, snap)) {
+        cur = { ...cur, status: "committed", statusAt: nowIso() }; // roll FORWARD
+      } else {
+        updates.push({ ...cur, status: "cleared", statusAt: nowIso(), outcome: "rolledback" }); // roll back
+        continue;
+      }
+    }
+    const post = replayCommittedOp(cur);
+    if (post === "applied") {
+      updates.push({ ...cur, status: "cleared", statusAt: nowIso(), outcome: "applied" });
+    } else if (post === "superseded") {
+      updates.push({ ...cur, status: "cleared", statusAt: nowIso(), outcome: "superseded" });
+      storageNotices.push({ text: "An earlier saved-team change couldn't be applied because a later edit replaced it. The later edit was kept." });
+    } else {
+      updates.push(cur); // stays committed — replays again next load
+    }
+  }
+  if (updates.length > 0) writeRepairEnvelope(updates);
+}
+
+// ── Wave 2 field validation / normalization (spec §4 Wave 2) ────────────────
+function normalizeJersey(v) {
+  const s = String(v).trim();
+  if (!/^\d{1,2}$/.test(s)) return null; // integer 0–99, "08" → 8
+  return parseInt(s, 10);
+}
+function normalizeTeamName(name) { return String(name).trim().toLowerCase(); }
+// Validate one player draft against the spec rules. Returns { ok, errors, player }.
+function validatePlayerDraft(d) {
+  const errors = [];
+  const name = String(d.name || "").trim();
+  if (!name) errors.push("Player name is required");
+  const jersey = normalizeJersey(d.jersey);
+  if (jersey === null) errors.push("Jersey must be a whole number 0–99");
+  const rating = Number(d.rating);
+  if (!Number.isFinite(rating) || rating < 1 || rating > 5) errors.push("Rating must be between 1.0 and 5.0");
+  const pos = Array.isArray(d.pos) ? d.pos.filter((p) => POSITIONS.includes(p)) : [];
+  if (pos.length === 0) errors.push("Pick at least one position");
+  const skills = Array.isArray(d.skills) ? d.skills.filter((s) => SKILL_SET.includes(s)) : [];
+  if (skills.length === 0) errors.push("Pick at least one skill");
+  const color = COLOR_PALETTE.includes(d.color) ? d.color : COLOR_PALETTE[0];
+  return { ok: errors.length === 0, errors, player: { name, jersey, rating, pos, skills, color, asthma: !!d.asthma, foulProne: !!d.foulProne } };
+}
+function nextFreeColor(existingPlayers) {
+  const used = new Set(existingPlayers.map((p) => p.color));
+  return COLOR_PALETTE.find((c) => !used.has(c)) || COLOR_PALETTE[existingPlayers.length % COLOR_PALETTE.length];
+}
+// Fresh validated read of the stored teams envelope (null when unreadable).
+function readTeamsEnvelopeFresh() {
+  try {
+    const env = JSON.parse(safeGet(TEAMS_KEY));
+    if (validTeamsEnvelope(env)) return env;
+  } catch (e) {}
+  return null;
+}
+function listActiveTeams() {
+  const env = readTeamsEnvelopeFresh();
+  return env ? env.teams.filter((t) => !t.deletedAt) : [];
+}
+// The Manage-Teams availability + commit-time guard input (§4 W2 round-8/9):
+// a saved game snapshot — pending setup OR live — existing at all.
+function gameSnapshotExists() { return safeGet(GAME_KEY) !== null; }
+
 // ── Teams / settings / history migrations (per-key, idempotent — spec W1.c/W1.e) ──
 function migrateTeams() {
   const raw = safeGet(TEAMS_KEY);
@@ -480,6 +706,10 @@ migrateSimpleKey(SETTINGS_KEY, SETTINGS_DEFAULTS, "Settings",
 migrateSimpleKey(HISTORY_KEY, { schemaVersion: 1, updatedAt: SEED_TS, games: [] }, "Game history",
   (h) => h.schemaVersion === 1 && Array.isArray(h.games));
 migrateTemplates();
+migrateRepair();
+// §4 W2: replay any surviving journal ops before the app renders — a permanent
+// edit whose teams write failed last session lands now.
+runRepairOnLoad();
 
 // ── Active roster (W1.d): the app reads THIS, never PLAYERS_DB ──────────────
 function getActiveTeam() {
@@ -493,11 +723,9 @@ function getActiveTeam() {
   // Blocked/corrupt storage: run the session on the in-memory seed (§5.1).
   return buildSeedEnvelope().teams[0];
 }
-const ACTIVE_TEAM = getActiveTeam();
-// Display order = jersey ascending (matches today's PLAYERS_DB order; storage order is canonical, not display).
-const ROSTER = ACTIVE_TEAM.players
-  .filter((p) => !p.deletedAt && !p.needsJersey && p.jersey !== null)
-  .sort((a, b) => a.jersey - b.jersey);
+// W2: no module-level active roster any more — the game's roster COPY is
+// captured at the team-selection event (or adopted from a hydrated snapshot).
+// getActiveTeam stays as the §5.1 in-memory fallback helper.
 
 // Sticky storage-health banner, rendered at the top of every screen. The notices
 // array is populated during migration/restore (before/at first render) — static
@@ -525,7 +753,7 @@ function StorageNoticesBanner() {
 }
 
 // Minimal internals surface for the sentinel harness (inert in normal use).
-window.__SP_INTERNALS__ = { TEAMS_KEY, SETTINGS_KEY, HISTORY_KEY, TPL_KEY, SEED_TEAM_ID, mergeTeamsEnvelopes, writeTeamsEnvelope, writeTemplatesEnvelope, buildSeedEnvelope, storageBlocks, storageNotices, validTemplateEntry, contentHash, tplCore, MAX_PARTICIPANTS };
+window.__SP_INTERNALS__ = { TEAMS_KEY, SETTINGS_KEY, HISTORY_KEY, TPL_KEY, GAME_KEY, REPAIR_KEY, SEED_TEAM_ID, mergeTeamsEnvelopes, writeTeamsEnvelope, writeTemplatesEnvelope, writeRepairEnvelope, mergeRepairEnvelopes, readRepairOps, runRepairOnLoad, buildSeedEnvelope, storageBlocks, storageNotices, validTemplateEntry, contentHash, tplCore, MAX_PARTICIPANTS, listActiveTeams, normalizeJersey, validatePlayerDraft };
 
 // Minimum skill coverage required on court at all times
 // Skills: Scoring, BallHandle, Passing, Interior, Perimeter
@@ -1431,10 +1659,87 @@ function CoachKLogo({ size = 40 }) {
   );
 }
 
+// Shared player form (Manage Teams editor, D-7 fill-in add, setup player edit).
+// Controlled by the parent's draft object; validation happens at commit time.
+function PlayerFields({ draft, onChange }) {
+  const set = (k, v) => onChange({ ...draft, [k]: v });
+  const toggleIn = (k, val) => {
+    const arr = Array.isArray(draft[k]) ? draft[k] : [];
+    set(k, arr.includes(val) ? arr.filter((x) => x !== val) : [...arr, val]);
+  };
+  const chip = (on) => ({
+    padding: "6px 10px", borderRadius: 8, cursor: "pointer", fontSize: 12, fontWeight: 700,
+    border: `1px solid ${on ? "#3b82f6" : "#334155"}`, background: on ? "#1e3a8a" : "#0f172a",
+    color: on ? "#60a5fa" : "#94a3b8",
+  });
+  const lbl = { color: "#94a3b8", fontSize: 11, fontWeight: 700, letterSpacing: 1, margin: "10px 0 4px" };
+  const inp = { width: "100%", padding: "10px", borderRadius: 10, border: "1px solid #334155", background: "#0f172a", color: "#fff", fontSize: 15 };
+  return (
+    <div>
+      <div style={lbl}>NAME</div>
+      <input style={inp} value={draft.name} placeholder="e.g. Aanya" onChange={(e) => set("name", e.target.value)} />
+      <div style={{ display: "flex", gap: 10 }}>
+        <div style={{ flex: 1 }}>
+          <div style={lbl}>JERSEY # (0–99)</div>
+          <input style={inp} inputMode="numeric" value={draft.jersey} placeholder="e.g. 8" onChange={(e) => set("jersey", e.target.value)} />
+        </div>
+        <div style={{ flex: 1 }}>
+          <div style={lbl}>RATING (1–5)</div>
+          <input style={inp} inputMode="decimal" value={draft.rating} placeholder="e.g. 2.5" onChange={(e) => set("rating", e.target.value)} />
+        </div>
+      </div>
+      <div style={lbl}>POSITIONS</div>
+      <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+        {POSITIONS.map((p) => (
+          <button key={p} onClick={() => toggleIn("pos", p)} style={chip((draft.pos || []).includes(p))}>{p}</button>
+        ))}
+      </div>
+      <div style={lbl}>SKILLS</div>
+      <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+        {SKILL_SET.map((s) => (
+          <button key={s} onClick={() => toggleIn("skills", s)} style={chip((draft.skills || []).includes(s))}>{s}</button>
+        ))}
+      </div>
+      <div style={lbl}>COLOUR</div>
+      <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+        {COLOR_PALETTE.map((c) => (
+          <button key={c} onClick={() => set("color", c)}
+            style={{ width: 30, height: 30, borderRadius: "50%", background: c, cursor: "pointer",
+              border: draft.color === c ? "3px solid #fff" : "2px solid #1e293b" }} />
+        ))}
+      </div>
+      <div style={{ display: "flex", gap: 6, marginTop: 10 }}>
+        <button onClick={() => set("asthma", !draft.asthma)} style={chip(!!draft.asthma)}>Asthma</button>
+        <button onClick={() => set("foulProne", !draft.foulProne)} style={chip(!!draft.foulProne)}>Foul-prone</button>
+      </div>
+    </div>
+  );
+}
+
 function App() {
+  // ── §4 W2 landing layer ────────────────────────────────────────────────────
+  // appMode is APP-LEVEL state, never persisted: "landing" (boot screen, always),
+  // "picker" (team choice for a new game), "manage" (Manage Teams), "app" (the
+  // four persisted game screens below). The snapshot's `screen` can only ever be
+  // setup / start5 / plan / game.
+  const [appMode, setAppMode] = useState("landing");
+  // A pending-setup OR live snapshot exists (hydrated at boot or created at team
+  // selection). Gates the save effect, Continue Game, and Manage Teams availability.
+  const [gameInFlight, setGameInFlight] = useState(false);
+  // A snapshot exists but can't be hydrated (future schema): Continue is disabled
+  // with a reason, Manage Teams stays locked, New Game offers the discard path.
+  const [blockedSave, setBlockedSave] = useState(false);
+  const [newGamePrompt, setNewGamePrompt] = useState(false);   // save/discard-first prompt
+  const [selectionError, setSelectionError] = useState(null);  // persist-gate failure { teamId }
+  const [capMsg, setCapMsg] = useState(null);                  // D-9 cap feedback on setup
+  const [planStale, setPlanStale] = useState(false);           // §4 W2 plan-staleness flag (persisted)
+  const [staleChoiceNeeded, setStaleChoiceNeeded] = useState(false); // Start Game pressed while stale
+  const [tipoffError, setTipoffError] = useState(false);       // Start Game persistence gate failure
+  const [setupEdit, setSetupEdit] = useState(null);            // pre-game player edit dialog state
+  const [guestForm, setGuestForm] = useState(null);            // D-7 fill-in add dialog state
   const [screen, setScreen] = useState("setup");
   const [halfMins, setHalfMins] = useState(20);
-  const [selected, setSelected] = useState(new Set(ROSTER.map(p => p.jersey)));
+  const [selected, setSelected] = useState(new Set());
   const [starters, setStarters] = useState(new Set());
   const [plan, setPlan] = useState(null);
   const [planMode, setPlanMode] = useState("balanced"); // balanced | competitive | development
@@ -1949,17 +2254,19 @@ function App() {
   // Save / restore full game state across browser refresh, tab close, mobile memory flush, etc.
   const STORAGE_KEY = "coachk-subplanner-v9";
   const [hydrated, setHydrated] = useState(false); // blocks save effect until restore commits
-  const [hasSavedGame, setHasSavedGame] = useState(false); // whether restore found a live game
   const [confirmDiscard, setConfirmDiscard] = useState(false); // two-tap confirm for discard button
   // If a saved snapshot uses a future schema we can't read, refuse to restore AND
   // refuse to overwrite. Without this guard the save effect would clobber the
   // newer save with a fresh v1 default snapshot on the next render.
   const restoreBlockedRef = useRef(false);
   const [saveError, setSaveError] = useState(false); // surfaces silent localStorage failures
-  // W1.f: the game's roster COPY (v2 snapshot field). Fresh sessions use the active
-  // team's roster; hydrated v1/v2 saves adopt the snapshot's own roster. Wave 2 moves
-  // capture to the team-selection event per the frozen contract.
-  const gameRosterSnapshotRef = useRef(ROSTER);
+  // W1.f/W2: the game's roster COPY (v2 snapshot field). Captured at the TEAM
+  // SELECTION event (frozen contract — the W1 mount-ref stopgap is gone); hydrated
+  // v1/v2 saves adopt the snapshot's own roster. State drives rendering; the ref
+  // mirrors it for the undo path (quirk: undo maps jerseys via this ref — keep it).
+  const [gameRoster, _setGameRosterState] = useState([]);
+  const gameRosterSnapshotRef = useRef([]);
+  const setGameRoster = (r) => { gameRosterSnapshotRef.current = r; _setGameRosterState(r); };
   // The screen the saved game was on — Resume returns HERE, not hard-coded "game"
   // (a start5/plan-stage save resumed straight into the game screen would have no
   // plan/lineup to run on).
@@ -1967,7 +2274,9 @@ function App() {
   // v2 snapshot identity + per-game tracking config: adopted from a hydrated
   // snapshot, else the active team + settings defaults. The save effect reads
   // THESE — never re-stamps the current team over a snapshot's own identity.
-  const gameIdentityRef = useRef({ selectedTeamId: ACTIVE_TEAM.id, teamNameAtGameTime: ACTIVE_TEAM.name });
+  // Empty until a team-selection event (or a hydrated snapshot) supplies it —
+  // nothing is ever persisted before selection, so the placeholder never leaks.
+  const gameIdentityRef = useRef({ selectedTeamId: "", teamNameAtGameTime: "" });
   const trackingTogglesRef = useRef({ ...SETTINGS_DEFAULTS.defaultTrackingToggles });
 
   useEffect(() => {
@@ -2001,6 +2310,9 @@ function App() {
           // §5.2: refusal must be VISIBLE — silent blocking let the coach play a whole
           // "game" that was never being saved (Codex W1-R1 CRITICAL).
           storageNotices.push({ text: "A game saved by a NEWER app version is stored here. NOT SAVING games this session to protect it — update the app or discard from the newer version." });
+          // W2 landing: the snapshot EXISTS but can't be resumed — Continue is
+          // disabled with a reason and Manage Teams stays locked behind it.
+          setBlockedSave(true);
           setHydrated(true);
           return;
         }
@@ -2062,6 +2374,7 @@ function App() {
         // saved team, never PLAYERS_DB) — the game runs entirely on its copy.
         const snapRoster = s.gameRosterSnapshot;
         gameRosterSnapshotRef.current = snapRoster;
+        _setGameRosterState(snapRoster);
         const validJerseys = new Set(snapRoster.map(p => p.jersey));
         const sanitizeJerseyArray = (arr) =>
           Array.isArray(arr) ? arr.filter(j => validJerseys.has(j)) : [];
@@ -2088,12 +2401,15 @@ function App() {
         s.halfMins = s.gameConfig.halfMins;
         s.planMode = s.gameConfig.planMode;
 
-        // A saved game is meaningful on ANY screen past setup — including start5,
-        // which has no plan yet. (W1 audit R1 CRITICAL: the old `s.plan &&` guard
-        // left start5 saves without the SAVED GAME banner, stranding a snapshot the
-        // coach could neither see nor discard — a Wave-2 Manage-Teams lockout.)
-        if (s.screen && s.screen !== "setup") { setHasSavedGame(true); savedScreenRef.current = s.screen; }
+        // §4 W2: ANY hydratable snapshot — pending setup included — is a game in
+        // flight: the landing screen offers Continue Game (into the persisted
+        // screen), and Manage Teams locks. (W1 audit R1 CRITICAL precedent: start5
+        // saves used to be invisible/undiscardable; the landing contract closes
+        // that whole class.)
+        setGameInFlight(true);
+        savedScreenRef.current = s.screen;
         if (s.screen) setScreen(s.screen);
+        if (typeof s.planStale === "boolean") setPlanStale(s.planStale);
         if (typeof s.halfMins === "number" && s.halfMins > 0) setHalfMins(s.halfMins);
         if (Array.isArray(s.selected)) setSelected(new Set(sanitizeJerseyArray(s.selected)));
         if (Array.isArray(s.starters)) setStarters(new Set(sanitizeJerseyArray(s.starters)));
@@ -2166,52 +2482,73 @@ function App() {
     setHydrated(true); // batched with restore setState calls — save effect won't fire until next render
   }, []);
 
+  // One snapshot shape for every writer (save effect, team selection, permanent
+  // edits, tip-off gate) — divergence between writers is how schema drift starts.
+  function buildSnapshotFromState(overrides = {}) {
+    const snapshot = {
+      schemaVersion: 2,
+      // W1.f v2 fields — the game's own roster copy + per-game config (frozen spec).
+      selectedTeamId: gameIdentityRef.current.selectedTeamId,
+      teamNameAtGameTime: gameIdentityRef.current.teamNameAtGameTime,
+      gameRosterSnapshot: gameRoster,
+      gameConfig: { halfMins, planMode, trackingToggles: { ...trackingTogglesRef.current } },
+      screen, halfMins,
+      selected: [...selected], starters: [...starters],
+      plan, planMode,
+      gameSecs, onCourt, accumulated, stintStart,
+      halftimeDone,
+      fouls,
+      fouledOut: [...fouledOut], injured: [...injured],
+      adjustedTargetMins, subLog, injuryInfo, fouloutInfo,
+      lastSubTime, offSince,
+      handledWindows: [...handledWindows],
+      restedThisHalf: [...restedThisHalf],
+      replacingJersey,
+      scoreUs, scoreOpponent, timeoutsUs, timeoutsOpponent,
+      possessionLeft,
+      // V3 plan-first state
+      rotationPlan: rotationPlan || null,
+      gridPlayerOrderJerseys: gridPlayerOrder.map(p => p.jersey),
+      editableGrid: editableGrid || null,
+      plannedTimeouts: [...plannedTimeouts],
+      dismissedTimeouts: [...dismissedTimeouts],
+      timeoutRemindersOn,
+      lastExecutedSegId: lastExecutedSegId || null,
+      planDelayUntilSecs: planDelayUntilSecs ?? null,
+      delayedSegId: delayedSegId || null,
+      shortHandedDismissedAt: shortHandedDismissedAt ?? null,
+      planStale,
+    };
+    return { ...snapshot, ...overrides };
+  }
+  // Synchronous persist + read-back verify — the §4 W2 persistence gates
+  // (team selection, tip-off) must PROVE the write landed before proceeding.
+  function persistSnapshotNow(overrides = {}) {
+    if (restoreBlockedRef.current) return false;
+    try {
+      const out = JSON.stringify(buildSnapshotFromState(overrides));
+      localStorage.setItem(STORAGE_KEY, out);
+      return localStorage.getItem(STORAGE_KEY) === out;
+    } catch (e) { return false; }
+  }
+
   useEffect(() => {
     if (!hydrated) return; // don't overwrite saved state during initial restore
     if (restoreBlockedRef.current) return; // refuse to overwrite a future-schema save
+    // §4 W2 snapshot lifecycle: the snapshot is CREATED at team selection and
+    // exists until finish/discard. No game in flight → nothing may be written
+    // (Manage Teams availability keys off snapshot existence).
+    if (!gameInFlight) return;
     // Save every tick — state is small, reliability beats battery savings.
     try {
-      const snapshot = {
-        schemaVersion: 2,
-        // W1.f v2 fields — the game's own roster copy + per-game config (frozen spec).
-        selectedTeamId: gameIdentityRef.current.selectedTeamId,
-        teamNameAtGameTime: gameIdentityRef.current.teamNameAtGameTime,
-        gameRosterSnapshot: gameRosterSnapshotRef.current,
-        gameConfig: { halfMins, planMode, trackingToggles: { ...trackingTogglesRef.current } },
-        screen, halfMins,
-        selected: [...selected], starters: [...starters],
-        plan, planMode,
-        gameSecs, onCourt, accumulated, stintStart,
-        halftimeDone,
-        fouls,
-        fouledOut: [...fouledOut], injured: [...injured],
-        adjustedTargetMins, subLog, injuryInfo, fouloutInfo,
-        lastSubTime, offSince,
-        handledWindows: [...handledWindows],
-        restedThisHalf: [...restedThisHalf],
-        replacingJersey,
-        scoreUs, scoreOpponent, timeoutsUs, timeoutsOpponent,
-        possessionLeft,
-        // V3 plan-first state
-        rotationPlan: rotationPlan || null,
-        gridPlayerOrderJerseys: gridPlayerOrder.map(p => p.jersey),
-        editableGrid: editableGrid || null,
-        plannedTimeouts: [...plannedTimeouts],
-        dismissedTimeouts: [...dismissedTimeouts],
-        timeoutRemindersOn,
-        lastExecutedSegId: lastExecutedSegId || null,
-        planDelayUntilSecs: planDelayUntilSecs ?? null,
-        delayedSegId: delayedSegId || null,
-        shortHandedDismissedAt: shortHandedDismissedAt ?? null,
-      };
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(snapshot));
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(buildSnapshotFromState()));
       if (saveError) setSaveError(false);
     } catch (e) {
       // Quota / private-mode / serialization failure. Surface it so the coach
       // sees a banner instead of silently losing the game on the next refresh.
       if (!saveError) setSaveError(true);
     }
-  }, [hydrated, screen, halfMins, selected, starters, plan, planMode, gameSecs, onCourt, accumulated, stintStart,
+  }, [hydrated, gameInFlight, gameRoster, planStale, screen, halfMins, selected, starters, plan, planMode, gameSecs, onCourt, accumulated, stintStart,
       halftimeDone, fouls, fouledOut, injured, adjustedTargetMins, subLog, injuryInfo, fouloutInfo,
       lastSubTime, offSince, handledWindows, restedThisHalf, replacingJersey,
       scoreUs, scoreOpponent, timeoutsUs, timeoutsOpponent, possessionLeft,
@@ -2222,9 +2559,21 @@ function App() {
     try { localStorage.removeItem(STORAGE_KEY); } catch (e) {}
     // Clear the future-schema lock so a fresh game on the same tab can save again.
     restoreBlockedRef.current = false;
-    // Fresh game lifecycle: roster copy + identity + toggles return to the active team.
-    gameRosterSnapshotRef.current = ROSTER;
-    gameIdentityRef.current = { selectedTeamId: ACTIVE_TEAM.id, teamNameAtGameTime: ACTIVE_TEAM.name };
+    // §4 W2 lifecycle: discard ends the game entirely — no snapshot, no roster
+    // copy, back to the landing screen. The next roster copy is captured at the
+    // next team-selection event, never here.
+    setGameRoster([]);
+    setGameInFlight(false);
+    setBlockedSave(false);
+    setPlanStale(false);
+    setStaleChoiceNeeded(false);
+    setTipoffError(false);
+    setSetupEdit(null);
+    setGuestForm(null);
+    setCapMsg(null);
+    setSelected(new Set());
+    setAppMode("landing");
+    gameIdentityRef.current = { selectedTeamId: "", teamNameAtGameTime: "" };
     trackingTogglesRef.current = { ...SETTINGS_DEFAULTS.defaultTrackingToggles };
     savedScreenRef.current = "game";
     // Reset to clean setup state
@@ -2245,7 +2594,6 @@ function App() {
     setRestedThisHalf(new Set());
     setReplacingJersey(null);
     setShortHandedDismissedAt(null);
-    setHasSavedGame(false);
     setScoreUs(0); setScoreOpponent(0);
     setTimeoutsUs(0); setTimeoutsOpponent(0);
     setUndoStack([]);
@@ -2261,6 +2609,430 @@ function App() {
     setPlanDelayUntilSecs(null);
     setDelayedSegId(null);
     setRerouteBanner(null);
+  }
+
+  // ═══ WAVE 2 — landing / team selection / Manage Teams / reconciliation ═══
+
+  // Manage Teams draft state (list view reads storage fresh on every render).
+  const [manageView, setManageView] = useState("list"); // "list" | "edit"
+  const [manageDraft, setManageDraft] = useState(null);
+  const [manageError, setManageError] = useState(null);
+  const [managePlayerEdit, setManagePlayerEdit] = useState(null); // { index|null, draft }
+  const [manageDeleteConfirm, setManageDeleteConfirm] = useState(null); // team id
+
+  function readSettingsStored() {
+    try {
+      const s = JSON.parse(safeGet(SETTINGS_KEY));
+      if (s && s.schemaVersion === 1 && typeof s.defaultHalfMins === "number" && s.defaultHalfMins > 0 &&
+          typeof s.defaultPlanMode === "string" && s.defaultTrackingToggles) return s;
+    } catch (e) {}
+    return SETTINGS_DEFAULTS;
+  }
+
+  // ── Team selection (the roster-copy capture event — frozen contract) ──────
+  function selectTeamAndStart(teamId) {
+    // Fresh read at the SELECTION event: the picker list or landing state could
+    // be stale against another tab's Manage Teams edits.
+    const env = readTeamsEnvelopeFresh();
+    const team = env && env.teams.find((t) => t.id === teamId && !t.deletedAt);
+    if (!team) { setSelectionError({ teamId, reason: "missing" }); return; }
+    // The game's roster COPY: active players with a jersey (needsJersey girls are
+    // excluded from games until the coach assigns a free number — §5.5).
+    const roster = team.players
+      .filter((p) => !p.deletedAt && !p.needsJersey && p.jersey !== null)
+      .sort((a, b) => a.jersey - b.jersey)
+      .map((p) => JSON.parse(JSON.stringify(p)));
+    if (roster.length === 0) { setSelectionError({ teamId, reason: "empty" }); return; }
+    // D-9 initialization: ≤10 → all girls start checked (parent-spec rule
+    // unchanged); >10 → NONE checked, coach picks up to 10 for today.
+    const selInit = roster.length <= MAX_PARTICIPANTS ? roster.map((p) => p.jersey) : [];
+    const st = readSettingsStored();
+    const hm = st.defaultHalfMins, pm = PLAN_MODES[st.defaultPlanMode] ? st.defaultPlanMode : "balanced";
+    const tt = { ...SETTINGS_DEFAULTS.defaultTrackingToggles, ...st.defaultTrackingToggles };
+    gameIdentityRef.current = { selectedTeamId: team.id, teamNameAtGameTime: team.name };
+    trackingTogglesRef.current = tt;
+    // Implicit-selection contract: the pending snapshot is captured + persisted
+    // (one setItem + read-back verify) BEFORE the setup screen becomes editable.
+    const ok = persistSnapshotNow({
+      screen: "setup",
+      selectedTeamId: team.id, teamNameAtGameTime: team.name,
+      gameRosterSnapshot: roster,
+      gameConfig: { halfMins: hm, planMode: pm, trackingToggles: { ...tt } },
+      halfMins: hm, planMode: pm,
+      selected: selInit, starters: [],
+      plan: null, rotationPlan: null, editableGrid: null, gridPlayerOrderJerseys: [],
+      gameSecs: 0, onCourt: [], accumulated: {}, stintStart: {}, halftimeDone: false,
+      fouls: {}, fouledOut: [], injured: [], adjustedTargetMins: {}, subLog: [],
+      injuryInfo: {}, fouloutInfo: {}, lastSubTime: -120, offSince: {},
+      handledWindows: [], restedThisHalf: [], replacingJersey: null,
+      scoreUs: 0, scoreOpponent: 0, timeoutsUs: 0, timeoutsOpponent: 0,
+      plannedTimeouts: [], dismissedTimeouts: [],
+      lastExecutedSegId: null, planDelayUntilSecs: null, delayedSegId: null,
+      shortHandedDismissedAt: null, planStale: false,
+    });
+    if (!ok) {
+      // Persist-gate failure: there is NO path onto the setup screen without a
+      // persisted pending snapshot — block with banner + retry.
+      setSelectionError({ teamId, reason: "save" });
+      return;
+    }
+    setGameRoster(roster);
+    setSelected(new Set(selInit));
+    setStarters(new Set());
+    setHalfMins(hm); setPlanMode(pm);
+    setPlan(null); setRotationPlan(null); setEditableGrid(null); setGridPlayerOrder([]);
+    setPlanStale(false); setStaleChoiceNeeded(false); setTipoffError(false);
+    setCapMsg(roster.length > MAX_PARTICIPANTS ? `Pick up to ${MAX_PARTICIPANTS} girls for today` : null);
+    setSelectionError(null);
+    setGameInFlight(true);
+    savedScreenRef.current = "setup";
+    setScreen("setup");
+    setAppMode("app");
+  }
+
+  function startNewGameTapped() {
+    // Parent-spec rule: never lose a game silently — a saved game (readable or
+    // future-schema-blocked) must be dealt with explicitly first.
+    if (gameInFlight || blockedSave) { setNewGamePrompt(true); return; }
+    proceedNewGame();
+  }
+  function proceedNewGame() {
+    setNewGamePrompt(false);
+    const teams = listActiveTeams();
+    if (teams.length === 0) { openManageCreate(); return; } // empty-state bootstrap
+    if (teams.length === 1) { selectTeamAndStart(teams[0].id); return; } // D-4 skip
+    setAppMode("picker");
+  }
+
+  // ── Manage Teams (availability = SNAPSHOT EXISTENCE; commit-time re-check) ──
+  function manageGuardBlocked() {
+    return gameSnapshotExists() ? "Finish or discard the current game first" : null;
+  }
+  function openManage() {
+    setManageView("list"); setManageDraft(null); setManageError(null);
+    setManagePlayerEdit(null); setManageDeleteConfirm(null);
+    setAppMode("manage");
+  }
+  function openManageCreate() {
+    setManageView("edit"); setManageError(null); setManagePlayerEdit(null);
+    setManageDraft({ id: null, original: null, name: "", players: [] });
+    setAppMode("manage");
+  }
+  function openManageEdit(team) {
+    setManageView("edit"); setManageError(null); setManagePlayerEdit(null);
+    setManageDraft({
+      id: team.id, original: team, name: team.name,
+      // Draft holds ACTIVE players only; removal marks _removed (tombstoned on save).
+      players: team.players.filter((p) => !p.deletedAt).map((p) => JSON.parse(JSON.stringify(p))),
+    });
+  }
+  const MANAGE_PLAYER_FIELDS = ["name", "jersey", "rating", "color", "pos", "skills", "asthma", "foulProne"];
+  function playerFieldsChanged(a, b) {
+    return MANAGE_PLAYER_FIELDS.some((k) => JSON.stringify(a[k]) !== JSON.stringify(b[k]));
+  }
+  function saveManageDraft() {
+    const d = manageDraft;
+    if (!d) return;
+    const errors = [];
+    const name = String(d.name || "").trim();
+    if (!name) errors.push("Team name is required");
+    const kept = d.players.filter((p) => !p._removed);
+    if (kept.length < 1) errors.push("A team needs at least 1 player");
+    const seen = new Set();
+    for (const p of kept) {
+      if (p.jersey === null) continue; // a needsJersey girl may stay unresolved
+      if (seen.has(p.jersey)) errors.push(`Jersey #${p.jersey} is used twice — every girl needs her own number`);
+      seen.add(p.jersey);
+    }
+    // Commit-time guard (round-9/11 FINAL FORM): fresh snapshot re-read right
+    // before the write; reject if any pending/live game now exists. NO revert.
+    const blocked = manageGuardBlocked();
+    if (blocked) errors.push(blocked);
+    // Name uniqueness among ACTIVE teams after normalization — fresh read.
+    const others = listActiveTeams().filter((t) => t.id !== d.id);
+    if (others.some((t) => normalizeTeamName(t.name) === normalizeTeamName(name)))
+      errors.push(`A team called "${name}" already exists`);
+    if (errors.length > 0) { setManageError(errors.join(" · ")); return; }
+    const ts = nowIso();
+    let record;
+    if (d.id === null) {
+      record = {
+        schemaVersion: 1, id: newId(), name, rev: 1,
+        createdAt: ts, updatedAt: ts, aggregateUpdatedAt: ts,
+        deletedAt: null, restoredAt: null,
+        players: kept.map((p) => ({
+          playerId: p.playerId, jersey: p.jersey, name: p.name, rating: p.rating, color: p.color,
+          pos: p.pos.slice(), skills: p.skills.slice(),
+          asthma: !!p.asthma, foulProne: !!p.foulProne, isGuest: false, needsJersey: false,
+          rev: 1, createdAt: ts, updatedAt: ts, deletedAt: null, restoredAt: null,
+        })),
+      };
+    } else {
+      const orig = d.original;
+      const nameChanged = name !== orig.name;
+      const draftById = new Map(d.players.map((p) => [p.playerId, p]));
+      const players = orig.players.map((op) => {
+        const dp = draftById.get(op.playerId);
+        if (!dp) return op; // tombstoned in storage already (drafts only carry active)
+        if (dp._removed) return op.deletedAt ? op : { ...op, deletedAt: ts, rev: op.rev + 1, updatedAt: ts };
+        if (!playerFieldsChanged(op, dp)) return op;
+        return {
+          ...op, name: dp.name, jersey: dp.jersey, rating: dp.rating, color: dp.color,
+          pos: dp.pos.slice(), skills: dp.skills.slice(), asthma: !!dp.asthma, foulProne: !!dp.foulProne,
+          needsJersey: dp.jersey === null ? op.needsJersey : false,
+          rev: op.rev + 1, updatedAt: ts,
+        };
+      });
+      for (const dp of d.players) {
+        if (dp._isNew && !dp._removed) {
+          players.push({
+            playerId: dp.playerId, jersey: dp.jersey, name: dp.name, rating: dp.rating, color: dp.color,
+            pos: dp.pos.slice(), skills: dp.skills.slice(),
+            asthma: !!dp.asthma, foulProne: !!dp.foulProne, isGuest: false, needsJersey: false,
+            rev: 1, createdAt: ts, updatedAt: ts, deletedAt: null, restoredAt: null,
+          });
+        }
+      }
+      // Team rev/updatedAt are SCALAR-scoped (spec W1.b) — bumped only when the
+      // team-level name changed, never for player edits.
+      record = { ...orig, name, rev: nameChanged ? orig.rev + 1 : orig.rev, updatedAt: nameChanged ? ts : orig.updatedAt, players };
+    }
+    if (!writeTeamsEnvelope({ schemaVersion: 1, updatedAt: ts, teams: [record] })) {
+      setManageError("Couldn't save — storage failed. Nothing was changed."); return;
+    }
+    setManageView("list"); setManageDraft(null); setManageError(null); setManagePlayerEdit(null);
+  }
+  function deleteManageTeam(team) {
+    // Commit-time snapshot re-read + defence-in-depth reference check (a snapshot
+    // created in another tab microseconds ago may reference this team).
+    const blocked = manageGuardBlocked();
+    if (blocked) { setManageError(blocked); setManageDeleteConfirm(null); return; }
+    try {
+      const snap = JSON.parse(safeGet(GAME_KEY));
+      if (snap && snap.selectedTeamId === team.id) { setManageError("Finish or discard the current game first"); setManageDeleteConfirm(null); return; }
+    } catch (e) {}
+    if (listActiveTeams().filter((t) => t.id !== team.id).length === 0) {
+      setManageError("You can't delete your only team — create the new team first."); setManageDeleteConfirm(null); return;
+    }
+    const ts = nowIso();
+    if (!writeTeamsEnvelope({ schemaVersion: 1, updatedAt: ts, teams: [{ ...team, deletedAt: ts, rev: team.rev + 1, updatedAt: ts }] })) {
+      setManageError("Couldn't save — storage failed."); setManageDeleteConfirm(null); return;
+    }
+    setManageDeleteConfirm(null); setManageError(null);
+  }
+
+  // ── Roster-mutation reconciliation (§4 W2 round-3 fold) ───────────────────
+  // Identity is remapped by playerId; a removed player is dropped from
+  // selected/starters and her grid COLUMN deleted; every jersey-keyed plan
+  // structure is remapped so no structure retains a jersey that no longer
+  // exists in the pending snapshot.
+  function computeRosterReconciliation(newRoster, planningInputChanged) {
+    const newByPid = new Map(newRoster.map((p) => [p.playerId, p]));
+    const oldJerseyToNew = new Map();
+    for (const op of gameRoster) {
+      const np = newByPid.get(op.playerId);
+      oldJerseyToNew.set(op.jersey, np ? np.jersey : undefined);
+    }
+    const remapJ = (j) => oldJerseyToNew.has(j) ? oldJerseyToNew.get(j) : undefined;
+    const remapArr = (arr) => (arr || []).map(remapJ).filter((j) => j !== undefined && j !== null);
+    const remapKeys = (obj) => {
+      const out = {};
+      for (const k of Object.keys(obj || {})) {
+        const nj = remapJ(Number(k));
+        if (nj !== undefined && nj !== null) out[nj] = obj[k];
+      }
+      return out;
+    };
+    const nextSelected = remapArr([...selected]);
+    const nextStarters = remapArr([...starters]);
+    let nextOrder = gridPlayerOrder, nextGrid = editableGrid;
+    if (gridPlayerOrder.length > 0) {
+      const keptIdx = [];
+      const order = [];
+      gridPlayerOrder.forEach((p, i) => {
+        const np = newByPid.get(p.playerId);
+        if (np) { keptIdx.push(i); order.push(np); }
+      });
+      nextOrder = order;
+      if (editableGrid) nextGrid = editableGrid.map((row) => keptIdx.map((i) => row[i]));
+    }
+    let nextRotationPlan = rotationPlan;
+    if (rotationPlan) {
+      nextRotationPlan = {
+        ...rotationPlan,
+        starters: remapArr(rotationPlan.starters),
+        segments: (rotationPlan.segments || []).map((s) => ({ ...s, onCourt: remapArr(s.onCourt) })),
+        targetMinutes: remapKeys(rotationPlan.targetMinutes),
+        actualMinutes: rotationPlan.actualMinutes ? remapKeys(rotationPlan.actualMinutes) : rotationPlan.actualMinutes,
+      };
+    }
+    let nextPlan = plan;
+    if (plan) {
+      nextPlan = {
+        ...plan,
+        starting: (plan.starting || []).map((p) => newByPid.get(p.playerId)).filter(Boolean),
+        targetMins: remapKeys(plan.targetMins),
+      };
+    }
+    const stale = planStale || (!!planningInputChanged && (rotationPlan !== null || editableGrid !== null));
+    return {
+      roster: newRoster, selected: nextSelected, starters: nextStarters,
+      gridPlayerOrder: nextOrder, editableGrid: nextGrid,
+      rotationPlan: nextRotationPlan, plan: nextPlan,
+      adjustedTargetMins: remapKeys(adjustedTargetMins), planStale: stale,
+    };
+  }
+  function reconciliationOverrides(rec) {
+    return {
+      gameRosterSnapshot: rec.roster,
+      selected: rec.selected, starters: rec.starters,
+      gridPlayerOrderJerseys: rec.gridPlayerOrder.map((p) => p.jersey),
+      editableGrid: rec.editableGrid || null,
+      rotationPlan: rec.rotationPlan || null,
+      plan: rec.plan,
+      adjustedTargetMins: rec.adjustedTargetMins,
+      planStale: rec.planStale,
+    };
+  }
+  function applyRosterReconciliation(rec) {
+    setGameRoster(rec.roster);
+    setSelected(new Set(rec.selected));
+    setStarters(new Set(rec.starters));
+    setGridPlayerOrder(rec.gridPlayerOrder);
+    setEditableGrid(rec.editableGrid);
+    setRotationPlan(rec.rotationPlan);
+    setPlan(rec.plan);
+    setAdjustedTargetMins(rec.adjustedTargetMins);
+    setPlanStale(rec.planStale);
+  }
+
+  // Apply a pending-roster change: persist the snapshot FIRST (verified — the
+  // pending snapshot persists on every change), then mirror into state. For
+  // permanent edits, wrap in the two-phase journal protocol (§4 W2 round-4/5/6).
+  function applyPendingRosterChange(newRoster, { planningInput = false, addJersey = null, op = null } = {}) {
+    const rec = computeRosterReconciliation(newRoster, planningInput);
+    if (addJersey !== null && addJersey !== undefined) {
+      if (rec.selected.length < MAX_PARTICIPANTS) rec.selected = [...rec.selected, addJersey];
+      else setCapMsg(`She's on today's roster, but ${MAX_PARTICIPANTS} girls are already playing — untick someone to swap her in`);
+    }
+    if (op) {
+      // Phase 1: journal op appended as PREPARED (setItem + verify).
+      if (!writeRepairEnvelope([op])) { showToast("⚠ Couldn't record the change — nothing was changed"); return false; }
+      // Phase 2: pending snapshot updated (one setItem + verify).
+      if (!persistSnapshotNow(reconciliationOverrides(rec))) {
+        // Broken half-edit: roll the prepared op back — nothing user-visible changed.
+        writeRepairEnvelope([{ ...op, status: "cleared", statusAt: nowIso(), outcome: "rolledback" }]);
+        showToast("⚠ Couldn't save the change — nothing was changed");
+        return false;
+      }
+      applyRosterReconciliation(rec);
+      // Phase 3: committed, then the teams envelope via §5.5 merge-on-write.
+      const committed = { ...op, status: "committed", statusAt: nowIso() };
+      writeRepairEnvelope([committed]);
+      const post = replayCommittedOp(committed);
+      if (post === "applied") {
+        writeRepairEnvelope([{ ...committed, status: "cleared", statusAt: nowIso(), outcome: "applied" }]);
+      } else if (post === "superseded") {
+        // Postcondition-verified clearing: a fresher edit won — never silent.
+        writeRepairEnvelope([{ ...committed, status: "cleared", statusAt: nowIso(), outcome: "superseded" }]);
+        showToast("Heads up: a later edit to the saved team replaced this change there — today's game keeps your version");
+      }
+      // post === null → op stays committed; repair-on-load replays it until it lands.
+      return true;
+    }
+    if (!persistSnapshotNow(reconciliationOverrides(rec))) {
+      showToast("⚠ Couldn't save the change — nothing was changed");
+      return false;
+    }
+    applyRosterReconciliation(rec);
+    return true;
+  }
+
+  // Saved-team player record (fresh read) — permanent edits need its current rev.
+  function savedTeamPlayer(playerId) {
+    const env = readTeamsEnvelopeFresh();
+    const team = env && env.teams.find((t) => t.id === gameIdentityRef.current.selectedTeamId);
+    return team ? team.players.find((p) => p.playerId === playerId) || null : null;
+  }
+  function makeRepairOp(type, targetPlayerId, payload, rev) {
+    const ts = nowIso();
+    return { opId: newId(), type, teamId: gameIdentityRef.current.selectedTeamId, targetPlayerId, payload, rev, ts, status: "prepared", statusAt: ts };
+  }
+  const PLANNING_FIELDS = ["rating", "pos", "skills", "foulProne"]; // §4 W2 staleness inputs (attribute class)
+
+  // ── Setup-screen roster editing (D-7 guests + two-key permanent edits) ─────
+  function commitGuestAdd(permanent) {
+    const v = validatePlayerDraft(guestForm.draft);
+    const errors = [...v.errors];
+    // Jersey uniqueness is enforced across the ENTIRE pending snapshot — every
+    // player carried in it, available or deselected, member or guest (D-7 rule:
+    // a guest may NOT take the regular #8's number just because she's away today).
+    if (v.player.jersey !== null && gameRoster.some((p) => p.jersey === v.player.jersey))
+      errors.push(`#${v.player.jersey} is already taken in this game — pick a free number`);
+    if (errors.length > 0) { setGuestForm({ ...guestForm, error: errors.join(" · ") }); return; }
+    const ts = nowIso();
+    // Pre-generated identity (op schema rule): replay can never mint a duplicate.
+    const playerId = newId();
+    const newPlayer = { playerId, ...v.player, isGuest: !permanent, needsJersey: false, rev: 1, createdAt: ts, updatedAt: ts, deletedAt: null, restoredAt: null };
+    const newRoster = [...gameRoster, newPlayer].sort((a, b) => a.jersey - b.jersey);
+    let op = null;
+    if (permanent) {
+      op = makeRepairOp("addPlayer", playerId, {
+        jersey: newPlayer.jersey, name: newPlayer.name, rating: newPlayer.rating, color: newPlayer.color,
+        pos: newPlayer.pos, skills: newPlayer.skills, asthma: newPlayer.asthma, foulProne: newPlayer.foulProne,
+        isGuest: false, needsJersey: false,
+      }, 1);
+    }
+    if (applyPendingRosterChange(newRoster, { planningInput: true, addJersey: newPlayer.jersey, op })) setGuestForm(null);
+  }
+  function commitSetupEdit(scope) { // "game" (this game only) | "team" (permanently)
+    const target = gameRoster.find((p) => p.playerId === setupEdit.playerId);
+    if (!target) { setSetupEdit(null); return; }
+    const v = validatePlayerDraft(setupEdit.draft);
+    const errors = [...v.errors];
+    if (v.player.jersey !== null && gameRoster.some((p) => p.playerId !== target.playerId && p.jersey === v.player.jersey))
+      errors.push(`#${v.player.jersey} is already taken in this game`);
+    if (errors.length > 0) { setSetupEdit({ ...setupEdit, error: errors.join(" · ") }); return; }
+    const changed = {};
+    for (const k of MANAGE_PLAYER_FIELDS) {
+      if (JSON.stringify(v.player[k]) !== JSON.stringify(target[k])) changed[k] = v.player[k];
+    }
+    if (Object.keys(changed).length === 0) { setSetupEdit(null); return; }
+    const planningInput = PLANNING_FIELDS.some((k) => changed[k] !== undefined);
+    const ts = nowIso();
+    const newRoster = gameRoster
+      .map((p) => p.playerId === target.playerId ? { ...p, ...changed, rev: p.rev + 1, updatedAt: ts } : p)
+      .sort((a, b) => a.jersey - b.jersey);
+    let op = null;
+    if (scope === "team") {
+      const saved = savedTeamPlayer(target.playerId);
+      if (!saved) { setSetupEdit({ ...setupEdit, error: "She's a fill-in, not on the saved team — use \"this game only\"" }); return; }
+      op = makeRepairOp("editPlayer", target.playerId, changed, saved.rev + 1);
+    }
+    if (applyPendingRosterChange(newRoster, { planningInput, op })) setSetupEdit(null);
+  }
+  function commitSetupRemove(scope) {
+    const target = gameRoster.find((p) => p.playerId === setupEdit.playerId);
+    if (!target) { setSetupEdit(null); return; }
+    // Explicit confirm NAMING the player (spec accidental-removal mitigation).
+    const label = `${target.name}${target.jersey !== null ? " #" + target.jersey : ""}`;
+    if (!window.confirm(scope === "team"
+      ? `Remove ${label} from ${gameIdentityRef.current.teamNameAtGameTime}? She also leaves today's game.`
+      : `Take ${label} out of today's game?`)) return;
+    const newRoster = gameRoster.filter((p) => p.playerId !== target.playerId);
+    let op = null;
+    if (scope === "team") {
+      const saved = savedTeamPlayer(target.playerId);
+      if (saved) op = makeRepairOp("removePlayer", target.playerId, {}, saved.rev + 1);
+    }
+    if (applyPendingRosterChange(newRoster, { planningInput: true, op })) setSetupEdit(null);
+  }
+  function regenerateFromStale() {
+    setPlanStale(false);
+    setStaleChoiceNeeded(false);
+    const starterObjs = available.filter((p) => starters.has(p.jersey));
+    if (starterObjs.length === 5 && satisfiesHardRules(starterObjs)) handleGeneratePlan();
+    else setScreen("start5"); // starting 5 no longer valid — re-pick, then Generate
   }
 
   // Persist settings toggles independently of game state
@@ -2314,7 +3086,7 @@ function App() {
     }
   }, [gameSecs, halfMins, running, onCourt, stintStart]);
 
-  const available = useMemo(() => ROSTER.filter(p => selected.has(p.jersey)), [selected]);
+  const available = useMemo(() => gameRoster.filter(p => selected.has(p.jersey)), [gameRoster, selected]);
   const totalGameSecs = halfMins * 2 * 60;
   // Clock adjustment helper — updates both gameSecs AND the timestamp anchor
   // so the running interval doesn't snap the clock back to its old position.
@@ -2420,11 +3192,23 @@ function App() {
   );
 
   function togglePlayer(jersey) {
+    // D-9 persistent invariant: participating ≤ 10, enforced at the toggle (the
+    // 11th is blocked with a message, never silently).
+    if (!selected.has(jersey) && selected.size >= MAX_PARTICIPANTS) {
+      setCapMsg(`Up to ${MAX_PARTICIPANTS} girls can play in one game — untick someone first`);
+      return;
+    }
+    setCapMsg(null);
     setSelected(prev => {
       const next = new Set(prev);
-      next.has(jersey) ? next.delete(jersey) : next.add(jersey);
+      if (next.has(jersey)) { next.delete(jersey); return next; }
+      if (next.size >= MAX_PARTICIPANTS) return prev; // rapid-tap guard for the same invariant
+      next.add(jersey);
       return next;
     });
+    // §4 W2 plan staleness: an availability toggle changes the participating
+    // count — a pre-game plan built on the old count is stale (round-5 widening).
+    if (!(screen === "game" || (gameSecs > 0 && !gameOver)) && (rotationPlan || editableGrid)) setPlanStale(true);
   }
 
   function handlePickStarters() {
@@ -2618,6 +3402,9 @@ function App() {
     setAdjustedTargetMins(rp ? { ...Object.fromEntries(
       Object.entries(rp.targetMinutes).map(([j, m]) => [j, Math.round(m * 10) / 10])
     )} : { ...newPlan.targetMins });
+    // A freshly generated plan matches the current roster/availability by definition.
+    setPlanStale(false);
+    setStaleChoiceNeeded(false);
     setScreen("plan");
   }
 
@@ -2649,6 +3436,17 @@ function App() {
   }
 
   function handleStartGame() {
+    // §4 W2 plan staleness is a progression checkpoint: the coach must choose
+    // Regenerate or Keep explicitly before tip-off (no silent regeneration).
+    if (planStale) { setStaleChoiceNeeded(true); return; }
+    // Pre-game: a kept grid may still contain a girl the coach has since
+    // unticked — starting would put a non-participant on court.
+    const availSet = new Set(available.map(p => p.jersey));
+    const ghost = gridPlayerOrder.find(p => !availSet.has(p.jersey));
+    if (ghost) {
+      alert(`${ghost.name} #${ghost.jersey} is in the rotation grid but not ticked to play today.\n\nRegenerate the plan, or tick her on the setup screen.`);
+      return;
+    }
     // Validate grid: every row must have exactly 5 players
     if (gridHasInvalidRows()) return;
     // Sync editable grid back into rotationPlan before starting
@@ -2668,6 +3466,30 @@ function App() {
       if (courtJerseys.includes(p.jersey)) stint[p.jersey] = 0;
       else off[p.jersey] = 0; // bench-sitting since tip-off
     });
+    // Use V3 plan targets if available, fallback to reactive engine targets
+    const targetSource = syncedPlan?.targetMinutes || rotationPlan?.targetMinutes || plan?.targetMins || {};
+    // Seed carousel: bench players have already "rested" relative to starters
+    // (especially critical for 6-player / 1-bench games).
+    const initialBench = available
+      .filter(p => !courtJerseys.includes(p.jersey))
+      .map(p => p.jersey);
+    // §4 W2: Start Game is a PERSISTENCE-GATED transition — the final v2 snapshot
+    // must be written AND read-back verified BEFORE the app enters the live game
+    // screen. On failure: stay pre-game with the save-failure banner (retry/cancel);
+    // never enter live mode on memory-only state.
+    const persisted = persistSnapshotNow({
+      screen: "game",
+      gameSecs: 0, onCourt: courtJerseys, accumulated: acc, stintStart: stint, offSince: off,
+      halftimeDone: false, fouls: {}, fouledOut: [], injured: [],
+      adjustedTargetMins: { ...targetSource }, subLog: [], injuryInfo: {}, fouloutInfo: {},
+      lastSubTime: -120, handledWindows: [], restedThisHalf: initialBench, replacingJersey: null,
+      scoreUs: 0, scoreOpponent: 0, timeoutsUs: 0, timeoutsOpponent: 0,
+      rotationPlan: (syncedPlan || rotationPlan) || null,
+      dismissedTimeouts: [], lastExecutedSegId: null,
+      planDelayUntilSecs: null, delayedSegId: null, shortHandedDismissedAt: null,
+    });
+    if (!persisted) { setTipoffError(true); return; }
+    setTipoffError(false);
     setOnCourt(courtJerseys);
     setAccumulated(acc);
     setStintStart(stint);
@@ -2682,8 +3504,6 @@ function App() {
     setActiveMenu(null);
     setBenchMenu(null);
     setReplacingJersey(null);
-    // Use V3 plan targets if available, fallback to reactive engine targets
-    const targetSource = syncedPlan?.targetMinutes || rotationPlan?.targetMinutes || plan?.targetMins || {};
     setAdjustedTargetMins({ ...targetSource });
     setSubLog([]);
     setLastSubTime(-120);
@@ -2693,12 +3513,6 @@ function App() {
     setLastExecutedSegId(null);      // prevent stale executor skip
     setDelayedSegId(null);
     setPlanDelayUntilSecs(null);
-    // Seed carousel: bench players have already "rested" relative to starters,
-    // so mark them to prevent the first-cycle carousel from pulling them right
-    // back off after they enter (especially critical for 6-player / 1-bench).
-    const initialBench = available
-      .filter(p => !courtJerseys.includes(p.jersey))
-      .map(p => p.jersey);
     setRestedThisHalf(new Set(initialBench));
     setScoreUs(0); setScoreOpponent(0);
     setTimeoutsUs(0); setTimeoutsOpponent(0);
@@ -3219,7 +4033,7 @@ function App() {
       if (cur >= 5) return;
       if (cur === 4) {
         // 5th foul — ask BEFORE mutating any state
-        const p = ROSTER.find(pl => pl.jersey === jersey);
+        const p = gameRoster.find(pl => pl.jersey === jersey);
         const name = p ? `#${p.jersey} ${p.name}` : `#${jersey}`;
         if (window.confirm(`5th foul for ${name}. Foul out this player?`)) {
           pushUndo("5th foul + foul out #" + jersey);
@@ -3632,7 +4446,7 @@ function App() {
     if (!rotationPlan) return; // reactive engine handles its own short-handed check
     if (pendingSub && pendingSub.mandatory) return; // already showing an emergency prompt
 
-    const onCourtPlayers = onCourt.map(j => ROSTER.find(p => p.jersey === j)).filter(Boolean);
+    const onCourtPlayers = onCourt.map(j => gameRoster.find(p => p.jersey === j)).filter(Boolean);
     const benchAvail = available.filter(p =>
       !onCourt.includes(p.jersey) && !unavailableJerseys.has(p.jersey));
 
@@ -4257,7 +5071,7 @@ function App() {
     return courtTime(jersey) - paceFor(jersey);
   }
 
-  const pObj = (jersey) => ROSTER.find(p => p.jersey === jersey);
+  const pObj = (jersey) => gameRoster.find(p => p.jersey === jersey);
 
   // ── SCORE HELPERS ──────────────────────────────────────────────────────────
   function addScore(team, pts) {
@@ -4295,6 +5109,283 @@ function App() {
   }
 
   // ── SETUP SCREEN ────────────────────────────────────────────────────────────
+  // ═══ WAVE 2 SCREENS (app-level, never persisted as snapshot screens) ═══
+  const pageStyle = { minHeight: "100vh", backgroundColor: "#0f172a", padding: "16px", fontFamily: "system-ui, sans-serif" };
+  const cardStyle = { background: "#1e293b", borderRadius: 16, padding: 16, marginBottom: 12 };
+  const bigBtn = (bg, enabled = true) => ({
+    width: "100%", padding: "16px", borderRadius: 16, border: "none", marginBottom: 10,
+    cursor: enabled ? "pointer" : "not-allowed", background: enabled ? bg : "#334155",
+    color: "#fff", fontSize: 17, fontWeight: 700, opacity: enabled ? 1 : 0.7,
+  });
+  const smallBtn = (bg = "#334155") => ({ padding: "8px 14px", borderRadius: 10, border: "none", background: bg, color: "#fff", fontSize: 13, fontWeight: 700, cursor: "pointer" });
+
+  // ── LANDING SCREEN — the boot screen, always (§4 W2) ────────────────────────
+  if (appMode === "landing") {
+    const activeTeams = listActiveTeams();
+    const snapExists = gameInFlight || blockedSave;
+    return (
+      <div style={pageStyle}>
+        <div style={{ maxWidth: 400, margin: "0 auto" }}>
+          <StorageNoticesBanner />
+          <div style={{ background: "linear-gradient(135deg,#1e3a8a,#1d4ed8)", borderRadius: 20, padding: "24px 20px 20px", marginBottom: 16, textAlign: "center" }}>
+            <div style={{ display: "flex", justifyContent: "center", marginBottom: 10 }}>
+              <CoachKLogo size={88} />
+            </div>
+            <div style={{ color: "#fff", fontSize: 18, fontWeight: 700, letterSpacing: 0.3 }}>Coach K Sub Planner</div>
+          </div>
+
+          {selectionError && (
+            <div style={{ background: "#7f1d1d", border: "1px solid #ef4444", borderRadius: 12, padding: 12, marginBottom: 12 }}>
+              <div style={{ color: "#fecaca", fontSize: 13, fontWeight: 700, marginBottom: 8 }}>
+                {selectionError.reason === "save"
+                  ? "⚠ Couldn't save the new game — nothing was started."
+                  : selectionError.reason === "empty"
+                    ? "⚠ That team has no players with jersey numbers yet — add them in Manage Teams."
+                    : "⚠ That team isn't available any more."}
+              </div>
+              {selectionError.reason === "save" && (
+                <button onClick={() => selectTeamAndStart(selectionError.teamId)} style={smallBtn("#b91c1c")}>Try again</button>
+              )}
+              <button onClick={() => setSelectionError(null)} style={{ ...smallBtn(), marginLeft: 8 }}>Dismiss</button>
+            </div>
+          )}
+
+          {gameInFlight && (
+            <button onClick={() => setAppMode("app")} style={bigBtn("linear-gradient(135deg,#15803d,#22c55e)")}>
+              ▶ Continue Game
+            </button>
+          )}
+          {blockedSave && (
+            <div style={{ ...cardStyle, border: "1px solid #f59e0b" }}>
+              <div style={{ color: "#fbbf24", fontSize: 13, fontWeight: 700 }}>A game saved by a newer app version is stored here.</div>
+              <div style={{ color: "#fde68a", fontSize: 12, marginTop: 4 }}>It can't be continued in this version. Start a new game to discard it, or update the app.</div>
+            </div>
+          )}
+          {activeTeams.length > 0 ? (
+            <button onClick={startNewGameTapped} style={bigBtn("linear-gradient(135deg,#1d4ed8,#7c3aed)")}>
+              🏀 New Game
+            </button>
+          ) : (
+            <button onClick={() => { if (!snapExists) openManageCreate(); }} disabled={snapExists} style={bigBtn("linear-gradient(135deg,#1d4ed8,#7c3aed)", !snapExists)}>
+              ＋ Create your first team
+            </button>
+          )}
+          <button onClick={() => { if (!snapExists) openManage(); }} disabled={snapExists} style={bigBtn("#334155", !snapExists)}>
+            👥 Manage Teams
+          </button>
+          {snapExists && (
+            <div style={{ color: "#94a3b8", fontSize: 12, textAlign: "center", marginTop: -4 }}>
+              Manage Teams: finish or discard the current game first
+            </div>
+          )}
+
+          {newGamePrompt && (
+            <div style={{ ...cardStyle, border: "1px solid #f59e0b", marginTop: 12 }}>
+              <div style={{ color: "#fbbf24", fontSize: 13, fontWeight: 700, marginBottom: 6 }}>⚠ A game is already saved</div>
+              <div style={{ color: "#fde68a", fontSize: 12, marginBottom: 10 }}>
+                Starting a new game will throw away the saved one — its minutes and score are lost for good.
+              </div>
+              {gameInFlight && (
+                <button onClick={() => { setNewGamePrompt(false); setAppMode("app"); }} style={{ ...bigBtn("#15803d"), padding: "12px" }}>
+                  ▶ Keep playing that game
+                </button>
+              )}
+              <button onClick={() => { discardSavedGame(); proceedNewGame(); }} style={{ ...bigBtn("#b91c1c"), padding: "12px" }}>
+                🗑 Discard it and start a new game
+              </button>
+              <button onClick={() => setNewGamePrompt(false)} style={{ ...bigBtn("#334155"), padding: "12px", marginBottom: 0 }}>
+                Cancel
+              </button>
+            </div>
+          )}
+        </div>
+      </div>
+    );
+  }
+
+  // ── TEAM PICKER (≥2 active teams; §4 W2 / D-4) ──────────────────────────────
+  if (appMode === "picker") {
+    const activeTeams = listActiveTeams();
+    return (
+      <div style={pageStyle}>
+        <div style={{ maxWidth: 400, margin: "0 auto" }}>
+          <StorageNoticesBanner />
+          <div style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 16 }}>
+            <button onClick={() => { setSelectionError(null); setAppMode("landing"); }} style={smallBtn()}>← Back</button>
+            <div style={{ color: "#fff", fontSize: 18, fontWeight: 700 }}>Who are we coaching?</div>
+          </div>
+          {selectionError && (
+            <div style={{ background: "#7f1d1d", border: "1px solid #ef4444", borderRadius: 12, padding: 12, marginBottom: 12 }}>
+              <div style={{ color: "#fecaca", fontSize: 13, fontWeight: 700, marginBottom: 8 }}>
+                {selectionError.reason === "save" ? "⚠ Couldn't save the new game — nothing was started." : "⚠ That team can't start a game right now."}
+              </div>
+              {selectionError.reason === "save" && (
+                <button onClick={() => selectTeamAndStart(selectionError.teamId)} style={smallBtn("#b91c1c")}>Try again</button>
+              )}
+            </div>
+          )}
+          {activeTeams.map((t) => (
+            <button key={t.id} onClick={() => selectTeamAndStart(t.id)}
+              style={{ ...bigBtn("#1e293b"), textAlign: "left", border: "1px solid #334155", display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+              <span>{t.name}</span>
+              <span style={{ color: "#64748b", fontSize: 13, fontWeight: 600 }}>
+                {t.players.filter((p) => !p.deletedAt).length} players
+              </span>
+            </button>
+          ))}
+        </div>
+      </div>
+    );
+  }
+
+  // ── MANAGE TEAMS (§4 W2 CRUD; only reachable while NO snapshot exists) ─────
+  if (appMode === "manage") {
+    const activeTeams = listActiveTeams();
+    if (manageView === "edit" && manageDraft) {
+      const kept = manageDraft.players.filter((p) => !p._removed);
+      const needsJerseyGirls = kept.filter((p) => p.jersey === null);
+      return (
+        <div style={pageStyle}>
+          <div style={{ maxWidth: 400, margin: "0 auto" }}>
+            <StorageNoticesBanner />
+            <div style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 16 }}>
+              <button onClick={() => { setManageView("list"); setManageDraft(null); setManageError(null); setManagePlayerEdit(null); }} style={smallBtn()}>← Back</button>
+              <div style={{ color: "#fff", fontSize: 18, fontWeight: 700 }}>{manageDraft.id === null ? "New Team" : "Edit Team"}</div>
+            </div>
+            {manageError && (
+              <div style={{ background: "#7f1d1d", border: "1px solid #ef4444", borderRadius: 12, padding: 12, marginBottom: 12, color: "#fecaca", fontSize: 13, fontWeight: 600 }}>
+                ⚠ {manageError}
+              </div>
+            )}
+            {needsJerseyGirls.length > 0 && (
+              <div style={{ background: "#422006", border: "1px solid #f59e0b", borderRadius: 12, padding: 12, marginBottom: 12, color: "#fde68a", fontSize: 12 }}>
+                {needsJerseyGirls.map((p) => p.name).join(", ")} {needsJerseyGirls.length === 1 ? "needs" : "need"} a jersey number
+                (two girls ended up with the same one). They sit out of games until you give them a free number.
+              </div>
+            )}
+            <div style={cardStyle}>
+              <div style={{ color: "#94a3b8", fontSize: 12, fontWeight: 700, letterSpacing: 1, marginBottom: 6 }}>TEAM NAME</div>
+              <input value={manageDraft.name} placeholder="e.g. Lakeside Lakers"
+                onChange={(e) => setManageDraft({ ...manageDraft, name: e.target.value })}
+                style={{ width: "100%", padding: "12px", borderRadius: 10, border: "1px solid #334155", background: "#0f172a", color: "#fff", fontSize: 16 }} />
+            </div>
+            <div style={cardStyle}>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 10 }}>
+                <div style={{ color: "#94a3b8", fontSize: 12, fontWeight: 700, letterSpacing: 1 }}>PLAYERS ({kept.length})</div>
+                <button onClick={() => setManagePlayerEdit({ index: null, draft: { name: "", jersey: "", rating: "", pos: [], skills: [], color: nextFreeColor(kept), asthma: false, foulProne: false } })}
+                  style={smallBtn("#1d4ed8")}>＋ Add player</button>
+              </div>
+              {kept.length === 0 && <div style={{ color: "#64748b", fontSize: 13 }}>No players yet — add at least one.</div>}
+              {kept.map((p) => {
+                const realIdx = manageDraft.players.indexOf(p);
+                return (
+                  <div key={p.playerId} style={{ display: "flex", alignItems: "center", gap: 10, padding: "8px 10px", borderRadius: 10, marginBottom: 6, background: "#0f172a", border: "1px solid #1e293b" }}>
+                    <div style={{ width: 32, height: 32, borderRadius: "50%", background: p.color, display: "flex", alignItems: "center", justifyContent: "center", color: "#fff", fontSize: 12, fontWeight: 700, flexShrink: 0 }}>
+                      {p.jersey === null ? "?" : "#" + p.jersey}
+                    </div>
+                    <div style={{ flex: 1 }}>
+                      <div style={{ color: "#fff", fontSize: 14, fontWeight: 600 }}>{p.name}</div>
+                      <div style={{ color: "#64748b", fontSize: 11 }}>{p.pos.join("/")} · rating {p.rating}</div>
+                    </div>
+                    <button onClick={() => setManagePlayerEdit({ index: realIdx, draft: { name: p.name, jersey: p.jersey === null ? "" : String(p.jersey), rating: String(p.rating), pos: p.pos.slice(), skills: p.skills.slice(), color: p.color, asthma: !!p.asthma, foulProne: !!p.foulProne } })}
+                      style={smallBtn()}>✎</button>
+                  </div>
+                );
+              })}
+            </div>
+            <button onClick={saveManageDraft} style={bigBtn("linear-gradient(135deg,#15803d,#22c55e)")}>💾 Save Team</button>
+
+            {managePlayerEdit && (
+              <div style={{ position: "fixed", inset: 0, background: "rgba(2,6,23,0.85)", display: "flex", alignItems: "center", justifyContent: "center", padding: 16, zIndex: 50 }}>
+                <div style={{ background: "#1e293b", borderRadius: 16, padding: 16, width: "100%", maxWidth: 380, maxHeight: "90vh", overflowY: "auto" }}>
+                  <div style={{ color: "#fff", fontSize: 16, fontWeight: 700, marginBottom: 4 }}>
+                    {managePlayerEdit.index === null ? "Add Player" : "Edit " + manageDraft.players[managePlayerEdit.index].name}
+                  </div>
+                  {managePlayerEdit.error && (
+                    <div style={{ background: "#7f1d1d", borderRadius: 10, padding: 10, margin: "8px 0", color: "#fecaca", fontSize: 12, fontWeight: 600 }}>⚠ {managePlayerEdit.error}</div>
+                  )}
+                  <PlayerFields draft={managePlayerEdit.draft} onChange={(nd) => setManagePlayerEdit({ ...managePlayerEdit, draft: nd })} />
+                  <div style={{ display: "flex", gap: 8, marginTop: 14 }}>
+                    <button style={{ ...smallBtn("#15803d"), flex: 1, padding: "12px" }} onClick={() => {
+                      const v = validatePlayerDraft(managePlayerEdit.draft);
+                      const errors = [...v.errors];
+                      if (v.player.jersey !== null) {
+                        const clash = kept.some((p, i) => manageDraft.players.indexOf(p) !== managePlayerEdit.index && p.jersey === v.player.jersey);
+                        if (clash) errors.push(`#${v.player.jersey} is already taken in this team`);
+                      }
+                      if (errors.length > 0) { setManagePlayerEdit({ ...managePlayerEdit, error: errors.join(" · ") }); return; }
+                      const players = manageDraft.players.slice();
+                      if (managePlayerEdit.index === null) {
+                        players.push({ playerId: newId(), ...v.player, isGuest: false, needsJersey: false, _isNew: true });
+                      } else {
+                        players[managePlayerEdit.index] = { ...players[managePlayerEdit.index], ...v.player };
+                      }
+                      setManageDraft({ ...manageDraft, players });
+                      setManagePlayerEdit(null);
+                    }}>Done</button>
+                    <button style={{ ...smallBtn(), flex: 1, padding: "12px" }} onClick={() => setManagePlayerEdit(null)}>Cancel</button>
+                  </div>
+                  {managePlayerEdit.index !== null && (
+                    <button style={{ ...smallBtn("#7f1d1d"), width: "100%", marginTop: 8, padding: "12px" }} onClick={() => {
+                      // Spec: removal requires an explicit confirm NAMING the player.
+                      const p = manageDraft.players[managePlayerEdit.index];
+                      if (!window.confirm(`Remove ${p.name}${p.jersey !== null ? " #" + p.jersey : ""} from ${manageDraft.name || "this team"}?`)) return;
+                      const players = manageDraft.players.slice();
+                      if (players[managePlayerEdit.index]._isNew) players.splice(managePlayerEdit.index, 1);
+                      else players[managePlayerEdit.index] = { ...players[managePlayerEdit.index], _removed: true };
+                      setManageDraft({ ...manageDraft, players });
+                      setManagePlayerEdit(null);
+                    }}>Remove from team…</button>
+                  )}
+                </div>
+              </div>
+            )}
+          </div>
+        </div>
+      );
+    }
+    return (
+      <div style={pageStyle}>
+        <div style={{ maxWidth: 400, margin: "0 auto" }}>
+          <StorageNoticesBanner />
+          <div style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 16 }}>
+            <button onClick={() => { setManageError(null); setAppMode("landing"); }} style={smallBtn()}>← Back</button>
+            <div style={{ color: "#fff", fontSize: 18, fontWeight: 700 }}>Manage Teams</div>
+          </div>
+          {manageError && (
+            <div style={{ background: "#7f1d1d", border: "1px solid #ef4444", borderRadius: 12, padding: 12, marginBottom: 12, color: "#fecaca", fontSize: 13, fontWeight: 600 }}>
+              ⚠ {manageError}
+            </div>
+          )}
+          {activeTeams.length === 0 && (
+            <div style={cardStyle}>
+              <div style={{ color: "#fff", fontSize: 15, fontWeight: 700, marginBottom: 6 }}>No teams yet</div>
+              <div style={{ color: "#94a3b8", fontSize: 13 }}>Create your first team to start planning games.</div>
+            </div>
+          )}
+          {activeTeams.map((t) => {
+            const count = t.players.filter((p) => !p.deletedAt).length;
+            return (
+              <div key={t.id} style={{ ...cardStyle, display: "flex", alignItems: "center", gap: 10 }}>
+                <div style={{ flex: 1 }}>
+                  <div style={{ color: "#fff", fontSize: 15, fontWeight: 700 }}>{t.name}</div>
+                  <div style={{ color: "#64748b", fontSize: 12 }}>{count} player{count !== 1 ? "s" : ""}</div>
+                </div>
+                <button onClick={() => openManageEdit(t)} style={smallBtn("#1d4ed8")}>Edit</button>
+                {manageDeleteConfirm === t.id ? (
+                  <button onClick={() => deleteManageTeam(t)} style={smallBtn("#dc2626")}>⚠ Confirm</button>
+                ) : (
+                  <button onClick={() => { setManageDeleteConfirm(t.id); setManageError(null); }} style={smallBtn("#7f1d1d")}>Delete</button>
+                )}
+              </div>
+            );
+          })}
+          <button onClick={openManageCreate} style={bigBtn("linear-gradient(135deg,#1d4ed8,#7c3aed)")}>＋ New Team</button>
+        </div>
+      </div>
+    );
+  }
+
   if (screen === "setup") return (
     <div style={{ minHeight: "100vh", backgroundColor: "#0f172a", padding: "16px", fontFamily: "system-ui, sans-serif" }}>
       <div style={{ maxWidth: 400, margin: "0 auto" }}>
@@ -4307,42 +5398,32 @@ function App() {
           <div style={{ color: "#93c5fd", fontSize: 11, marginTop: 2 }}>Roadies 005</div>
         </div>
 
-        {hasSavedGame && (
-          <div style={{ background: "#422006", border: "1px solid #f59e0b", borderRadius: 16, padding: 14, marginBottom: 12 }}>
-            <div style={{ color: "#fbbf24", fontSize: 12, fontWeight: 700, letterSpacing: 1, marginBottom: 6 }}>⚠ SAVED GAME FOUND</div>
-            <div style={{ color: "#fde68a", fontSize: 13, marginBottom: 10 }}>
-              A game is in progress. Tap Resume to jump back into it (clock stays paused), or discard to start fresh.
-            </div>
-            <div style={{ display: "flex", gap: 8 }}>
-              <button onClick={() => { setConfirmDiscard(false); setScreen(savedScreenRef.current); }}
-                style={{ flex: 1, padding: "10px", borderRadius: 10, border: "none", background: "#22c55e", color: "#052e16", fontSize: 14, fontWeight: 700, cursor: "pointer" }}>
-                ▶ Resume Game
+        <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 12 }}>
+          <button onClick={() => { setConfirmDiscard(false); setAppMode("landing"); }}
+            style={{ background: "#334155", border: "none", color: "#fff", borderRadius: 10, padding: "8px 14px", cursor: "pointer", fontSize: 13, fontWeight: 700 }}>
+            ← Menu
+          </button>
+          <div style={{ color: "#94a3b8", fontSize: 13, fontWeight: 700, flex: 1 }}>
+            {gameIdentityRef.current.teamNameAtGameTime}
+          </div>
+          {confirmDiscard ? (
+            <>
+              <button onClick={() => { discardSavedGame(); setConfirmDiscard(false); }}
+                style={{ background: "#dc2626", border: "none", color: "#fff", borderRadius: 10, padding: "8px 12px", cursor: "pointer", fontSize: 12, fontWeight: 700 }}>
+                ⚠ Confirm discard
               </button>
-              <button
-                onClick={() => {
-                  if (confirmDiscard) {
-                    discardSavedGame();
-                    setConfirmDiscard(false);
-                  } else {
-                    setConfirmDiscard(true);
-                  }
-                }}
-                style={{
-                  flex: 1, padding: "10px", borderRadius: 10, border: "none",
-                  background: confirmDiscard ? "#dc2626" : "#7f1d1d",
-                  color: "#fff", fontSize: 14, fontWeight: 700, cursor: "pointer",
-                }}>
-                {confirmDiscard ? "⚠ Tap again to confirm" : "🗑 Discard"}
-              </button>
-            </div>
-            {confirmDiscard && (
               <button onClick={() => setConfirmDiscard(false)}
-                style={{ marginTop: 8, width: "100%", padding: "6px", borderRadius: 8, border: "none", background: "#334155", color: "#cbd5e1", fontSize: 12, cursor: "pointer" }}>
+                style={{ background: "#334155", border: "none", color: "#cbd5e1", borderRadius: 10, padding: "8px 10px", cursor: "pointer", fontSize: 12 }}>
                 Cancel
               </button>
-            )}
-          </div>
-        )}
+            </>
+          ) : (
+            <button onClick={() => setConfirmDiscard(true)}
+              style={{ background: "#7f1d1d", border: "none", color: "#fff", borderRadius: 10, padding: "8px 12px", cursor: "pointer", fontSize: 12, fontWeight: 700 }}>
+              🗑 Discard game
+            </button>
+          )}
+        </div>
 
         <div style={{ background: "#1e293b", borderRadius: 16, padding: 16, marginBottom: 12 }}>
           <div style={{ color: "#94a3b8", fontSize: 12, fontWeight: 700, marginBottom: 10, letterSpacing: 1 }}>HALF DURATION</div>
@@ -4392,26 +5473,113 @@ function App() {
             <div style={{ color: "#94a3b8", fontSize: 12, fontWeight: 700, letterSpacing: 1 }}>AVAILABLE PLAYERS</div>
             <div style={{ color: "#60a5fa", fontSize: 13, fontWeight: 600 }}>{selected.size} selected</div>
           </div>
-          {ROSTER.map(p => {
+          {gameRoster.length > MAX_PARTICIPANTS && (
+            <div style={{ color: "#fbbf24", fontSize: 12, fontWeight: 600, marginBottom: 8 }}>
+              Pick up to {MAX_PARTICIPANTS} girls for today
+            </div>
+          )}
+          {capMsg && (
+            <div style={{ background: "#422006", border: "1px solid #f59e0b", borderRadius: 10, padding: "8px 12px", marginBottom: 8, color: "#fde68a", fontSize: 12, fontWeight: 600 }}>
+              {capMsg}
+            </div>
+          )}
+          {gameRoster.map(p => {
             const isOn = selected.has(p.jersey);
             return (
-              <div key={p.jersey} onClick={() => togglePlayer(p.jersey)}
+              <div key={p.playerId} onClick={() => togglePlayer(p.jersey)}
                 style={{ display: "flex", alignItems: "center", gap: 12, padding: "10px 12px", borderRadius: 12, marginBottom: 6, cursor: "pointer",
                   background: isOn ? "#1e3a5f" : "#0f172a", border: `1px solid ${isOn ? "#3b82f6" : "#1e293b"}`, opacity: isOn ? 1 : 0.5 }}>
                 <div style={{ width: 36, height: 36, borderRadius: "50%", background: p.color, display: "flex", alignItems: "center", justifyContent: "center", color: "#fff", fontSize: 13, fontWeight: 700, flexShrink: 0 }}>
                   #{p.jersey}
                 </div>
                 <div style={{ flex: 1 }}>
-                  <div style={{ color: "#fff", fontSize: 15, fontWeight: 600 }}>{p.name}</div>
+                  <div style={{ color: "#fff", fontSize: 15, fontWeight: 600 }}>
+                    {p.name}{p.isGuest ? <span style={{ color: "#f59e0b", fontSize: 10, fontWeight: 700, marginLeft: 6 }}>FILL-IN</span> : null}
+                  </div>
                   <div style={{ color: "#64748b", fontSize: 11 }}>
                     {p.skills.join(" · ")}
                   </div>
                 </div>
+                <button onClick={(e) => { e.stopPropagation(); setSetupEdit({ playerId: p.playerId, error: null, draft: { name: p.name, jersey: p.jersey === null ? "" : String(p.jersey), rating: String(p.rating), pos: p.pos.slice(), skills: p.skills.slice(), color: p.color, asthma: !!p.asthma, foulProne: !!p.foulProne } }); }}
+                  style={{ background: "#334155", border: "none", color: "#cbd5e1", borderRadius: 8, padding: "6px 10px", cursor: "pointer", fontSize: 13 }}>✎</button>
                 <div style={{ color: isOn ? "#60a5fa" : "#334155", fontSize: 20 }}>{isOn ? "✓" : "○"}</div>
               </div>
             );
           })}
+          <button onClick={() => setGuestForm({ error: null, draft: { name: "", jersey: "", rating: "", pos: [], skills: [], color: nextFreeColor(gameRoster), asthma: false, foulProne: false } })}
+            style={{ width: "100%", padding: "10px", borderRadius: 12, border: "1px dashed #475569", background: "transparent", color: "#94a3b8", fontSize: 13, fontWeight: 700, cursor: "pointer", marginTop: 4 }}>
+            ＋ Add a player for today
+          </button>
         </div>
+
+        {guestForm && (
+          <div style={{ position: "fixed", inset: 0, background: "rgba(2,6,23,0.85)", display: "flex", alignItems: "center", justifyContent: "center", padding: 16, zIndex: 50 }}>
+            <div style={{ background: "#1e293b", borderRadius: 16, padding: 16, width: "100%", maxWidth: 380, maxHeight: "90vh", overflowY: "auto" }}>
+              <div style={{ color: "#fff", fontSize: 16, fontWeight: 700 }}>Add a player</div>
+              <div style={{ color: "#94a3b8", fontSize: 12, marginTop: 2 }}>
+                A fill-in plays today only and never joins {gameIdentityRef.current.teamNameAtGameTime}.
+              </div>
+              {guestForm.error && (
+                <div style={{ background: "#7f1d1d", borderRadius: 10, padding: 10, margin: "8px 0", color: "#fecaca", fontSize: 12, fontWeight: 600 }}>⚠ {guestForm.error}</div>
+              )}
+              <PlayerFields draft={guestForm.draft} onChange={(nd) => setGuestForm({ ...guestForm, draft: nd })} />
+              <button onClick={() => commitGuestAdd(false)}
+                style={{ width: "100%", marginTop: 14, padding: "12px", borderRadius: 12, border: "none", background: "#15803d", color: "#fff", fontSize: 14, fontWeight: 700, cursor: "pointer" }}>
+                Add for TODAY only (fill-in)
+              </button>
+              <button onClick={() => commitGuestAdd(true)}
+                style={{ width: "100%", marginTop: 8, padding: "12px", borderRadius: 12, border: "none", background: "#1d4ed8", color: "#fff", fontSize: 14, fontWeight: 700, cursor: "pointer" }}>
+                Add to the team permanently
+              </button>
+              <button onClick={() => setGuestForm(null)}
+                style={{ width: "100%", marginTop: 8, padding: "10px", borderRadius: 12, border: "none", background: "#334155", color: "#cbd5e1", fontSize: 13, cursor: "pointer" }}>
+                Cancel
+              </button>
+            </div>
+          </div>
+        )}
+
+        {setupEdit && (() => {
+          const target = gameRoster.find(p => p.playerId === setupEdit.playerId);
+          if (!target) return null;
+          return (
+            <div style={{ position: "fixed", inset: 0, background: "rgba(2,6,23,0.85)", display: "flex", alignItems: "center", justifyContent: "center", padding: 16, zIndex: 50 }}>
+              <div style={{ background: "#1e293b", borderRadius: 16, padding: 16, width: "100%", maxWidth: 380, maxHeight: "90vh", overflowY: "auto" }}>
+                <div style={{ color: "#fff", fontSize: 16, fontWeight: 700 }}>Edit {target.name}</div>
+                {setupEdit.error && (
+                  <div style={{ background: "#7f1d1d", borderRadius: 10, padding: 10, margin: "8px 0", color: "#fecaca", fontSize: 12, fontWeight: 600 }}>⚠ {setupEdit.error}</div>
+                )}
+                <PlayerFields draft={setupEdit.draft} onChange={(nd) => setSetupEdit({ ...setupEdit, draft: nd })} />
+                <button onClick={() => commitSetupEdit("game")}
+                  style={{ width: "100%", marginTop: 14, padding: "12px", borderRadius: 12, border: "none", background: "#15803d", color: "#fff", fontSize: 14, fontWeight: 700, cursor: "pointer" }}>
+                  Save for THIS GAME only
+                </button>
+                {!target.isGuest && (
+                  <button onClick={() => commitSetupEdit("team")}
+                    style={{ width: "100%", marginTop: 8, padding: "12px", borderRadius: 12, border: "none", background: "#1d4ed8", color: "#fff", fontSize: 14, fontWeight: 700, cursor: "pointer" }}>
+                    Save PERMANENTLY to the team
+                  </button>
+                )}
+                <div style={{ display: "flex", gap: 8, marginTop: 8 }}>
+                  <button onClick={() => commitSetupRemove("game")}
+                    style={{ flex: 1, padding: "10px", borderRadius: 12, border: "none", background: "#7f1d1d", color: "#fecaca", fontSize: 12, fontWeight: 700, cursor: "pointer" }}>
+                    Out of today's game…
+                  </button>
+                  {!target.isGuest && (
+                    <button onClick={() => commitSetupRemove("team")}
+                      style={{ flex: 1, padding: "10px", borderRadius: 12, border: "none", background: "#7f1d1d", color: "#fecaca", fontSize: 12, fontWeight: 700, cursor: "pointer" }}>
+                      Remove from team…
+                    </button>
+                  )}
+                </div>
+                <button onClick={() => setSetupEdit(null)}
+                  style={{ width: "100%", marginTop: 8, padding: "10px", borderRadius: 12, border: "none", background: "#334155", color: "#cbd5e1", fontSize: 13, cursor: "pointer" }}>
+                  Cancel
+                </button>
+              </div>
+            </div>
+          );
+        })()}
 
         <button onClick={handlePickStarters} disabled={selected.size < 5}
           style={{ width: "100%", padding: "16px", borderRadius: 16, border: "none", cursor: selected.size >= 5 ? "pointer" : "not-allowed",
@@ -4420,6 +5588,15 @@ function App() {
           Next: Pick Starting 5 →
         </button>
         {selected.size < 5 && <div style={{ color: "#f87171", textAlign: "center", marginTop: 8, fontSize: 13 }}>Select at least 5 players</div>}
+        {/* §4 W2 staleness contract needs a KEEP path: returning to the existing
+            grid without regenerating. Without this, every setup detour forces
+            Generate — silently discarding a hand-painted grid. */}
+        {rotationPlan && editableGrid && !gameIsLive && (
+          <button onClick={() => { setSwapSelectedIdx(null); setScreen("plan"); }}
+            style={{ width: "100%", marginTop: 10, padding: "12px", borderRadius: 16, border: "1px solid #475569", background: "transparent", color: "#cbd5e1", fontSize: 14, fontWeight: 700, cursor: "pointer" }}>
+            ↩ Back to Rotation Plan{planStale ? " (needs review)" : ""}
+          </button>
+        )}
       </div>
     </div>
   );
@@ -4544,6 +5721,46 @@ function App() {
         <h1 style={{ textAlign: "center", fontSize: "1.3rem", marginBottom: 12, color: "#f8fafc" }}>
           🏀 Rotation Planner
         </h1>
+
+        {/* §4 W2 plan staleness — explicit choice, never silent regeneration */}
+        {planStale && !gameIsLive && (
+          <div style={{ background: "#422006", border: "1px solid #f59e0b", borderRadius: 12, padding: 12, marginBottom: 12, maxWidth: 500, marginLeft: "auto", marginRight: "auto" }}>
+            <div style={{ color: "#fbbf24", fontSize: 13, fontWeight: 700, marginBottom: 4 }}>
+              ⚠ Roster or availability changed since this plan was generated
+            </div>
+            <div style={{ color: "#fde68a", fontSize: 12, marginBottom: 10 }}>
+              Regenerate a fresh plan, or keep this grid as it is{staleChoiceNeeded ? " — choose before starting the game" : ""}.
+            </div>
+            <div style={{ display: "flex", gap: 8 }}>
+              <button onClick={regenerateFromStale}
+                style={{ flex: 1, padding: "10px", borderRadius: 10, border: "none", background: "#1d4ed8", color: "#fff", fontSize: 13, fontWeight: 700, cursor: "pointer" }}>
+                🔄 Regenerate plan
+              </button>
+              <button onClick={() => { setPlanStale(false); setStaleChoiceNeeded(false); }}
+                style={{ flex: 1, padding: "10px", borderRadius: 10, border: "none", background: "#334155", color: "#fff", fontSize: 13, fontWeight: 700, cursor: "pointer" }}>
+                ✋ Keep this grid
+              </button>
+            </div>
+          </div>
+        )}
+        {/* §4 W2 tip-off persistence gate failure */}
+        {tipoffError && (
+          <div style={{ background: "#7f1d1d", border: "1px solid #ef4444", borderRadius: 12, padding: 12, marginBottom: 12, maxWidth: 500, marginLeft: "auto", marginRight: "auto" }}>
+            <div style={{ color: "#fecaca", fontSize: 13, fontWeight: 700, marginBottom: 8 }}>
+              ⚠ Couldn't save the game — it did NOT start. A refresh right now would lose it, so the app stayed here.
+            </div>
+            <div style={{ display: "flex", gap: 8 }}>
+              <button onClick={handleStartGame}
+                style={{ flex: 1, padding: "10px", borderRadius: 10, border: "none", background: "#b91c1c", color: "#fff", fontSize: 13, fontWeight: 700, cursor: "pointer" }}>
+                Try again
+              </button>
+              <button onClick={() => setTipoffError(false)}
+                style={{ flex: 1, padding: "10px", borderRadius: 10, border: "none", background: "#334155", color: "#fff", fontSize: 13, fontWeight: 700, cursor: "pointer" }}>
+                Cancel
+              </button>
+            </div>
+          </div>
+        )}
 
         {/* Controls — Row 1: Grid tools */}
         <div style={{ display: "flex", justifyContent: "center", gap: 8, marginBottom: 8, flexWrap: "wrap" }}>
@@ -5043,7 +6260,7 @@ function App() {
                         }
                       }
                       return previewJerseys.map(j => {
-                        const p = available.find(pl => pl.jersey === j) || ROSTER.find(pl => pl.jersey === j);
+                        const p = available.find(pl => pl.jersey === j) || gameRoster.find(pl => pl.jersey === j);
                         if (!p) return null;
                         return (
                           <div key={j} style={{ background: p.color + "44", border: `1px solid ${p.color}`, borderRadius: 8, padding: "4px 10px", color: "#fff", fontSize: 13, fontWeight: 600 }}>
@@ -5629,7 +6846,7 @@ function App() {
             {(() => {
               const w3 = activeWeakest3;
               if (w3.length < 3) return null;
-              const courtObjs = onCourt.map(j => ROSTER.find(p => p.jersey === j)).filter(Boolean);
+              const courtObjs = onCourt.map(j => gameRoster.find(p => p.jersey === j)).filter(Boolean);
               const onCount = courtObjs.filter(p => w3.includes(p.jersey)).length;
               const violated = onCount >= 3;
               // If violated, check whether any of the weakest-3 on court is

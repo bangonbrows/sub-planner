@@ -19,7 +19,7 @@ const SENTINELS = [
     id: "S-002", name: "Setup renders all 9 players, all selected",
     run: async ({ page, url }) => {
       await page.goto(url);
-      await H.waitForMount(page);
+      await H.newGame(page);
       for (const name of ROSTER) {
         H.expect(await page.getByText(name, { exact: true }).first().isVisible(), `player missing from setup: ${name}`);
       }
@@ -45,6 +45,7 @@ const SENTINELS = [
       const before = await H.getStorage(page, H.STORAGE_KEY);
       H.expect(before && JSON.parse(before).screen === "game", "expected persisted snapshot with screen:'game'");
       await page.reload();
+      await H.continueGame(page); // W2: boot is the landing screen — never auto-hydrates
       await page.getByText("ON COURT (5)").waitFor({ timeout: 20000 });
       const after = JSON.parse(await H.getStorage(page, H.STORAGE_KEY));
       H.expect(after.screen === "game", "snapshot lost after reload");
@@ -118,7 +119,7 @@ const SENTINELS = [
         localStorage.setItem("coachk-subplanner-teams", JSON.stringify(env));
       });
       await page.reload();
-      await H.waitForMount(page);
+      await H.newGame(page); // W2: the roster copy is captured from storage at selection
       H.expect(await page.getByText("RENAMED-EIGHT").first().isVisible(), "renamed stored player not shown — UI still reads the hardcoded list");
       H.expect(!(await page.getByText("Aanya", { exact: true }).count()), "old hardcoded name still rendered");
     },
@@ -136,6 +137,7 @@ const SENTINELS = [
         localStorage.setItem("coachk-subplanner-v9", JSON.stringify(s));
       });
       await page.reload();
+      await H.continueGame(page);
       await page.getByText(/ON COURT \(/).waitFor({ timeout: 20000 });
       await page.waitForTimeout(1200); // let the save effect write the upgraded snapshot
       const s2 = JSON.parse(await H.getStorage(page, "coachk-subplanner-v9"));
@@ -240,7 +242,7 @@ const SENTINELS = [
         return false;
       });
       H.expect(hasQuarantine, "over-cap live snapshot was not quarantined");
-      H.expect((await page.getByText(/ON COURT \(/).count()) === 0, "over-cap live snapshot hydrated into the game engine");
+      H.expect((await page.getByText("▶ Continue Game").count()) === 0, "over-cap live snapshot still resumable from the landing");
     },
   },
   {
@@ -273,11 +275,12 @@ const SENTINELS = [
     id: "S-110", name: "Refresh on the Pick Starting 5 screen restores it (start5 branch)",
     run: async ({ page, url }) => {
       await page.goto(url);
-      await H.waitForMount(page);
+      await H.newGame(page);
       await page.getByText("Next: Pick Starting 5 →").click();
       await page.getByText("Pick Starting 5").first().waitFor();
       await page.waitForTimeout(800); // let the save effect persist screen:"start5"
       await page.reload();
+      await H.continueGame(page); // Continue must land on the SAVED screen (start5)
       await page.getByText("Pick Starting 5").first().waitFor({ timeout: 20000 });
     },
   },
@@ -285,25 +288,28 @@ const SENTINELS = [
     id: "S-111", name: "start5 save is a visible, resumable, discardable saved game (audit R1 CRITICAL)",
     run: async ({ page, url }) => {
       await page.goto(url);
-      await H.waitForMount(page);
+      await H.newGame(page);
       await page.getByText("Next: Pick Starting 5 →").click();
       await page.getByText("Pick Starting 5").first().waitFor();
       await page.waitForTimeout(800);
       await page.reload();
-      await page.getByText("Pick Starting 5").first().waitFor({ timeout: 20000 });
-      await page.getByText("← Back").click();
-      // The trap: the banner must exist so the coach can see/discard the snapshot.
-      await page.getByText("SAVED GAME FOUND").waitFor({ timeout: 5000 });
-      // Resume must return to the SAVED screen (start5), not jump into a plan-less game.
-      await page.getByText("▶ Resume Game").click();
+      // W2 landing contract: the saved start5 game must be VISIBLE on the landing
+      // screen as Continue Game — the trap was a snapshot the coach couldn't see.
+      await H.waitForMount(page);
+      await page.getByText("▶ Continue Game").waitFor({ timeout: 5000 });
+      // Continue must return to the SAVED screen (start5), not a plan-less game.
+      await page.getByText("▶ Continue Game").click();
       await page.getByText("Pick Starting 5").first().waitFor({ timeout: 5000 });
-      // And discard must actually clear the snapshot (two-tap confirm).
+      // And discard (setup header, confirm required) must actually clear it.
       await page.getByText("← Back").click();
-      await page.getByText("🗑 Discard").click();
-      await page.getByText("⚠ Tap again to confirm").click();
+      await page.getByText("AVAILABLE PLAYERS").waitFor({ timeout: 5000 });
+      await page.getByText("🗑 Discard game").click();
+      await page.getByText("⚠ Confirm discard").click();
       await page.waitForTimeout(500);
       const snap = await H.getStorage(page, H.STORAGE_KEY);
-      H.expect(!snap || JSON.parse(snap).screen === "setup", "discard did not clear the stranded snapshot");
+      H.expect(snap === null, "discard did not clear the stranded snapshot");
+      // Discard returns to the landing screen with no Continue offered.
+      H.expect((await page.getByText("▶ Continue Game").count()) === 0, "landing still offers Continue after discard");
     },
   },
   {
@@ -338,7 +344,11 @@ const SENTINELS = [
       await H.setStorage(page, H.STORAGE_KEY, canary);
       await page.reload();
       await H.waitForMount(page);
-      H.expect(await page.getByText(/NEWER app version is stored here/i).first().isVisible(), "no banner — coach could play an unsaved game without warning");
+      // TWO independent visibility layers, each asserted on its unique text:
+      // the sticky storage notice AND the W2 landing card (either alone could
+      // silently vanish behind the other's matching words).
+      H.expect(await page.getByText(/NOT SAVING games this session/i).first().isVisible(), "storage notice missing — coach could play an unsaved game without warning");
+      H.expect(await page.getByText(/can't be continued in this version/i).first().isVisible(), "landing card missing — blocked save invisible on the boot screen");
       H.expect((await H.getStorage(page, H.STORAGE_KEY)) === canary, "future save altered");
     },
   },
@@ -397,7 +407,9 @@ const SENTINELS = [
       });
       await page.reload();
       await H.waitForMount(page);
-      H.expect((await page.getByText(/ON COURT \(/).count()) === 0, "impossible 4-participant live game hydrated");
+      // W2: ON COURT can never show on the landing screen, so the live power
+      // check is the Continue offer — a quarantined save must not leave one.
+      H.expect((await page.getByText("▶ Continue Game").count()) === 0, "impossible 4-participant live game still resumable");
     },
   },
   {
@@ -432,6 +444,7 @@ const SENTINELS = [
         localStorage.setItem("coachk-subplanner-v9", JSON.stringify(s));
       });
       await page.reload();
+      await H.continueGame(page);
       await page.getByText(/ON COURT \(/).waitFor({ timeout: 20000 });
       await page.waitForTimeout(1200);
       const s2 = JSON.parse(await H.getStorage(page, H.STORAGE_KEY));
@@ -580,7 +593,7 @@ const SENTINELS = [
       });
       await page.reload();
       await H.waitForMount(page);
-      H.expect((await page.getByText(/ON COURT \(/).count()) === 0, "empty tracking toggles hydrated into a live game");
+      H.expect((await page.getByText("▶ Continue Game").count()) === 0, "empty-toggles save still resumable (not quarantined)");
     },
   },
   {
@@ -595,7 +608,7 @@ const SENTINELS = [
       });
       await page.reload();
       await H.waitForMount(page);
-      H.expect((await page.getByText(/ON COURT \(/).count()) === 0, "identity-less v2 save hydrated into a live game");
+      H.expect((await page.getByText("▶ Continue Game").count()) === 0, "identity-less v2 save still resumable (not quarantined)");
     },
   },
   {
@@ -610,7 +623,7 @@ const SENTINELS = [
       });
       await page.reload();
       await H.waitForMount(page);
-      H.expect((await page.getByText(/ON COURT \(/).count()) === 0, "roster entry without playerId hydrated");
+      H.expect((await page.getByText("▶ Continue Game").count()) === 0, "playerId-less roster save still resumable (not quarantined)");
     },
   },
   {
@@ -635,6 +648,7 @@ const SENTINELS = [
         localStorage.setItem("coachk-subplanner-v9", JSON.stringify(s));
       });
       await page.reload();
+      await H.continueGame(page);
       await page.getByText(/ON COURT \(/).waitFor({ timeout: 20000 });
       await page.waitForTimeout(1200);
       const s2 = JSON.parse(await H.getStorage(page, H.STORAGE_KEY));
@@ -662,6 +676,523 @@ const SENTINELS = [
         await page.getByText(/damaged template data — nothing imported/i).first().waitFor({ timeout: 5000 });
         H.expect((await H.getStorage(page, H.TEMPLATES_KEY)) === before, "invalid tombstone import still changed storage: " + c.file);
       }
+    },
+  },
+  // ── WAVE 2 sentinels (team management UI — frozen MULTI-TEAM-SPEC Rev 16 §4) ──
+  {
+    id: "S-201", name: "Landing is the boot screen: no auto-hydration, no snapshot before selection",
+    run: async ({ page, url }) => {
+      await page.goto(url);
+      await H.waitForMount(page);
+      H.expect((await page.getByText("🏀 New Game").count()) > 0, "New Game missing from landing");
+      H.expect((await page.getByText("👥 Manage Teams").count()) > 0, "Manage Teams missing from landing");
+      H.expect((await page.getByText("▶ Continue Game").count()) === 0, "Continue offered with no saved game");
+      H.expect((await page.getByText("AVAILABLE PLAYERS").count()) === 0, "app auto-entered the setup screen");
+      H.expect((await H.getStorage(page, H.STORAGE_KEY)) === null, "a snapshot was written before any team selection");
+    },
+  },
+  {
+    id: "S-202", name: "Implicit selection persists the pending snapshot BEFORE setup is editable",
+    run: async ({ page, url }) => {
+      // NOTE: "persisted BEFORE editable" cannot be distinguished from "persisted
+      // by the save effect milliseconds later" via storage polling or observer
+      // timestamps (React may flush the effect in the same task). The gate's
+      // OBSERVABLE contract is its failure path — S-220 proves setup is blocked
+      // when the write fails; MUT-202 plants the missing-gate bug against S-220.
+      await page.goto(url);
+      await H.newGame(page);
+      const s = JSON.parse(await H.getStorage(page, H.STORAGE_KEY));
+      H.expect(s && s.schemaVersion === 2 && s.screen === "setup", "pending snapshot missing/malformed at setup entry");
+      H.expect(s.selectedTeamId === "team_seed_lakeside_lakers" && s.teamNameAtGameTime === "Lakeside Lakers", "selection identity not captured");
+      H.expect(Array.isArray(s.gameRosterSnapshot) && s.gameRosterSnapshot.length === 9 &&
+        s.gameRosterSnapshot.every((p) => p.playerId && typeof p.jersey === "number"), "roster copy not captured at selection");
+      H.expect(Array.isArray(s.selected) && s.selected.length === 9, "≤10 roster should start all-checked");
+      H.expect(s.gameConfig && typeof s.gameConfig.halfMins === "number" && s.gameConfig.trackingToggles, "gameConfig not captured");
+    },
+  },
+  {
+    id: "S-203", name: "Roster copy is PINNED at selection — later saved-team edits don't leak in",
+    run: async ({ page, url }) => {
+      await page.goto(url);
+      await H.newGame(page);
+      // Another 'tab' renames #8 in the SAVED team after selection.
+      await page.evaluate(() => {
+        const env = JSON.parse(localStorage.getItem("coachk-subplanner-teams"));
+        const p = env.teams[0].players.find((x) => x.jersey === 8);
+        p.name = "RENAMED-LATER"; p.rev++; p.updatedAt = new Date().toISOString();
+        localStorage.setItem("coachk-subplanner-teams", JSON.stringify(env));
+      });
+      await page.reload();
+      await H.continueGame(page);
+      await page.getByText("AVAILABLE PLAYERS").waitFor({ timeout: 10000 });
+      H.expect((await page.getByText("Aanya", { exact: true }).count()) > 0, "pinned roster copy lost the original name");
+      H.expect((await page.getByText("RENAMED-LATER").count()) === 0, "saved-team edit leaked into the pinned game roster");
+    },
+  },
+  {
+    id: "S-204", name: "Manage Teams availability keys off SNAPSHOT EXISTENCE (locked while pending, free after discard)",
+    run: async ({ page, url }) => {
+      await page.goto(url);
+      await H.newGame(page);
+      await page.getByText("← Menu").click();
+      await page.getByText("Manage Teams: finish or discard the current game first").waitFor({ timeout: 5000 });
+      // Discard the pending game → Manage unlocks.
+      await page.getByText("▶ Continue Game").click();
+      await page.getByText("AVAILABLE PLAYERS").waitFor({ timeout: 5000 });
+      await page.getByText("🗑 Discard game").click();
+      await page.getByText("⚠ Confirm discard").click();
+      await H.waitForMount(page);
+      H.expect((await page.getByText("Manage Teams: finish or discard the current game first").count()) === 0, "Manage still locked after discard");
+      await page.getByText("👥 Manage Teams").click();
+      await page.getByText("Manage Teams", { exact: true }).first().waitFor({ timeout: 5000 });
+      H.expect((await page.getByText("Lakeside Lakers").count()) > 0, "team list missing the stored team");
+    },
+  },
+  {
+    id: "S-205", name: "Create team via UI → picker appears at 2 teams → picked team's roster drives setup",
+    run: async ({ page, url }) => {
+      await page.goto(url);
+      await H.waitForMount(page);
+      await page.getByText("👥 Manage Teams").click();
+      await page.getByText("＋ New Team").click();
+      await page.getByPlaceholder("e.g. Lakeside Lakers").fill("Tigers");
+      for (const [name, jersey] of [["Poppy", "3"], ["Indie", "07"], ["Marlee", "21"], ["Sage", "33"], ["Wren", "44"]]) {
+        await page.getByText("＋ Add player").click();
+        await page.getByPlaceholder("e.g. Aanya").fill(name);
+        await page.getByPlaceholder("e.g. 8").fill(jersey);
+        await page.getByPlaceholder("e.g. 2.5").fill("2.5");
+        await page.getByText("PG", { exact: true }).click();
+        await page.getByText("Passing", { exact: true }).click();
+        await page.getByText("Done", { exact: true }).click();
+      }
+      await page.getByText("💾 Save Team").click();
+      await page.getByText("＋ New Team").waitFor({ timeout: 5000 }); // back on the list view
+      const env = await page.evaluate(() => JSON.parse(localStorage.getItem("coachk-subplanner-teams")));
+      const tigers = env.teams.find((t) => t.name === "Tigers");
+      H.expect(tigers && !tigers.deletedAt, "created team not persisted");
+      H.expect(tigers.players.length === 5, "created team roster wrong size");
+      H.expect(tigers.players.some((p) => p.name === "Indie" && p.jersey === 7), "jersey '07' not normalized to 7");
+      // New Game must now show the picker (≥2 active teams).
+      await page.getByText("← Back").click();
+      await page.getByText("🏀 New Game").click();
+      await page.getByText("Who are we coaching?").waitFor({ timeout: 5000 });
+      await page.getByText("Tigers").click();
+      await page.getByText("AVAILABLE PLAYERS").waitFor({ timeout: 10000 });
+      H.expect((await page.getByText("Poppy").count()) > 0, "picked team's roster not on setup");
+      const s = JSON.parse(await H.getStorage(page, H.STORAGE_KEY));
+      H.expect(s.selectedTeamId === tigers.id && s.teamNameAtGameTime === "Tigers", "picker selection identity wrong");
+    },
+  },
+  {
+    id: "S-206", name: "Validation: duplicate active team name and duplicate jersey are rejected",
+    run: async ({ page, url }) => {
+      await page.goto(url);
+      await H.waitForMount(page);
+      await page.getByText("👥 Manage Teams").click();
+      await page.getByText("＋ New Team").click();
+      // Normalized duplicate of the seed team's name (case + whitespace).
+      await page.getByPlaceholder("e.g. Lakeside Lakers").fill("  lakeside LAKERS ");
+      await page.getByText("＋ Add player").click();
+      await page.getByPlaceholder("e.g. Aanya").fill("Someone");
+      await page.getByPlaceholder("e.g. 8").fill("9");
+      await page.getByPlaceholder("e.g. 2.5").fill("3");
+      await page.getByText("PG", { exact: true }).click();
+      await page.getByText("Passing", { exact: true }).click();
+      await page.getByText("Done", { exact: true }).click();
+      await page.getByText("💾 Save Team").click();
+      await page.getByText(/already exists/i).first().waitFor({ timeout: 5000 });
+      const env1 = await page.evaluate(() => JSON.parse(localStorage.getItem("coachk-subplanner-teams")));
+      H.expect(env1.teams.length === 1, "duplicate-named team was persisted anyway");
+      // Duplicate jersey inside the player dialog is rejected at Done.
+      await page.getByText("＋ Add player").click();
+      await page.getByPlaceholder("e.g. Aanya").fill("Clash");
+      await page.getByPlaceholder("e.g. 8").fill("09");
+      await page.getByPlaceholder("e.g. 2.5").fill("3");
+      await page.getByText("PG", { exact: true }).click();
+      await page.getByText("Passing", { exact: true }).click();
+      await page.getByText("Done", { exact: true }).click();
+      await page.getByText(/#9 is already taken in this team/i).first().waitFor({ timeout: 5000 });
+    },
+  },
+  {
+    id: "S-207", name: "Manage commit-time guard: a snapshot appearing before the write rejects the mutation",
+    run: async ({ page, url }) => {
+      await page.goto(url);
+      await H.waitForMount(page);
+      await page.getByText("👥 Manage Teams").click();
+      await page.getByText("Edit").first().click();
+      await page.getByPlaceholder("e.g. Lakeside Lakers").fill("Renamed Lakers");
+      const before = await H.getStorage(page, "coachk-subplanner-teams");
+      // Second tab starts a game between the coach opening the editor and saving.
+      await page.evaluate(() => localStorage.setItem("coachk-subplanner-v9", JSON.stringify({ simulated: "second-tab-snapshot" })));
+      await page.getByText("💾 Save Team").click();
+      await page.getByText(/Finish or discard the current game first/i).first().waitFor({ timeout: 5000 });
+      H.expect((await H.getStorage(page, "coachk-subplanner-teams")) === before, "mutation was written despite the commit-time snapshot");
+    },
+  },
+  {
+    id: "S-208", name: "Delete team: tombstone (not splice), last-team delete blocked, snapshot-reference blocked",
+    run: async ({ page, url }) => {
+      await page.goto(url);
+      await H.waitForMount(page);
+      // Seed a second team directly (validated write path).
+      await page.evaluate(() => {
+        const ts = "2026-07-19T00:00:00.000Z";
+        const mkP = (j, n) => ({ playerId: "p_tig_" + j, jersey: j, name: n, rating: 2.5, color: "#4A90E2",
+          pos: ["PG"], skills: ["Passing"], asthma: false, foulProne: false, isGuest: false, needsJersey: false,
+          rev: 1, createdAt: ts, updatedAt: ts, deletedAt: null, restoredAt: null });
+        window.__SP_INTERNALS__.writeTeamsEnvelope({ schemaVersion: 1, updatedAt: ts, teams: [{
+          schemaVersion: 1, id: "team_tigers", name: "Tigers", rev: 1, createdAt: ts, updatedAt: ts,
+          aggregateUpdatedAt: ts, deletedAt: null, restoredAt: null, players: [mkP(3, "Poppy"), mkP(7, "Indie"), mkP(21, "Marlee"), mkP(33, "Sage"), mkP(44, "Wren")] }] });
+      });
+      await page.getByText("👥 Manage Teams").click();
+      await page.getByText("Tigers").waitFor({ timeout: 5000 });
+      // Delete Tigers (confirm) → tombstone kept in storage, hidden in UI.
+      // Canonical ordering puts the seed team first, Tigers second.
+      await page.getByText("Delete", { exact: true }).nth(1).click();
+      await page.getByText("⚠ Confirm").click();
+      await page.waitForTimeout(400);
+      const env = await page.evaluate(() => JSON.parse(localStorage.getItem("coachk-subplanner-teams")));
+      const tigers = env.teams.find((t) => t.id === "team_tigers");
+      H.expect(tigers, "deleted team was SPLICED from storage — tombstone required");
+      H.expect(typeof tigers.deletedAt === "string" && tigers.deletedAt, "deleted team has no deletedAt");
+      H.expect((await page.getByText("Tigers").count()) === 0, "tombstoned team still listed");
+      // Deleting the LAST active team is blocked.
+      await page.getByText("Delete", { exact: true }).first().click();
+      await page.getByText("⚠ Confirm").click();
+      await page.getByText(/can't delete your only team/i).first().waitFor({ timeout: 5000 });
+      const env2 = await page.evaluate(() => JSON.parse(localStorage.getItem("coachk-subplanner-teams")));
+      H.expect(!env2.teams.find((t) => t.id === "team_seed_lakeside_lakers").deletedAt, "last active team was tombstoned anyway");
+    },
+  },
+  {
+    id: "S-209", name: "D-7 guest add: snapshot-wide jersey uniqueness, FILL-IN tagged, survives refresh",
+    run: async ({ page, url }) => {
+      await page.goto(url);
+      await H.newGame(page);
+      // Deselect the regular #8 — her number must STILL be blocked (whole-snapshot rule).
+      await page.getByText("Aanya", { exact: true }).click();
+      await page.getByText("＋ Add a player for today").click();
+      await page.getByPlaceholder("e.g. Aanya").fill("Zoe");
+      await page.getByPlaceholder("e.g. 8").fill("8");
+      await page.getByPlaceholder("e.g. 2.5").fill("2.5");
+      await page.getByText("PG", { exact: true }).click();
+      await page.getByText("Passing", { exact: true }).click();
+      await page.getByText("Add for TODAY only (fill-in)").click();
+      await page.getByText(/#8 is already taken in this game/i).first().waitFor({ timeout: 5000 });
+      // Free number → accepted, tagged FILL-IN, isGuest persisted.
+      await page.getByPlaceholder("e.g. 8").fill("50");
+      await page.getByText("Add for TODAY only (fill-in)").click();
+      await page.getByText("FILL-IN").first().waitFor({ timeout: 5000 });
+      const s = JSON.parse(await H.getStorage(page, H.STORAGE_KEY));
+      const zoe = s.gameRosterSnapshot.find((p) => p.name === "Zoe");
+      H.expect(zoe && zoe.isGuest === true && zoe.jersey === 50, "guest not persisted with isGuest into the pending snapshot");
+      H.expect(s.selected.includes(50), "guest not auto-included in today's participants");
+      // A refresh / tab eviction during setup must keep her (D-7 CRITICAL from round 2).
+      await page.reload();
+      await H.continueGame(page);
+      await page.getByText("Zoe").waitFor({ timeout: 10000 });
+      const env = await page.evaluate(() => JSON.parse(localStorage.getItem("coachk-subplanner-teams")));
+      H.expect(!env.teams[0].players.some((p) => p.name === "Zoe"), "guest leaked into the SAVED team");
+    },
+  },
+  {
+    id: "S-210", name: "D-9: >10 roster initializes UNCHECKED; the 11th participant is blocked with a message",
+    run: async ({ page, url }) => {
+      await page.goto(url);
+      await H.waitForMount(page);
+      await page.evaluate(() => {
+        const ts = "2026-07-19T00:00:00.000Z";
+        const names = ["Ava", "Bea", "Cleo", "Dot", "Eve", "Fern", "Gia", "Hana", "Isla", "June", "Kiki", "Lulu"];
+        const players = names.map((n, i) => ({ playerId: "p_big_" + i, jersey: i + 1, name: n, rating: 2.5, color: "#4A90E2",
+          pos: ["PG"], skills: ["Passing"], asthma: false, foulProne: false, isGuest: false, needsJersey: false,
+          rev: 1, createdAt: ts, updatedAt: ts, deletedAt: null, restoredAt: null }));
+        window.__SP_INTERNALS__.writeTeamsEnvelope({ schemaVersion: 1, updatedAt: ts, teams: [{
+          schemaVersion: 1, id: "team_bigs", name: "Bigs", rev: 1, createdAt: ts, updatedAt: ts,
+          aggregateUpdatedAt: ts, deletedAt: null, restoredAt: null, players }] });
+      });
+      await page.getByText("🏀 New Game").click();
+      await page.getByText("Who are we coaching?").waitFor({ timeout: 5000 });
+      await page.getByText("Bigs").click();
+      await page.getByText("AVAILABLE PLAYERS").waitFor({ timeout: 10000 });
+      await page.getByText("Pick up to 10 girls for today").first().waitFor({ timeout: 5000 });
+      H.expect((await page.getByText("0 selected").count()) > 0, ">10 roster did not initialize UNCHECKED");
+      const names = ["Ava", "Bea", "Cleo", "Dot", "Eve", "Fern", "Gia", "Hana", "Isla", "June"];
+      for (const n of names) await page.getByText(n, { exact: true }).click();
+      await page.getByText("10 selected").waitFor({ timeout: 5000 });
+      await page.getByText("Kiki", { exact: true }).click(); // the 11th
+      await page.getByText(/Up to 10 girls can play/i).first().waitFor({ timeout: 5000 });
+      H.expect((await page.getByText("10 selected").count()) > 0, "the 11th girl was admitted past the cap");
+      const s = JSON.parse(await H.getStorage(page, H.STORAGE_KEY));
+      H.expect(s.selected.length === 10, "persisted participants exceed the cap");
+    },
+  },
+  {
+    id: "S-211", name: "D-9: complete 10-player flow — 10 grid columns, game starts, sub works",
+    run: async ({ page, url }) => {
+      await page.goto(url);
+      await H.newGame(page);
+      await page.getByText("＋ Add a player for today").click();
+      await page.getByPlaceholder("e.g. Aanya").fill("Tenth");
+      await page.getByPlaceholder("e.g. 8").fill("50");
+      await page.getByPlaceholder("e.g. 2.5").fill("2.5");
+      await page.getByText("PG", { exact: true }).click();
+      await page.getByText("Passing", { exact: true }).click();
+      await page.getByText("Add for TODAY only (fill-in)").click();
+      await page.getByText("10 selected").waitFor({ timeout: 5000 });
+      await page.getByText("Next: Pick Starting 5 →").click();
+      await page.getByText("Pick Starting 5").first().waitFor();
+      for (const name of ["Lola", "Aanya", "Katyayani", "Rosalie", "Alannah"]) {
+        await page.getByText(name, { exact: true }).first().click();
+      }
+      await page.getByText("Generate Rotation Plan →").click();
+      await page.getByText("💾 Save Template").waitFor({ timeout: 15000 });
+      await page.waitForTimeout(800);
+      const s = JSON.parse(await H.getStorage(page, H.STORAGE_KEY));
+      H.expect(s.gridPlayerOrderJerseys.length === 10, "grid does not carry 10 columns");
+      H.expect(s.editableGrid.every((row) => row.length === 10), "grid rows not 10 wide");
+      await page.getByText("Start Game", { exact: false }).last().click();
+      await page.getByText(/ON COURT \(/).waitFor({ timeout: 30000 });
+      H.expect((await page.getByText("ON COURT (5)").count()) > 0, "10-player game did not start with 5 on court");
+    },
+  },
+  {
+    id: "S-212", name: "Permanent edit during setup: journal op applied to the saved team and cleared",
+    run: async ({ page, url }) => {
+      await page.goto(url);
+      await H.newGame(page);
+      // Roster renders jersey-ascending: #4 Lola, #8 Aanya → Aanya's ✎ is index 1.
+      await page.getByText("✎").nth(1).click();
+      await page.getByText("Edit Aanya").waitFor({ timeout: 5000 });
+      await page.getByPlaceholder("e.g. Aanya").fill("Aanya K");
+      await page.getByText("Save PERMANENTLY to the team").click();
+      await page.getByText("Aanya K").first().waitFor({ timeout: 5000 });
+      const st = await page.evaluate(() => ({
+        env: JSON.parse(localStorage.getItem("coachk-subplanner-teams")),
+        repair: JSON.parse(localStorage.getItem("coachk-subplanner-repair")),
+        snap: JSON.parse(localStorage.getItem("coachk-subplanner-v9")),
+      }));
+      const teamP = st.env.teams[0].players.find((p) => p.playerId === "player_seed_8");
+      H.expect(teamP.name === "Aanya K" && teamP.rev === 2, "permanent edit did not land on the saved team: " + JSON.stringify({ name: teamP.name, rev: teamP.rev }));
+      H.expect(st.snap.gameRosterSnapshot.find((p) => p.playerId === "player_seed_8").name === "Aanya K", "pending snapshot missed the edit");
+      const op = st.repair.ops.find((o) => o.targetPlayerId === "player_seed_8");
+      H.expect(op && op.status === "cleared" && op.outcome === "applied", "journal op not postcondition-cleared: " + JSON.stringify(op && { status: op.status, outcome: op.outcome }));
+    },
+  },
+  {
+    id: "S-213", name: "Repair-on-load replays a committed op whose teams write never landed",
+    run: async ({ page, url }) => {
+      await page.goto(url);
+      await H.waitForMount(page);
+      await page.evaluate(() => {
+        const ts = new Date().toISOString();
+        localStorage.setItem("coachk-subplanner-repair", JSON.stringify({ schemaVersion: 1, updatedAt: ts, ops: [{
+          opId: "op_test_replay", type: "editPlayer", teamId: "team_seed_lakeside_lakers", targetPlayerId: "player_seed_8",
+          payload: { name: "REPAIRED-EIGHT" }, rev: 2, ts, status: "committed", statusAt: ts }] }));
+      });
+      await page.reload();
+      await H.waitForMount(page);
+      const st = await page.evaluate(() => ({
+        env: JSON.parse(localStorage.getItem("coachk-subplanner-teams")),
+        repair: JSON.parse(localStorage.getItem("coachk-subplanner-repair")),
+      }));
+      const p = st.env.teams[0].players.find((x) => x.playerId === "player_seed_8");
+      H.expect(p.name === "REPAIRED-EIGHT", "committed op not replayed into the saved team on load");
+      const op = st.repair.ops.find((o) => o.opId === "op_test_replay");
+      H.expect(op.status === "cleared" && op.outcome === "applied", "replayed op not cleared: " + JSON.stringify({ status: op.status, outcome: op.outcome }));
+    },
+  },
+  {
+    id: "S-214", name: "Prepared-op recovery is two-branch: effect-absent rolls BACK, effect-present rolls FORWARD",
+    run: async ({ page, url }) => {
+      await page.goto(url);
+      await H.waitForMount(page);
+      // Branch A: prepared op, NO snapshot effect → must roll back, team untouched.
+      await page.evaluate(() => {
+        const ts = new Date().toISOString();
+        localStorage.setItem("coachk-subplanner-repair", JSON.stringify({ schemaVersion: 1, updatedAt: ts, ops: [{
+          opId: "op_ghost", type: "editPlayer", teamId: "team_seed_lakeside_lakers", targetPlayerId: "player_seed_8",
+          payload: { name: "GHOST-EDIT" }, rev: 2, ts, status: "prepared", statusAt: ts }] }));
+      });
+      await page.reload();
+      await H.waitForMount(page);
+      let st = await page.evaluate(() => ({
+        env: JSON.parse(localStorage.getItem("coachk-subplanner-teams")),
+        repair: JSON.parse(localStorage.getItem("coachk-subplanner-repair")),
+      }));
+      H.expect(st.env.teams[0].players.find((x) => x.playerId === "player_seed_8").name === "Aanya", "effect-absent prepared op was applied to the team");
+      let op = st.repair.ops.find((o) => o.opId === "op_ghost");
+      H.expect(op.status === "cleared" && op.outcome === "rolledback", "effect-absent prepared op not rolled back: " + JSON.stringify({ status: op.status, outcome: op.outcome }));
+      // Branch B: prepared op whose effect IS in the pending snapshot → roll forward.
+      await H.newGame(page);
+      await page.evaluate(() => {
+        const ts = new Date().toISOString();
+        const snap = JSON.parse(localStorage.getItem("coachk-subplanner-v9"));
+        snap.gameRosterSnapshot.find((p) => p.playerId === "player_seed_8").name = "FORWARD-EDIT";
+        localStorage.setItem("coachk-subplanner-v9", JSON.stringify(snap));
+        localStorage.setItem("coachk-subplanner-repair", JSON.stringify({ schemaVersion: 1, updatedAt: ts, ops: [{
+          opId: "op_forward", type: "editPlayer", teamId: "team_seed_lakeside_lakers", targetPlayerId: "player_seed_8",
+          payload: { name: "FORWARD-EDIT" }, rev: 2, ts, status: "prepared", statusAt: ts }] }));
+      });
+      await page.reload();
+      await H.waitForMount(page);
+      st = await page.evaluate(() => ({
+        env: JSON.parse(localStorage.getItem("coachk-subplanner-teams")),
+        repair: JSON.parse(localStorage.getItem("coachk-subplanner-repair")),
+      }));
+      H.expect(st.env.teams[0].players.find((x) => x.playerId === "player_seed_8").name === "FORWARD-EDIT", "effect-present prepared op was NOT rolled forward into the team");
+      op = st.repair.ops.find((o) => o.opId === "op_forward");
+      H.expect(op.status === "cleared" && op.outcome === "applied", "rolled-forward op not cleared as applied: " + JSON.stringify({ status: op.status, outcome: op.outcome }));
+    },
+  },
+  {
+    id: "S-215", name: "Plan staleness: availability change → explicit regenerate-or-keep; keep never touches the grid; ghost girl blocks Start",
+    run: async ({ page, url }) => {
+      await page.goto(url);
+      const dialogs = [];
+      page.on("dialog", (d) => { dialogs.push(d.message()); d.accept(); });
+      await H.driveToPlanScreen(page);
+      await page.waitForTimeout(500);
+      const gridBefore = JSON.parse(await H.getStorage(page, H.STORAGE_KEY)).editableGrid;
+      // Back to setup, untick a bench girl (Mihika #31 is not a starter).
+      await page.getByText("← Back").click();
+      await page.getByText("AVAILABLE PLAYERS").waitFor({ timeout: 5000 });
+      await page.getByText("Mihika", { exact: true }).click();
+      // The KEEP path back to the existing plan must exist (no forced regenerate).
+      await page.getByText(/↩ Back to Rotation Plan/).click();
+      await page.getByText(/Roster or availability changed since this plan was generated/).waitFor({ timeout: 5000 });
+      // Keep → banner resolves, grid byte-identical (never silently regenerated).
+      await page.getByText("✋ Keep this grid").click();
+      await page.waitForTimeout(600);
+      const s = JSON.parse(await H.getStorage(page, H.STORAGE_KEY));
+      H.expect((await page.getByText(/Roster or availability changed/).count()) === 0, "staleness banner did not resolve on Keep");
+      H.expect(JSON.stringify(s.editableGrid) === JSON.stringify(gridBefore), "the grid changed without the coach choosing Regenerate");
+      H.expect(s.planStale === false, "planStale not cleared after Keep");
+      // Starting with the unticked girl still in the grid must be blocked.
+      await page.getByText("Start Game", { exact: false }).last().click();
+      await page.waitForTimeout(600);
+      H.expect(dialogs.some((m) => /in the rotation grid but not ticked/.test(m)), "Start Game admitted a grid containing an unticked girl");
+      H.expect((await page.getByText(/ON COURT \(/).count()) === 0, "game started despite ghost participant");
+    },
+  },
+  {
+    id: "S-216", name: "Reconciliation: a pre-game renumber keeps her availability/starter/grid identity under the new jersey",
+    run: async ({ page, url }) => {
+      await page.goto(url);
+      await H.driveToPlanScreen(page); // Aanya #8 is a starter with a grid column
+      await page.getByText("← Back").click();
+      await page.getByText("AVAILABLE PLAYERS").waitFor({ timeout: 5000 });
+      await page.getByText("✎").nth(1).click(); // Aanya #8 (jersey-ascending order)
+      await page.getByText("Edit Aanya").waitFor({ timeout: 5000 });
+      await page.getByPlaceholder("e.g. 8").fill("12");
+      await page.getByText("Save for THIS GAME only").click();
+      await page.getByText("#12").first().waitFor({ timeout: 5000 });
+      const s = JSON.parse(await H.getStorage(page, H.STORAGE_KEY));
+      H.expect(s.selected.includes(12) && !s.selected.includes(8), "availability did not follow the renumber");
+      H.expect(s.starters.includes(12) && !s.starters.includes(8), "starter status did not follow the renumber");
+      H.expect(s.gridPlayerOrderJerseys.includes(12) && !s.gridPlayerOrderJerseys.includes(8), "grid column did not follow the renumber");
+      const planStr = JSON.stringify(s.rotationPlan);
+      H.expect(!s.rotationPlan.starters.includes(8) && s.rotationPlan.starters.includes(12), "rotationPlan starters retain the dead jersey");
+      H.expect(!s.rotationPlan.segments.some((seg) => seg.onCourt.includes(8)), "plan segments retain the dead jersey: " + planStr.slice(0, 120));
+      H.expect(s.rotationPlan.targetMinutes["12"] !== undefined && s.rotationPlan.targetMinutes["8"] === undefined, "targetMinutes keyed by the dead jersey");
+      H.expect(s.planStale === false, "a display-only renumber wrongly marked the plan stale");
+      // Team side untouched (this-game-only scope).
+      const env = await page.evaluate(() => JSON.parse(localStorage.getItem("coachk-subplanner-teams")));
+      H.expect(env.teams[0].players.find((p) => p.playerId === "player_seed_8").jersey === 8, "this-game-only renumber leaked into the saved team");
+    },
+  },
+  {
+    id: "S-217", name: "Reconciliation: removing a girl pre-game drops her from selected/starters and deletes her grid column",
+    run: async ({ page, url }) => {
+      await page.goto(url);
+      page.on("dialog", (d) => d.accept());
+      await H.driveToPlanScreen(page);
+      await page.getByText("← Back").click();
+      await page.getByText("AVAILABLE PLAYERS").waitFor({ timeout: 5000 });
+      await page.getByText("✎").nth(5).click(); // Mihika #31 (jersey-ascending order)
+      await page.getByText("Edit Mihika").waitFor({ timeout: 5000 });
+      await page.getByText("Out of today's game…").click();
+      await page.waitForTimeout(600);
+      const s = JSON.parse(await H.getStorage(page, H.STORAGE_KEY));
+      H.expect(!s.gameRosterSnapshot.some((p) => p.jersey === 31), "removed girl still in the roster copy");
+      H.expect(!s.selected.includes(31) && !s.starters.includes(31), "removed girl still selected/starter");
+      H.expect(s.gridPlayerOrderJerseys.length === 8 && !s.gridPlayerOrderJerseys.includes(31), "grid column not deleted");
+      H.expect(s.editableGrid.every((row) => row.length === 8), "grid rows not narrowed after column delete");
+      H.expect(s.planStale === true, "membership change did not mark the plan stale");
+    },
+  },
+  {
+    id: "S-218", name: "Empty state: zero active teams → create-first-team path, never a silent reseed",
+    run: async ({ page, url }) => {
+      await page.goto(url);
+      await H.waitForMount(page);
+      await page.evaluate(() => {
+        const env = JSON.parse(localStorage.getItem("coachk-subplanner-teams"));
+        env.teams.forEach((t) => { t.deletedAt = new Date().toISOString(); t.rev++; t.updatedAt = new Date().toISOString(); });
+        localStorage.setItem("coachk-subplanner-teams", JSON.stringify(env));
+      });
+      await page.reload();
+      await H.waitForMount(page);
+      await page.getByText("＋ Create your first team").waitFor({ timeout: 5000 });
+      H.expect((await page.getByText("🏀 New Game").count()) === 0, "New Game offered with zero teams");
+      const env = await page.evaluate(() => JSON.parse(localStorage.getItem("coachk-subplanner-teams")));
+      H.expect(env.teams.every((t) => t.deletedAt), "tombstoned teams were silently reseeded/undeleted");
+      // The create path works end-to-end.
+      await page.getByText("＋ Create your first team").click();
+      await page.getByPlaceholder("e.g. Lakeside Lakers").fill("Rockets");
+      await page.getByText("＋ Add player").click();
+      await page.getByPlaceholder("e.g. Aanya").fill("Nova");
+      await page.getByPlaceholder("e.g. 8").fill("1");
+      await page.getByPlaceholder("e.g. 2.5").fill("3");
+      await page.getByText("PG", { exact: true }).click();
+      await page.getByText("Passing", { exact: true }).click();
+      await page.getByText("Done", { exact: true }).click();
+      await page.getByText("💾 Save Team").click();
+      await page.getByText("＋ New Team").waitFor({ timeout: 5000 });
+      await page.getByText("← Back").click();
+      await page.getByText("🏀 New Game").click();
+      await page.getByText("AVAILABLE PLAYERS").waitFor({ timeout: 10000 });
+      H.expect((await page.getByText("Nova").count()) > 0, "created-first-team roster not usable for a game");
+    },
+  },
+  {
+    id: "S-219", name: "New Game with a saved game prompts save/discard FIRST — nothing is lost silently",
+    run: async ({ page, url }) => {
+      await page.goto(url);
+      await H.newGame(page);
+      await page.getByText("← Menu").click();
+      await H.waitForMount(page);
+      const before = await H.getStorage(page, H.STORAGE_KEY);
+      await page.getByText("🏀 New Game").click();
+      await page.getByText("⚠ A game is already saved").waitFor({ timeout: 5000 });
+      H.expect((await H.getStorage(page, H.STORAGE_KEY)) === before, "the saved game was touched before the coach chose");
+      await page.getByText("Cancel", { exact: true }).click();
+      H.expect((await H.getStorage(page, H.STORAGE_KEY)) === before, "Cancel did not preserve the saved game");
+      // Explicit discard path replaces it.
+      await page.getByText("🏀 New Game").click();
+      await page.getByText("🗑 Discard it and start a new game").click();
+      await page.getByText("AVAILABLE PLAYERS").waitFor({ timeout: 10000 });
+      const s = JSON.parse(await H.getStorage(page, H.STORAGE_KEY));
+      H.expect(s && s.screen === "setup" && s.selected.length === 9, "discard-and-start did not produce a fresh pending snapshot");
+    },
+  },
+  {
+    id: "S-220", name: "Selection persist-gate: if the pending snapshot can't be written, setup is NOT entered",
+    run: async ({ page, url }) => {
+      await page.addInitScript(() => {
+        const orig = Storage.prototype.setItem;
+        Storage.prototype.setItem = function (k, v) {
+          if (k === "coachk-subplanner-v9") throw new Error("simulated quota");
+          return orig.call(this, k, v);
+        };
+      });
+      await page.goto(url);
+      await H.waitForMount(page);
+      await page.getByText("🏀 New Game").click();
+      await page.getByText(/Couldn't save the new game — nothing was started/).waitFor({ timeout: 5000 });
+      H.expect((await page.getByText("AVAILABLE PLAYERS").count()) === 0, "setup became editable without a persisted pending snapshot");
+      H.expect((await H.getStorage(page, H.STORAGE_KEY)) === null, "a partial snapshot appeared despite the write failure");
+      H.expect((await page.getByText("Try again").count()) > 0, "no retry offered on the persist-gate banner");
     },
   },
 ];

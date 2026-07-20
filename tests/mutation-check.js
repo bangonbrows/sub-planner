@@ -32,8 +32,8 @@ const CASES = [
   },
   {
     id: "MUT-004", mutates: "one player vanishes from the setup roster",
-    find: "{ROSTER.map(p => {",
-    replace: "{ROSTER.slice(0, 8).map(p => {",
+    find: "{gameRoster.map(p => {",
+    replace: "{gameRoster.slice(0, 8).map(p => {",
     mustFail: "S-002",
   },
   // ── Wave 1 cases (one  bug per new behaviour) ──
@@ -62,9 +62,9 @@ const CASES = [
     mustFail: "S-105",
   },
   {
-    id: "MUT-105", mutates: "roster silently falls back to the hardcoded seed (ignores stored team edits)",
-    find: "const ACTIVE_TEAM = getActiveTeam();",
-    replace: "const ACTIVE_TEAM = buildSeedEnvelope().teams[0];",
+    id: "MUT-105", mutates: "team selection reads the hardcoded seed, not the stored team (ignores edits)",
+    find: "    // Fresh read at the SELECTION event: the picker list or landing state could\n    // be stale against another tab's Manage Teams edits.\n    const env = readTeamsEnvelopeFresh();",
+    replace: "    const env = buildSeedEnvelope();",
     mustFail: "S-102",
   },
   {
@@ -80,9 +80,9 @@ const CASES = [
     mustFail: "S-108",
   },
   {
-    id: "MUT-108", mutates: "hasSavedGame regresses to plan-only (start5 saves invisible again)",
-    find: "        if (s.screen && s.screen !== \"setup\") { setHasSavedGame(true); savedScreenRef.current = s.screen; }",
-    replace: "        if (s.plan && s.screen && s.screen !== \"setup\") { setHasSavedGame(true); savedScreenRef.current = s.screen; }",
+    id: "MUT-108", mutates: "game-in-flight regresses to live-only (start5 saves invisible on the landing again)",
+    find: "        setGameInFlight(true);\n        savedScreenRef.current = s.screen;",
+    replace: "        if (s.screen === \"game\") setGameInFlight(true);\n        savedScreenRef.current = s.screen;",
     mustFail: "S-111",
   },
   {
@@ -121,8 +121,8 @@ const CASES = [
   },
   {
     id: "MUT-114", mutates: "v2 identity re-stamped by the current team on every save",
-    find: "        selectedTeamId: gameIdentityRef.current.selectedTeamId,\n        teamNameAtGameTime: gameIdentityRef.current.teamNameAtGameTime,",
-    replace: "        selectedTeamId: ACTIVE_TEAM.id,\n        teamNameAtGameTime: ACTIVE_TEAM.name,",
+    find: "      selectedTeamId: gameIdentityRef.current.selectedTeamId,\n      teamNameAtGameTime: gameIdentityRef.current.teamNameAtGameTime,",
+    replace: "      selectedTeamId: getActiveTeam().id,\n      teamNameAtGameTime: getActiveTeam().name,",
     mustFail: "S-118",
   },
   {
@@ -179,6 +179,138 @@ const CASES = [
     replace: "            !s.gameRosterSnapshot.every(p => p && typeof p.jersey === \"number\" && typeof p.name === \"string\")) { fail(\"roster copy malformed\"); break restoreattempt; }",
     mustFail: "S-126",
   },
+  // ── Wave 2 cases (one planted bug per new behaviour — spec §4 Wave 2) ──
+  {
+    id: "MUT-201", mutates: "landing screen skipped — app boots straight into setup again",
+    find: "const [appMode, setAppMode] = useState(\"landing\");",
+    replace: "const [appMode, setAppMode] = useState(\"app\");",
+    mustFail: "S-201",
+  },
+  {
+    // NOTE: with the sync selection write skipped, the ordinary save effect
+    // still persists an identical snapshot moments later — an equivalent mutant
+    // on the happy path (verified 20 Jul, same class as MUT-109). The gate's
+    // observable layer is the FAILURE path: without it, setup opens on
+    // memory-only state when the write throws — which S-220 catches.
+    id: "MUT-202", mutates: "team selection enters setup without persisting (gate skipped — failure path exposed)",
+    find: "    const ok = persistSnapshotNow({\n      screen: \"setup\",",
+    replace: "    const ok = true || persistSnapshotNow({\n      screen: \"setup\",",
+    mustFail: "S-220",
+  },
+  {
+    id: "MUT-203", mutates: "hydration re-reads the saved team instead of adopting the snapshot's pinned roster",
+    find: "        const snapRoster = s.gameRosterSnapshot;",
+    replace: "        const snapRoster = getActiveTeam().players.filter(p => !p.deletedAt && p.jersey !== null);",
+    mustFail: "S-203",
+  },
+  {
+    id: "MUT-204", mutates: "landing's Manage Teams lock ignores snapshot existence",
+    find: "    const snapExists = gameInFlight || blockedSave;",
+    replace: "    const snapExists = false;",
+    mustFail: "S-204",
+  },
+  {
+    id: "MUT-205", mutates: "commit-time snapshot re-check removed from Manage Teams mutations",
+    find: "  function manageGuardBlocked() {\n    return gameSnapshotExists() ? \"Finish or discard the current game first\" : null;\n  }",
+    replace: "  function manageGuardBlocked() {\n    return null;\n  }",
+    mustFail: "S-207",
+  },
+  {
+    id: "MUT-206", mutates: "active team-name uniqueness check removed",
+    find: "    if (others.some((t) => normalizeTeamName(t.name) === normalizeTeamName(name)))\n      errors.push(`A team called \"${name}\" already exists`);",
+    replace: "    ;",
+    mustFail: "S-206",
+  },
+  {
+    id: "MUT-207", mutates: "jersey uniqueness check removed from the Manage player dialog",
+    find: "                        const clash = kept.some((p, i) => manageDraft.players.indexOf(p) !== managePlayerEdit.index && p.jersey === v.player.jersey);",
+    replace: "                        const clash = false;",
+    mustFail: "S-206",
+  },
+  {
+    id: "MUT-208", mutates: "team delete stops tombstoning (record left active in storage)",
+    find: "teams: [{ ...team, deletedAt: ts, rev: team.rev + 1, updatedAt: ts }] })",
+    replace: "teams: [{ ...team, deletedAt: null, rev: team.rev + 1, updatedAt: ts }] })",
+    mustFail: "S-208",
+  },
+  {
+    id: "MUT-209", mutates: "last-active-team delete guard removed",
+    find: "    if (listActiveTeams().filter((t) => t.id !== team.id).length === 0) {",
+    replace: "    if (false) {",
+    mustFail: "S-208",
+  },
+  {
+    id: "MUT-210", mutates: "guest jersey uniqueness shrinks to selected players only (deselected #8 loses her number)",
+    find: "    if (v.player.jersey !== null && gameRoster.some((p) => p.jersey === v.player.jersey))\n      errors.push(`#${v.player.jersey} is already taken in this game — pick a free number`);",
+    replace: "    if (v.player.jersey !== null && gameRoster.some((p) => selected.has(p.jersey) && p.jersey === v.player.jersey))\n      errors.push(`#${v.player.jersey} is already taken in this game — pick a free number`);",
+    mustFail: "S-209",
+  },
+  {
+    id: "MUT-211", mutates: "a >10 roster auto-selects everyone (Codex R12 regression)",
+    find: "    const selInit = roster.length <= MAX_PARTICIPANTS ? roster.map((p) => p.jersey) : [];",
+    replace: "    const selInit = roster.map((p) => p.jersey);",
+    mustFail: "S-210",
+  },
+  {
+    id: "MUT-212", mutates: "the 11th participant is admitted without the cap message",
+    find: "    if (!selected.has(jersey) && selected.size >= MAX_PARTICIPANTS) {\n      setCapMsg(`Up to ${MAX_PARTICIPANTS} girls can play in one game — untick someone first`);\n      return;\n    }",
+    replace: "    if (false) {\n      setCapMsg(`Up to ${MAX_PARTICIPANTS} girls can play in one game — untick someone first`);\n      return;\n    }",
+    mustFail: "S-210",
+  },
+  {
+    id: "MUT-213", mutates: "repair-on-load stops replaying committed ops",
+    find: "    const post = replayCommittedOp(cur);",
+    replace: "    const post = null;",
+    mustFail: "S-213",
+  },
+  {
+    id: "MUT-214", mutates: "prepared-op recovery rolls FORWARD unconditionally (ghost half-edits applied)",
+    find: "      if (opEffectInSnapshot(cur, snap)) {",
+    replace: "      if (true || opEffectInSnapshot(cur, snap)) {",
+    mustFail: "S-214",
+  },
+  {
+    id: "MUT-215", mutates: "availability toggles stop marking the plan stale",
+    find: "    if (!(screen === \"game\" || (gameSecs > 0 && !gameOver)) && (rotationPlan || editableGrid)) setPlanStale(true);",
+    replace: "    ;",
+    mustFail: "S-215",
+  },
+  {
+    id: "MUT-216", mutates: "reconciliation loses playerId identity (renumbered girl dropped from selections)",
+    find: "    const nextSelected = remapArr([...selected]);",
+    replace: "    const nextSelected = [...selected].filter((j) => newRoster.some((p) => p.jersey === j));",
+    mustFail: "S-216",
+  },
+  {
+    id: "MUT-217", mutates: "a removed girl's grid column survives (grid/order divergence)",
+    find: "      if (editableGrid) nextGrid = editableGrid.map((row) => keptIdx.map((i) => row[i]));",
+    replace: "      if (false) nextGrid = editableGrid.map((row) => keptIdx.map((i) => row[i]));",
+    mustFail: "S-217",
+  },
+  {
+    id: "MUT-218", mutates: "empty state lost — New Game offered with zero active teams",
+    find: "          {activeTeams.length > 0 ? (",
+    replace: "          {true ? (",
+    mustFail: "S-218",
+  },
+  {
+    id: "MUT-219", mutates: "New Game silently discards the saved game (no save/discard prompt)",
+    find: "    if (gameInFlight || blockedSave) { setNewGamePrompt(true); return; }",
+    replace: "    if (false) { setNewGamePrompt(true); return; }",
+    mustFail: "S-219",
+  },
+  {
+    id: "MUT-220", mutates: "selection persist-gate ignores write failure (setup editable on memory-only state)",
+    find: "    if (!ok) {\n      // Persist-gate failure: there is NO path onto the setup screen without a\n      // persisted pending snapshot — block with banner + retry.\n      setSelectionError({ teamId, reason: \"save\" });\n      return;\n    }",
+    replace: "    if (false) {\n      setSelectionError({ teamId, reason: \"save\" });\n      return;\n    }",
+    mustFail: "S-220",
+  },
+  {
+    id: "MUT-221", mutates: "permanent edits stop replaying into the saved team (journal decorative)",
+    find: "      const post = replayCommittedOp(committed);",
+    replace: "      const post = null;",
+    mustFail: "S-212",
+  },
 ];
 
 function makeMutatedCopy(caseDef) {
@@ -206,8 +338,19 @@ function runSentinel(appDir, sentinelId) {
 }
 
 function main() {
+  // --only MUT-001,MUT-2xx filter: run a subset in FOREGROUND chunks. The wave
+  // gate is still the FULL suite (run every chunk); this only bounds one
+  // invocation's wall-clock.
+  const args = process.argv.slice(2);
+  const onlyIdx = args.indexOf("--only");
+  let cases = CASES;
+  if (onlyIdx >= 0) {
+    const wanted = args[onlyIdx + 1].split(",");
+    cases = CASES.filter((c) => wanted.some((w) => w.endsWith("x") ? c.id.startsWith(w.slice(0, -1)) : c.id === w));
+    if (!cases.length) { console.error("no case matches " + args[onlyIdx + 1]); process.exit(2); }
+  }
   let caught = 0, missed = 0;
-  for (const c of CASES) {
+  for (const c of cases) {
     const dir = makeMutatedCopy(c);
     try {
       const res = runSentinel(dir, c.mustFail);
@@ -217,7 +360,7 @@ function main() {
       fs.rmSync(dir, { recursive: true, force: true });
     }
   }
-  console.log(`\n${caught} CAUGHT / ${missed} MISSED of ${CASES.length}`);
+  console.log(`\n${caught} CAUGHT / ${missed} MISSED of ${cases.length}`);
   process.exit(missed ? 1 : 0);
 }
 
