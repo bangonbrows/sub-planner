@@ -311,6 +311,19 @@ const CASES = [
     replace: "      const post = null;",
     mustFail: "S-212",
   },
+  // ── Wave 2 audit round 1 (Codex-found coverage gaps + fixes) ──
+  {
+    id: "MUT-222", mutates: "landing Manage-Teams lock ignores the blockedSave (future-schema) branch",
+    find: "    const snapExists = gameInFlight || blockedSave;",
+    replace: "    const snapExists = gameInFlight;",
+    mustFail: "S-221",
+  },
+  {
+    id: "MUT-223", mutates: "gameIsLive falls back to the clock proxy — a live game at 0:00 reads as pre-game",
+    find: "  const gameIsLive = screen === \"game\" || ((gameStarted || gameSecs > 0) && !gameOver);",
+    replace: "  const gameIsLive = screen === \"game\" || (gameSecs > 0 && !gameOver);",
+    mustFail: "S-222",
+  },
 ];
 
 function makeMutatedCopy(caseDef) {

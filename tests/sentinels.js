@@ -1195,6 +1195,45 @@ const SENTINELS = [
       H.expect((await page.getByText("Try again").count()) > 0, "no retry offered on the persist-gate banner");
     },
   },
+  // ── WAVE 2 audit round 1 (Codex findings) ──
+  {
+    id: "S-221", name: "A future-schema saved game LOCKS Manage Teams on the landing (blockedSave branch)",
+    run: async ({ page, url }) => {
+      await page.goto(url);
+      await H.waitForMount(page);
+      // A game saved by a NEWER app version: readable-as-JSON but sv > SUPPORTED.
+      // It sets blockedSave (not gameInFlight) — the lock must still engage.
+      await H.setStorage(page, H.STORAGE_KEY, JSON.stringify({ schemaVersion: 99, canary: "FUTURE" }));
+      await page.reload();
+      await H.waitForMount(page);
+      H.expect(await page.getByText(/can't be continued in this version/i).first().isVisible(), "future-schema landing card missing");
+      H.expect((await page.getByText("Manage Teams: finish or discard the current game first").count()) > 0,
+        "Manage Teams NOT locked while a future-schema save exists (blockedSave branch unguarded)");
+      // Prove the lock actually engages: the button is disabled (not merely captioned).
+      H.expect(await page.getByText("👥 Manage Teams").isDisabled(), "Manage Teams button clickable despite the future-schema lock");
+    },
+  },
+  {
+    id: "S-222", name: "A just-started game (clock at 0:00) shows LIVE plan controls, not pre-game Start Game",
+    run: async ({ page, url }) => {
+      await page.goto(url);
+      await H.driveToGameScreen(page); // tip-off; clock paused at 0:00
+      const s0 = JSON.parse(await H.getStorage(page, H.STORAGE_KEY));
+      H.expect(s0.gameSecs === 0 && s0.screen === "game" && s0.gameStarted === true, "expected a live game persisted at 0:00 with gameStarted");
+      // Navigate game → Plan WITHOUT advancing the clock.
+      await page.getByText("Plan", { exact: true }).click();
+      await page.getByText("🏀 Rotation Planner").waitFor({ timeout: 10000 });
+      // The plan screen must render LIVE controls, never the pre-game Start Game.
+      H.expect((await page.getByText("← Back to Game").count()) > 0, "live game at 0:00 rendered pre-game controls (gameIsLive false at clock 0)");
+      H.expect((await page.getByText("End Game & New Setup").count()) > 0, "live End Game control missing at 0:00");
+      const startBtn = await page.getByText("Start Game", { exact: false }).count();
+      H.expect(startBtn === 0, "pre-game Start Game control shown inside a live game");
+      // And the persisted plan-screen save keeps gameStarted true (survives refresh).
+      await page.waitForTimeout(600);
+      const s1 = JSON.parse(await H.getStorage(page, H.STORAGE_KEY));
+      H.expect(s1.screen === "plan" && s1.gameStarted === true, "gameStarted not persisted on the plan-screen live save");
+    },
+  },
 ];
 
 async function main() {

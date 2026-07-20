@@ -1735,6 +1735,10 @@ function App() {
   const [planStale, setPlanStale] = useState(false);           // §4 W2 plan-staleness flag (persisted)
   const [staleChoiceNeeded, setStaleChoiceNeeded] = useState(false); // Start Game pressed while stale
   const [tipoffError, setTipoffError] = useState(false);       // Start Game persistence gate failure
+  // "The game is underway" — set at tip-off, persisted. The old `gameSecs > 0`
+  // proxy read a just-started game (clock still 0:00) as pre-game, so navigating
+  // game→Plan at 0:00 rendered Start Game instead of Back to Game (Codex W2-R1).
+  const [gameStarted, setGameStarted] = useState(false);
   const [setupEdit, setSetupEdit] = useState(null);            // pre-game player edit dialog state
   const [guestForm, setGuestForm] = useState(null);            // D-7 fill-in add dialog state
   const [screen, setScreen] = useState("setup");
@@ -2410,6 +2414,12 @@ function App() {
         savedScreenRef.current = s.screen;
         if (s.screen) setScreen(s.screen);
         if (typeof s.planStale === "boolean") setPlanStale(s.planStale);
+        // A live-game snapshot is underway by definition; otherwise adopt the
+        // persisted flag (older v2 saves lacking it default to false — safe:
+        // only a plan-screen-mid-live save at 0:00 depends on it, which the
+        // W2 build always stamps true).
+        if (s.screen === "game") setGameStarted(true);
+        else if (typeof s.gameStarted === "boolean") setGameStarted(s.gameStarted);
         if (typeof s.halfMins === "number" && s.halfMins > 0) setHalfMins(s.halfMins);
         if (Array.isArray(s.selected)) setSelected(new Set(sanitizeJerseyArray(s.selected)));
         if (Array.isArray(s.starters)) setStarters(new Set(sanitizeJerseyArray(s.starters)));
@@ -2517,7 +2527,7 @@ function App() {
       planDelayUntilSecs: planDelayUntilSecs ?? null,
       delayedSegId: delayedSegId || null,
       shortHandedDismissedAt: shortHandedDismissedAt ?? null,
-      planStale,
+      planStale, gameStarted,
     };
     return { ...snapshot, ...overrides };
   }
@@ -2548,7 +2558,7 @@ function App() {
       // sees a banner instead of silently losing the game on the next refresh.
       if (!saveError) setSaveError(true);
     }
-  }, [hydrated, gameInFlight, gameRoster, planStale, screen, halfMins, selected, starters, plan, planMode, gameSecs, onCourt, accumulated, stintStart,
+  }, [hydrated, gameInFlight, gameRoster, planStale, gameStarted, screen, halfMins, selected, starters, plan, planMode, gameSecs, onCourt, accumulated, stintStart,
       halftimeDone, fouls, fouledOut, injured, adjustedTargetMins, subLog, injuryInfo, fouloutInfo,
       lastSubTime, offSince, handledWindows, restedThisHalf, replacingJersey,
       scoreUs, scoreOpponent, timeoutsUs, timeoutsOpponent, possessionLeft,
@@ -2568,6 +2578,7 @@ function App() {
     setPlanStale(false);
     setStaleChoiceNeeded(false);
     setTipoffError(false);
+    setGameStarted(false);
     setSetupEdit(null);
     setGuestForm(null);
     setCapMsg(null);
@@ -2681,7 +2692,7 @@ function App() {
     setStarters(new Set());
     setHalfMins(hm); setPlanMode(pm);
     setPlan(null); setRotationPlan(null); setEditableGrid(null); setGridPlayerOrder([]);
-    setPlanStale(false); setStaleChoiceNeeded(false); setTipoffError(false);
+    setPlanStale(false); setStaleChoiceNeeded(false); setTipoffError(false); setGameStarted(false);
     setCapMsg(roster.length > MAX_PARTICIPANTS ? `Pick up to ${MAX_PARTICIPANTS} girls for today` : null);
     setSelectionError(null);
     setGameInFlight(true);
@@ -3487,9 +3498,11 @@ function App() {
       rotationPlan: (syncedPlan || rotationPlan) || null,
       dismissedTimeouts: [], lastExecutedSegId: null,
       planDelayUntilSecs: null, delayedSegId: null, shortHandedDismissedAt: null,
+      gameStarted: true,
     });
     if (!persisted) { setTipoffError(true); return; }
     setTipoffError(false);
+    setGameStarted(true);
     setOnCourt(courtJerseys);
     setAccumulated(acc);
     setStintStart(stint);
@@ -4308,7 +4321,7 @@ function App() {
   };
 
   // Track whether a game is currently live (clock has started at least once)
-  const gameIsLive = screen === "game" || (gameSecs > 0 && !gameOver);
+  const gameIsLive = screen === "game" || ((gameStarted || gameSecs > 0) && !gameOver);
 
   // ── CADENCE-FIRST ROTATION ENGINE ──────────────────────────────────────────
   // Architecture:
