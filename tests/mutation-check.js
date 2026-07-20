@@ -324,6 +324,12 @@ const CASES = [
     replace: "  const gameIsLive = screen === \"game\" || (gameSecs > 0 && !gameOver);",
     mustFail: "S-222",
   },
+  {
+    id: "MUT-224", mutates: "flag-absent hydration stops deriving gameStarted from tip-off state (old saves resume as pre-game)",
+    find: "        else setGameStarted(Array.isArray(s.onCourt) && s.onCourt.length > 0);",
+    replace: "        else setGameStarted(false);",
+    mustFail: "S-223",
+  },
 ];
 
 function makeMutatedCopy(caseDef) {

@@ -2414,12 +2414,16 @@ function App() {
         savedScreenRef.current = s.screen;
         if (s.screen) setScreen(s.screen);
         if (typeof s.planStale === "boolean") setPlanStale(s.planStale);
-        // A live-game snapshot is underway by definition; otherwise adopt the
-        // persisted flag (older v2 saves lacking it default to false — safe:
-        // only a plan-screen-mid-live save at 0:00 depends on it, which the
-        // W2 build always stamps true).
+        // "Game underway" flag. A live-game snapshot is underway by definition;
+        // otherwise adopt the persisted flag. When the field is ABSENT (a v1 save,
+        // or a schema-2 save from a build predating the flag — Codex W2-R2), DERIVE
+        // it from tip-off state: onCourt is populated only after Start Game (empty
+        // on every pre-game screen), so a plan/start5/setup save with players on
+        // court is a game already underway. Guessing from a missing field is exactly
+        // what W1.f forbids — this is a deterministic derivation, not a guess.
         if (s.screen === "game") setGameStarted(true);
         else if (typeof s.gameStarted === "boolean") setGameStarted(s.gameStarted);
+        else setGameStarted(Array.isArray(s.onCourt) && s.onCourt.length > 0);
         if (typeof s.halfMins === "number" && s.halfMins > 0) setHalfMins(s.halfMins);
         if (Array.isArray(s.selected)) setSelected(new Set(sanitizeJerseyArray(s.selected)));
         if (Array.isArray(s.starters)) setStarters(new Set(sanitizeJerseyArray(s.starters)));

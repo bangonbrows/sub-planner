@@ -1234,6 +1234,35 @@ const SENTINELS = [
       H.expect(s1.screen === "plan" && s1.gameStarted === true, "gameStarted not persisted on the plan-screen live save");
     },
   },
+  // ── WAVE 2 audit round 2 (Codex finding) ──
+  {
+    id: "S-223", name: "A pre-flag v2 plan-at-0:00 live save (no gameStarted field) resumes with LIVE controls",
+    run: async ({ page, url }) => {
+      await page.goto(url);
+      await H.driveToGameScreen(page); // tip-off writes gameStarted:true + populated onCourt
+      // Navigate game → Plan (still 0:00), producing a screen:"plan" live save.
+      await page.getByText("Plan", { exact: true }).click();
+      await page.getByText("🏀 Rotation Planner").waitFor({ timeout: 10000 });
+      await page.waitForTimeout(600);
+      // Downgrade to a save from a build PREDATING the flag: strip gameStarted.
+      // Everything else (screen:"plan", gameSecs:0, live onCourt/roster) is a
+      // legitimate schema-2 payload — this is exactly Codex's W2-R2 repro.
+      const stripped = await page.evaluate(() => {
+        const s = JSON.parse(localStorage.getItem("coachk-subplanner-v9"));
+        delete s.gameStarted;
+        localStorage.setItem("coachk-subplanner-v9", JSON.stringify(s));
+        return { screen: s.screen, gameSecs: s.gameSecs, onCourt: s.onCourt.length, hasFlag: "gameStarted" in s };
+      });
+      H.expect(stripped.screen === "plan" && stripped.gameSecs === 0 && stripped.onCourt === 5 && !stripped.hasFlag,
+        "test setup wrong: expected a plan-at-0:00 live save with the flag stripped");
+      await page.reload();
+      await H.continueGame(page);
+      await page.getByText("🏀 Rotation Planner").waitFor({ timeout: 15000 });
+      H.expect((await page.getByText("← Back to Game").count()) > 0, "flagless live plan save resumed as pre-game (no Back to Game)");
+      H.expect((await page.getByText("End Game & New Setup").count()) > 0, "flagless live plan save missing the live End Game control");
+      H.expect((await page.getByText("Start Game", { exact: false }).count()) === 0, "pre-game Start Game shown for a flagless live plan save");
+    },
+  },
 ];
 
 async function main() {
