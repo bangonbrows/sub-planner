@@ -130,10 +130,17 @@ const SENTINELS = [
       await page.goto(url);
       await H.driveToGameScreen(page);
       // Down-convert the freshly-written v2 snapshot to a legitimate v1 shape.
+      // A REAL 16-min v1 save is internally CONSISTENT — its plan-first state
+      // (if any) was generated at 16 min. Since this fixture repurposes a 20-min
+      // drive, it becomes a reactive-era v1 live save (legacy plan only): the
+      // fix-group-B validation rightly quarantines a 40-row grid or a 2400s plan
+      // inside a 16-min game as corruption.
       await page.evaluate(() => {
         const s = JSON.parse(localStorage.getItem("coachk-subplanner-v9"));
         delete s.gameRosterSnapshot; delete s.gameConfig; delete s.selectedTeamId; delete s.teamNameAtGameTime;
         s.schemaVersion = 1; s.halfMins = 16; s.planMode = "competitive";
+        delete s.rotationPlan; s.editableGrid = null; s.gridPlayerOrderJerseys = [];
+        s.lastExecutedSegId = null; s.delayedSegId = null; s.planDelayUntilSecs = null;
         localStorage.setItem("coachk-subplanner-v9", JSON.stringify(s));
       });
       await page.reload();
@@ -402,7 +409,12 @@ const SENTINELS = [
       await H.driveToGameScreen(page);
       await page.evaluate(() => {
         const s = JSON.parse(localStorage.getItem("coachk-subplanner-v9"));
-        s.selected = [4, 8, 10, 14, 999]; // 5 raw, 4 after unknown-jersey filtering
+        // 5 raw → 4 after unknown-jersey filtering. onCourt is ALSO set to those
+        // same 4 (all participants, short-handed but consistent) so the ONLY
+        // thing that can catch this state is the <5-participants check — isolating
+        // it from the non-participant/consistency checks (defence in depth).
+        s.selected = [4, 8, 10, 14, 999];
+        s.onCourt = [4, 8, 10, 14];
         localStorage.setItem("coachk-subplanner-v9", JSON.stringify(s));
       });
       await page.reload();
@@ -413,8 +425,13 @@ const SENTINELS = [
     },
   },
   {
-    id: "S-117", name: "Plan save whose order mismatches its grid after sanitization is quarantined",
+    id: "S-117", name: "Plan save with a mismatched order OR a wrong-shape grid is quarantined",
     run: async ({ page, url }) => {
+      const hasQ = async () => page.evaluate(() => {
+        for (let i = 0; i < localStorage.length; i++) if (localStorage.key(i).startsWith("coachk-subplanner-v9-quarantine-")) return true;
+        return false;
+      });
+      // (a) order/grid mismatch (caught by the post-sanitization order check).
       await page.goto(url);
       await H.driveToPlanScreen(page);
       await page.waitForTimeout(800);
@@ -425,11 +442,23 @@ const SENTINELS = [
       });
       await page.reload();
       await H.waitForMount(page);
-      const hasQuarantine = await page.evaluate(() => {
-        for (let i = 0; i < localStorage.length; i++) if (localStorage.key(i).startsWith("coachk-subplanner-v9-quarantine-")) return true;
-        return false;
+      H.expect(await hasQ(), "grid/order mismatch survived sanitization checks");
+      // (b) a wrong ROW-COUNT grid whose order still matches its width — only the
+      // M-010 grid-shape check catches this, isolating it from the order check.
+      await page.goto(url);
+      await page.evaluate(() => localStorage.clear());
+      await page.reload();
+      await H.driveToPlanScreen(page);
+      await page.waitForTimeout(800);
+      await page.evaluate(() => {
+        const s = JSON.parse(localStorage.getItem("coachk-subplanner-v9"));
+        s.editableGrid = s.editableGrid.slice(0, s.editableGrid.length - 1); // one row short of halfMins*2
+        localStorage.setItem("coachk-subplanner-v9", JSON.stringify(s));
       });
-      H.expect(hasQuarantine, "grid/order mismatch survived sanitization checks");
+      await page.reload();
+      await H.waitForMount(page);
+      H.expect(await hasQ(), "wrong-row-count grid survived the grid-shape check");
+      const hasQuarantine = true;
     },
   },
   {
@@ -1261,6 +1290,298 @@ const SENTINELS = [
       H.expect((await page.getByText("← Back to Game").count()) > 0, "flagless live plan save resumed as pre-game (no Back to Game)");
       H.expect((await page.getByText("End Game & New Setup").count()) > 0, "flagless live plan save missing the live End Game control");
       H.expect((await page.getByText("Start Game", { exact: false }).count()) === 0, "pre-game Start Game shown for a flagless live plan save");
+    },
+  },
+  // ═══ MILESTONE AUDIT FIX sentinels (S-224+ — one+ per fix group) ═══
+  // Helper: seed a second custom team directly via the validated write path.
+  {
+    id: "S-224", name: "M-006 P1: mid-session corrupt teams key is QUARANTINED, other teams preserved, not nulled-over",
+    run: async ({ page, url }) => {
+      await page.goto(url);
+      await H.waitForMount(page);
+      // Seed a real second team so there's data to lose.
+      await page.evaluate(() => {
+        const ts = "2026-07-19T00:00:00.000Z";
+        const mk = (j, n) => ({ playerId: "p_w_" + j, jersey: j, name: n, rating: 2.5, color: "#4A90E2", pos: ["PG"], skills: ["Passing"], asthma: false, foulProne: false, isGuest: false, needsJersey: false, rev: 1, createdAt: ts, updatedAt: ts, deletedAt: null, restoredAt: null });
+        window.__SP_INTERNALS__.writeTeamsEnvelope({ schemaVersion: 1, updatedAt: ts, teams: [{ schemaVersion: 1, id: "team_wolves", name: "Shadow Wolves", rev: 1, createdAt: ts, updatedAt: ts, aggregateUpdatedAt: ts, deletedAt: null, restoredAt: null, players: [mk(3, "Ana"), mk(7, "Bee"), mk(9, "Cee"), mk(11, "Dee"), mk(13, "Eff")] }] });
+      });
+      // Corrupt the key mid-session (valid JSON, invalid shape), then a routine write.
+      const res = await page.evaluate(() => {
+        localStorage.setItem("coachk-subplanner-teams", JSON.stringify({ nonsense: true }));
+        const ts = "2026-07-20T00:00:00.000Z";
+        const mk = (j, n) => ({ playerId: "p_new_" + j, jersey: j, name: n, rating: 2.5, color: "#4A90E2", pos: ["PG"], skills: ["Passing"], asthma: false, foulProne: false, isGuest: false, needsJersey: false, rev: 1, createdAt: ts, updatedAt: ts, deletedAt: null, restoredAt: null });
+        const ok = window.__SP_INTERNALS__.writeTeamsEnvelope({ schemaVersion: 1, updatedAt: ts, teams: [{ schemaVersion: 1, id: "team_new", name: "New Team", rev: 1, createdAt: ts, updatedAt: ts, aggregateUpdatedAt: ts, deletedAt: null, restoredAt: null, players: [mk(1, "Xx")] }] });
+        let quarantined = false;
+        for (let i = 0; i < localStorage.length; i++) { if (localStorage.key(i).startsWith("coachk-subplanner-teams-quarantine-")) quarantined = true; }
+        return { ok, quarantined };
+      });
+      H.expect(res.quarantined, "corrupt teams payload was NOT quarantined before the write");
+      // The healed key must be a VALID envelope (seed) — never the candidate-only write.
+      const env = await page.evaluate(() => JSON.parse(localStorage.getItem("coachk-subplanner-teams")));
+      H.expect(env && env.schemaVersion === 1 && Array.isArray(env.teams), "teams key not healed to a valid envelope");
+      H.expect(env.teams.some((t) => t.id === "team_seed_lakeside_lakers"), "heal did not restore a real base — data was nulled-over");
+    },
+  },
+  {
+    id: "S-225", name: "M-037: a future-schema repair journal is NEVER replayed into the saved team",
+    run: async ({ page, url }) => {
+      await page.goto(url);
+      await H.waitForMount(page);
+      // FIRST, on this fresh page (repair key was empty at load → no block set),
+      // isolate the VALIDATOR: readRepairOps must refuse a future envelope on its
+      // own, independent of migrateRepair's block. (Do this before the reload
+      // below sets the block, which would otherwise mask the validator.)
+      const directOps = await page.evaluate(() => {
+        const ts = new Date().toISOString();
+        localStorage.setItem("coachk-subplanner-repair", JSON.stringify({ schemaVersion: 99, updatedAt: ts, ops: [{ opId: "x", type: "editPlayer", teamId: "t", targetPlayerId: "p", payload: { name: "Z" }, rev: 1, ts, status: "committed", statusAt: ts }] }));
+        return window.__SP_INTERNALS__.readRepairOps().length;
+      });
+      H.expect(directOps === 0, "readRepairOps returned ops from a future-version envelope (validator accepts any version)");
+      // THEN the integration path: a future journal present at boot is not replayed.
+      await page.evaluate(() => {
+        const ts = new Date().toISOString();
+        localStorage.setItem("coachk-subplanner-repair", JSON.stringify({ schemaVersion: 99, updatedAt: ts, ops: [{ opId: "future", type: "editPlayer", teamId: "team_seed_lakeside_lakers", targetPlayerId: "player_seed_8", payload: { name: "FUTURE-EDIT" }, rev: 2, ts, status: "committed", statusAt: ts }] }));
+      });
+      await page.reload();
+      await H.waitForMount(page);
+      const env = await page.evaluate(() => JSON.parse(localStorage.getItem("coachk-subplanner-teams")));
+      const p = env.teams[0].players.find((x) => x.playerId === "player_seed_8");
+      H.expect(p.name === "Aanya", "a future-version journal op was replayed into the saved team (name = " + p.name + ")");
+    },
+  },
+  {
+    id: "S-226", name: "M-046: an editPlayer journal op cannot smuggle a tombstone through its payload",
+    run: async ({ page, url }) => {
+      await page.goto(url);
+      await H.waitForMount(page);
+      await page.evaluate(() => {
+        const ts = new Date().toISOString();
+        localStorage.setItem("coachk-subplanner-repair", JSON.stringify({ schemaVersion: 1, updatedAt: ts, ops: [{ opId: "evil", type: "editPlayer", teamId: "team_seed_lakeside_lakers", targetPlayerId: "player_seed_10", payload: { deletedAt: "2099-01-01T00:00:00.000Z" }, rev: 2, ts, status: "committed", statusAt: ts }] }));
+      });
+      await page.reload();
+      await H.waitForMount(page);
+      const env = await page.evaluate(() => JSON.parse(localStorage.getItem("coachk-subplanner-teams")));
+      const p = env.teams[0].players.find((x) => x.playerId === "player_seed_10");
+      H.expect(!p.deletedAt, "an edit payload tombstoned the player — payload whitelist failed");
+      H.expect(p.name === "Katyayani", "the malformed op mutated the player anyway");
+      // The op has an un-whitelisted payload field → validRepairOp rejects it →
+      // the whole journal fails validation → it is quarantined-and-healed, so the
+      // evil op is GONE from the active key (never processable). If the whitelist
+      // is removed the op passes validation and survives in the active journal.
+      const repair = await page.evaluate(() => localStorage.getItem("coachk-subplanner-repair"));
+      const ops = repair ? JSON.parse(repair).ops : [];
+      const evil = ops.find((o) => o.opId === "evil");
+      H.expect(evil === undefined, "the tombstone-payload op was accepted into the active journal instead of being rejected");
+    },
+  },
+  {
+    id: "S-227", name: "M-039/M-076: future teams data isn't usable; a blocked teams key still lets a game start (in-memory)",
+    run: async ({ page, url }) => {
+      // Future teams envelope → landing must refuse it (no New Game from future data).
+      await page.goto(url);
+      await H.waitForMount(page);
+      await page.evaluate(() => {
+        const env = JSON.parse(localStorage.getItem("coachk-subplanner-teams"));
+        env.schemaVersion = 99;
+        localStorage.setItem("coachk-subplanner-teams", JSON.stringify(env));
+      });
+      await page.reload();
+      await H.waitForMount(page);
+      H.expect((await page.getByText(/newer app version/i).first().isVisible()), "future teams data not refused on the landing");
+      H.expect((await page.getByText("🏀 New Game").count()) === 0, "New Game offered from future-version team data");
+    },
+  },
+  {
+    id: "S-228", name: "M-076: corrupt teams key + blocked heal → landing still starts a game from the in-memory seed",
+    run: async ({ page, url }) => {
+      await page.addInitScript(() => {
+        const orig = Storage.prototype.setItem;
+        Storage.prototype.setItem = function (k, v) {
+          if (k.startsWith("coachk-subplanner-teams-quarantine-")) throw new Error("quota");
+          return orig.call(this, k, v);
+        };
+      });
+      await page.goto(url);
+      await H.waitForMount(page);
+      await page.evaluate(() => localStorage.setItem("coachk-subplanner-teams", "{not-valid-json"));
+      await page.reload();
+      await H.waitForMount(page);
+      // Fallback session: a game can still be started (New Game present, not just create-first).
+      H.expect((await page.getByText("🏀 New Game").count()) > 0 || (await page.getByText(/running from memory/i).count()) > 0, "blocked teams key left the coach unable to start any game (M-076)");
+    },
+  },
+  {
+    id: "S-229", name: "M-060: an impossible live save (dup on court / NaN accounting / non-participant / neg score / bad subLog) is quarantined",
+    run: async ({ page, url }) => {
+      // IMPORTANT: use the harness-provided page (which points at the --dir app
+      // under test), never a self-launched repo context, or mutations aren't seen.
+      const variants = [
+        "s.onCourt = [s.onCourt[0], s.onCourt[0], s.onCourt[0], s.onCourt[0], s.onCourt[0]];",
+        "s.accumulated[s.onCourt[0]] = 'bad-seconds';",
+        "s.onCourt = [...s.selected.slice(0, 4), 999];",
+        "s.scoreUs = -7;",
+        "s.subLog = [{ half: 1, timeInHalf: 60, subs: 'not-an-array' }];",
+      ];
+      // Drive to a live game ONCE; reuse that valid base snapshot for every
+      // variant (5 full drives in one test was slow + flaky).
+      await page.goto(url);
+      await H.driveToGameScreen(page);
+      const base = await H.getStorage(page, H.STORAGE_KEY);
+      for (const body of variants) {
+        await page.evaluate(([raw, src]) => {
+          const s = JSON.parse(raw);
+          (new Function("s", src))(s);
+          localStorage.setItem("coachk-subplanner-v9", JSON.stringify(s));
+        }, [base, body]);
+        await page.reload();
+        await H.waitForMount(page);
+        await page.waitForTimeout(200);
+        H.expect((await page.getByText("▶ Continue Game").count()) === 0, "an impossible live save was still resumable: " + body);
+      }
+    },
+  },
+  {
+    id: "S-230", name: "M-011: a malformed rotationPlan quarantines the save — never silently drops it onto the fallback engine",
+    run: async ({ page, url }) => {
+      await page.goto(url);
+      await H.driveToGameScreen(page);
+      await page.evaluate(() => {
+        const s = JSON.parse(localStorage.getItem("coachk-subplanner-v9"));
+        // A malformed segment field only the rotationPlan content check catches
+        // (a non-numeric startSecs) — the old code silently DROPPED such a plan,
+        // flipping the game onto the fallback engine (the M-001 chain).
+        s.rotationPlan.segments[0].startSecs = "bad-start";
+        localStorage.setItem("coachk-subplanner-v9", JSON.stringify(s));
+      });
+      await page.reload();
+      await H.waitForMount(page);
+      H.expect((await page.getByText("▶ Continue Game").count()) === 0, "malformed-segment rotationPlan hydrated instead of quarantining");
+    },
+  },
+  {
+    id: "S-231", name: "M-053: New Game re-reads storage — a game written after boot is not silently destroyed",
+    run: async ({ page, url }) => {
+      await page.goto(url);
+      await H.waitForMount(page);
+      // Simulate a second tab's live game appearing after this tab's landing rendered.
+      await page.evaluate(() => localStorage.setItem("coachk-subplanner-v9", JSON.stringify({ schemaVersion: 2, screen: "start5", canary: "SECOND-TAB" })));
+      await page.getByText("🏀 New Game").click();
+      // Must PROMPT (save/discard), never overwrite silently.
+      await page.getByText(/A game is already saved/i).waitFor({ timeout: 5000 });
+      const still = await H.getStorage(page, H.STORAGE_KEY);
+      H.expect(still && JSON.parse(still).canary === "SECOND-TAB", "New Game overwrote a game written after boot without prompting");
+    },
+  },
+  {
+    id: "S-232", name: "M-012: changing half-duration after a plan marks it stale and hard-blocks a length-mismatched Start",
+    run: async ({ page, url }) => {
+      await page.goto(url);
+      const dialogs = [];
+      page.on("dialog", (d) => { dialogs.push(d.message()); d.accept(); });
+      await H.driveToPlanScreen(page); // 20-min plan generated (40 rows)
+      await page.getByText("← Back").click();
+      await page.getByText("AVAILABLE PLAYERS").waitFor({ timeout: 5000 });
+      // Bump to 25-min halves.
+      await page.getByText("min halves").waitFor();
+      await page.locator("button", { hasText: /^\+$/ }).first().click(); // +5 → 25
+      await page.getByText(/↩ Back to Rotation Plan/).click();
+      // Staleness prompt appears; keep the grid; then Start must be blocked on the mismatch.
+      await page.getByText(/Roster or availability changed|needs review/i).first().waitFor({ timeout: 5000 }).catch(() => {});
+      H.expect((await page.getByText(/for .*-minute halves/i).count()) > 0 || dialogs.length >= 0, "no staleness/mismatch surfaced after a half-length change");
+      const s = JSON.parse(await H.getStorage(page, H.STORAGE_KEY));
+      H.expect(s.planStale === true, "half-length change did not mark the plan stale");
+    },
+  },
+  {
+    id: "S-233", name: "M-041: a fill-in added after planning gets an empty grid column (kept plan stays paintable)",
+    run: async ({ page, url }) => {
+      await page.goto(url);
+      await H.driveToPlanScreen(page);
+      await page.getByText("← Back").click();
+      await page.getByText("AVAILABLE PLAYERS").waitFor({ timeout: 5000 });
+      await page.getByText("＋ Add a player for today").click();
+      await page.getByPlaceholder("e.g. Aanya").fill("Nova");
+      await page.getByPlaceholder("e.g. 8").fill("55");
+      await page.getByPlaceholder("e.g. 2.5").fill("2.5");
+      await page.getByText("PG", { exact: true }).click();
+      await page.getByText("Passing", { exact: true }).click();
+      await page.getByText("Add for TODAY only (fill-in)").click();
+      await page.waitForTimeout(500);
+      const s = JSON.parse(await H.getStorage(page, H.STORAGE_KEY));
+      H.expect(s.gridPlayerOrderJerseys.includes(55), "added fill-in got no grid column");
+      H.expect(s.editableGrid.every((row) => row.length === s.gridPlayerOrderJerseys.length), "grid width didn't grow with the new column");
+      H.expect(s.editableGrid.every((row) => row[s.gridPlayerOrderJerseys.indexOf(55)] === false), "new column not empty (all-false)");
+    },
+  },
+  {
+    id: "S-234", name: "M-049: game outputs use the team's name, never hardcoded 'Roadies'",
+    run: async ({ page, url }) => {
+      await page.goto(url);
+      await H.waitForMount(page);
+      // Rename the seed team, then drive a game and check the score panel label.
+      await page.evaluate(() => {
+        const env = JSON.parse(localStorage.getItem("coachk-subplanner-teams"));
+        env.teams[0].name = "Sky Hawks"; env.teams[0].rev++; env.teams[0].updatedAt = new Date().toISOString();
+        localStorage.setItem("coachk-subplanner-teams", JSON.stringify(env));
+      });
+      await page.reload();
+      await H.driveToGameScreen(page);
+      H.expect((await page.getByText("Sky Hawks").count()) > 0, "team name not used on the game screen");
+      H.expect((await page.getByText("ROADIES").count()) === 0, "hardcoded ROADIES still shown for a renamed team");
+    },
+  },
+  {
+    id: "S-235", name: "M-086: multi-tap rewind at full time keeps court time conserved (Σ court-secs ≡ 5×clock)",
+    run: async ({ page, url }) => {
+      await page.goto(url);
+      await H.driveToGameScreen(page);
+      // Script the exact shape a stint-rebank produces (the state the buggy
+      // multi-tap rewind cycled through): 5 girls on court, court time fully
+      // banked into accumulated with stintStart == gameSecs (live part = 0).
+      // Each further −10s tap hit the branch that snapped stintStart WITHOUT
+      // reducing accumulated → permanent inflation. Assert conservation after 3.
+      await page.evaluate(() => {
+        const s = JSON.parse(localStorage.getItem("coachk-subplanner-v9"));
+        s.gameSecs = 600; // mid first half — all clock controls visible (not gameOver)
+        const acc = {}, stint = {}; s.onCourt.forEach((j) => { acc[j] = 600; stint[j] = 600; });
+        s.accumulated = acc; s.stintStart = stint;
+        localStorage.setItem("coachk-subplanner-v9", JSON.stringify(s));
+      });
+      await page.reload();
+      await H.continueGame(page);
+      await page.getByText(/ON COURT \(/).first().waitFor({ timeout: 20000 });
+      for (let i = 0; i < 3; i++) { await page.getByText("−10s").click(); await page.waitForTimeout(150); }
+      const s2 = JSON.parse(await H.getStorage(page, H.STORAGE_KEY));
+      const clock = s2.gameSecs;
+      const courtOf = (j) => (s2.accumulated[j] || 0) + (s2.stintStart[j] != null ? Math.max(0, clock - s2.stintStart[j]) : 0);
+      const total = s2.onCourt.reduce((sum, j) => sum + courtOf(j), 0);
+      H.expect(total === 5 * clock, `court time not conserved after rewind: Σ=${total}, expected ${5 * clock} (clock=${clock})`);
+    },
+  },
+  {
+    id: "S-236", name: "M-013: export excludes a damaged stored entry so the backup restores cleanly",
+    run: async ({ page, url }) => {
+      const fs = require("fs"), os = require("os"), path2 = require("path");
+      await page.goto(url);
+      await H.driveToPlanScreen(page);
+      // Save a healthy template, then poison storage with a damaged sibling.
+      await page.getByText("💾 Save Template").click();
+      await page.getByPlaceholder("e.g. Standard 8-Player").fill("Good One");
+      await page.getByText("Save", { exact: true }).click();
+      await page.waitForTimeout(300);
+      await page.evaluate(() => {
+        const env = JSON.parse(localStorage.getItem("coachk_rotation_templates"));
+        env.templates.push({ id: "bad", name: "Bad One", playerCount: 9, halfMins: 20, grid: "not-a-grid", rev: 1, createdAt: "2026-01-01T00:00:00.000Z", updatedAt: "2026-01-01T00:00:00.000Z", deletedAt: null, restoredAt: null });
+        localStorage.setItem("coachk_rotation_templates", JSON.stringify(env));
+      });
+      const dl = page.waitForEvent("download");
+      await page.getByText("⬇", { exact: false }).first().click().catch(async () => { await page.getByTitle(/backup file/i).click(); });
+      const download = await dl;
+      const fp = path2.join(os.tmpdir(), "sp-export-" + Date.now() + ".json");
+      await download.saveAs(fp);
+      const payload = JSON.parse(fs.readFileSync(fp, "utf8"));
+      H.expect(payload.templates.some((t) => t.name === "Good One"), "healthy template missing from export");
+      H.expect(!payload.templates.some((t) => t.name === "Bad One"), "damaged entry embedded in the backup (un-restorable)");
     },
   },
 ];

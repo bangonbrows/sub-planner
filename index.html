@@ -66,6 +66,32 @@ function safeSet(key, val) {
   if (storageBlocks[key]) return false;
   try { localStorage.setItem(key, val); return localStorage.getItem(key) === val; } catch (e) { return false; }
 }
+// Distinguishes WHY a write didn't verify, so merge-writers can actually retry
+// the contended case (M-015 — the old boolean made every mismatch a dead end).
+function safeSetDetailed(key, val) {
+  if (storageBlocks[key]) return "blocked";
+  try { localStorage.setItem(key, val); } catch (e) { return "error"; }
+  try { return localStorage.getItem(key) === val ? "ok" : "mismatch"; } catch (e) { return "error"; }
+}
+// §5.3 sticky NOT-SAVING notice with a retry action, one per key (M-016).
+// retryFn re-attempts the write; on success the notice resolves in place.
+const writeFailureNotices = {};
+function noteWriteFailure(key, label, retryFn) {
+  if (writeFailureNotices[key]) return;
+  const notice = { text: "NOT SAVING " + label + " — the last save failed. Your changes are kept in memory for this session.", action: null };
+  notice.action = {
+    label: "Retry save",
+    run: () => {
+      if (retryFn()) {
+        notice.text = label + " saved — storage is working again.";
+        notice.action = null;
+        delete writeFailureNotices[key];
+      }
+    },
+  };
+  writeFailureNotices[key] = notice;
+  storageNotices.push(notice);
+}
 
 // Verbatim raw download — used by quarantine/deferral notices (§5.1: opaque bytes, .txt).
 function downloadRawText(filename, raw) {
@@ -78,18 +104,26 @@ function downloadRawText(filename, raw) {
 }
 
 // §5.1 quarantine: copy raw to <key>-quarantine-<ts>, read-back verify, keep newest 3.
+// M-020: an existing verified copy holding this EXACT payload is reused, never
+// duplicated (repeated heal failures no longer churn the retention window).
+// M-005: pruning runs BEFORE the new write, so freeing old copies can make room
+// for the preservation itself under near-full storage.
 function quarantineRaw(key, raw) {
-  const qkey = key + "-quarantine-" + Date.now();
   try {
-    localStorage.setItem(qkey, raw);
-    if (localStorage.getItem(qkey) !== raw) return false;
     const mine = [];
     for (let i = 0; i < localStorage.length; i++) {
       const k = localStorage.key(i);
       if (k && k.startsWith(key + "-quarantine-")) mine.push(k);
     }
-    mine.sort().slice(0, -3).forEach((k) => { try { localStorage.removeItem(k); } catch (e) {} });
-    return true;
+    mine.sort();
+    for (const k of mine) {
+      try { if (localStorage.getItem(k) === raw) return true; } catch (e) {} // content-match reuse
+    }
+    // Prune to 2 first — the incoming copy becomes the third (newest).
+    mine.slice(0, -2).forEach((k) => { try { localStorage.removeItem(k); } catch (e) {} });
+    const qkey = key + "-quarantine-" + Date.now();
+    localStorage.setItem(qkey, raw);
+    return localStorage.getItem(qkey) === raw;
   } catch (e) { return false; }
 }
 
@@ -112,22 +146,53 @@ function quarantineAndHeal(key, raw, healValue, noticeText) {
 }
 
 // ── Team / player model validation ──────────────────────────────────────────
+// M-061/M-044: value DOMAINS and cross-record invariants, not just JS types —
+// a stored record with rating -100, pos ["QB"], a truthy-object deletedAt, or a
+// duplicated identity is corruption and must take the quarantine path, never be
+// accepted (it silently loses girls or permanently poisons merge freshness).
+const nullOrIso = (v) => v === null || v === undefined || typeof v === "string";
 function validPlayer(p) {
   return p && typeof p === "object" && typeof p.playerId === "string" && p.playerId &&
     (p.jersey === null || (Number.isInteger(p.jersey) && p.jersey >= 0 && p.jersey <= 99)) &&
-    typeof p.name === "string" && typeof p.rating === "number" &&
-    Array.isArray(p.pos) && Array.isArray(p.skills) &&
-    typeof p.rev === "number" && typeof p.createdAt === "string" && typeof p.updatedAt === "string";
+    typeof p.name === "string" && p.name.trim().length > 0 &&
+    typeof p.rating === "number" && isFinite(p.rating) && p.rating >= 1 && p.rating <= 5 &&
+    Array.isArray(p.pos) && p.pos.length > 0 && p.pos.every((x) => POSITIONS.includes(x)) &&
+    Array.isArray(p.skills) && p.skills.length > 0 && p.skills.every((x) => SKILL_SET.includes(x)) &&
+    typeof p.color === "string" &&
+    typeof p.rev === "number" && isFinite(p.rev) && p.rev >= 0 &&
+    typeof p.createdAt === "string" && typeof p.updatedAt === "string" &&
+    nullOrIso(p.deletedAt) && nullOrIso(p.restoredAt);
 }
 function validTeam(t) {
-  return t && typeof t === "object" && t.schemaVersion === 1 && typeof t.id === "string" && t.id &&
-    typeof t.name === "string" && typeof t.rev === "number" &&
+  if (!(t && typeof t === "object" && t.schemaVersion === 1 && typeof t.id === "string" && t.id &&
+    typeof t.name === "string" && t.name.trim().length > 0 &&
+    typeof t.rev === "number" && isFinite(t.rev) &&
     typeof t.createdAt === "string" && typeof t.updatedAt === "string" && typeof t.aggregateUpdatedAt === "string" &&
-    Array.isArray(t.players) && t.players.every(validPlayer);
+    nullOrIso(t.deletedAt) && nullOrIso(t.restoredAt) &&
+    Array.isArray(t.players) && t.players.every(validPlayer))) return false;
+  // Cross-record: unique playerIds; unique jerseys among ACTIVE players.
+  const ids = new Set(), jerseys = new Set();
+  for (const p of t.players) {
+    if (ids.has(p.playerId)) return false;
+    ids.add(p.playerId);
+    if (!p.deletedAt && p.jersey !== null) {
+      if (jerseys.has(p.jersey)) return false;
+      jerseys.add(p.jersey);
+    }
+  }
+  return true;
 }
 function validTeamsEnvelope(env) {
-  return env && typeof env === "object" && typeof env.schemaVersion === "number" &&
-    Array.isArray(env.teams) && env.teams.every(validTeam);
+  // Exact-version check (M-018): only schemaVersion 1 is OUR format. Future
+  // versions are handled by the refusal paths BEFORE this validator runs.
+  if (!(env && typeof env === "object" && env.schemaVersion === 1 &&
+    Array.isArray(env.teams) && env.teams.every(validTeam))) return false;
+  const ids = new Set();
+  for (const t of env.teams) {
+    if (ids.has(t.id)) return false; // duplicate team ids start the WRONG team (M-044)
+    ids.add(t.id);
+  }
+  return true;
 }
 
 // ── Deterministic seed (spec W1.c) ──────────────────────────────────────────
@@ -240,10 +305,16 @@ function advanceAggregates(merged, stored) {
   return merged;
 }
 // §5.5 merge-on-write with bounded write-verify. Returns true on verified persist.
+// M-006 (P1): a stored value that is unreadable or invalid is NEVER treated as
+// empty — that nulled-and-overwrote the only copy of every other record. It now
+// takes the §5.1 quarantine-then-heal path, and the merge proceeds against the
+// healed base (the damaged payload is preserved with a banner + export action).
 function writeTeamsEnvelope(candidate) {
   for (let attempt = 0; attempt < 3; attempt++) {
+    const raw = safeGet(TEAMS_KEY);
     let stored = null;
-    try { const raw = safeGet(TEAMS_KEY); stored = raw ? JSON.parse(raw) : null; } catch (e) { stored = null; }
+    let parseFailed = false;
+    try { stored = raw ? JSON.parse(raw) : null; } catch (e) { parseFailed = true; }
     // §5.2 applies at EVERY write, not only startup (Codex W1-R4: a future-schema
     // envelope appearing mid-session was merged over and downgraded to v1).
     if (stored && ((typeof stored.schemaVersion === "number" && stored.schemaVersion > 1) ||
@@ -254,12 +325,20 @@ function writeTeamsEnvelope(candidate) {
       }
       return false;
     }
-    if (stored && !validTeamsEnvelope(stored)) stored = null; // corrupt handled by migrateTeams
+    if (raw !== null && (parseFailed || (stored && !validTeamsEnvelope(stored)))) {
+      // Mid-session corruption: preserve-then-recover, never null-and-overwrite.
+      const healed = quarantineAndHeal(TEAMS_KEY, raw, JSON.stringify(canonicalizeEnvelope(buildSeedEnvelope())), "Saved team data was damaged.");
+      if (healed !== "healed") return false; // key blocked; §5.1 banner is up
+      try { stored = JSON.parse(safeGet(TEAMS_KEY)); } catch (e) { return false; }
+    }
     let merged = mergeTeamsEnvelopes(JSON.parse(JSON.stringify(candidate)), stored);
     merged = advanceAggregates(merged, stored);
     const out = JSON.stringify(merged);
-    if (!safeSet(TEAMS_KEY, out)) return false;
-    if (safeGet(TEAMS_KEY) === out) return true; // verified; residual window documented in spec
+    const res = safeSetDetailed(TEAMS_KEY, out);
+    if (res === "ok") return true; // verified; residual window documented in spec
+    if (res === "mismatch") continue; // a competing write landed — re-read, re-merge (M-015)
+    if (res === "error") noteWriteFailure(TEAMS_KEY, "team changes", () => writeTeamsEnvelope(candidate));
+    return false;
   }
   return false;
 }
@@ -312,8 +391,10 @@ function mergeTemplatesEnvelopes(mine, theirs) {
 // Pass ONLY changed/new records — the union merge preserves everything else.
 function writeTemplatesEnvelope(candidate) {
   for (let attempt = 0; attempt < 3; attempt++) {
+    const raw = safeGet(TPL_KEY);
     let stored = null;
-    try { const r = safeGet(TPL_KEY); stored = r ? JSON.parse(r) : null; } catch (e) { stored = null; }
+    let parseFailed = false;
+    try { stored = raw ? JSON.parse(raw) : null; } catch (e) { parseFailed = true; }
     // §5.2 at every write (Codex W1-R4): a newer-version envelope must be refused,
     // never merged over.
     if (stored && !Array.isArray(stored) && typeof stored.schemaVersion === "number" && stored.schemaVersion > 1) {
@@ -323,11 +404,24 @@ function writeTemplatesEnvelope(candidate) {
       }
       return false;
     }
-    if (stored && (Array.isArray(stored) || !Array.isArray(stored.templates))) stored = null; // raw arrays are migration/deferral territory, never merged here
+    if (stored && Array.isArray(stored)) {
+      // A raw LEGACY array written mid-session by an old-version tab is DATA, not
+      // corruption (M-006 family): use its migrated form as the merge base so its
+      // entries survive alongside the candidate.
+      stored = { schemaVersion: 1, updatedAt: nowIso(), templates: canonTemplates(stored.filter(validTemplateEntry).map(stripTemplateEntry)) };
+    } else if (raw !== null && (parseFailed || (stored && !Array.isArray(stored.templates)))) {
+      // Genuinely unreadable/invalid → §5.1 preserve-then-recover (M-006).
+      const healed = quarantineAndHeal(TPL_KEY, raw, JSON.stringify({ schemaVersion: 1, updatedAt: nowIso(), templates: [] }), "Saved rotation templates were damaged.");
+      if (healed !== "healed") return false;
+      try { stored = JSON.parse(safeGet(TPL_KEY)); } catch (e) { return false; }
+    }
     const merged = mergeTemplatesEnvelopes(JSON.parse(JSON.stringify(candidate)), stored);
     const out = JSON.stringify(merged);
-    if (!safeSet(TPL_KEY, out)) return false;
-    if (safeGet(TPL_KEY) === out) return true;
+    const res = safeSetDetailed(TPL_KEY, out);
+    if (res === "ok") return true;
+    if (res === "mismatch") continue; // M-015: re-read + re-merge the contended write
+    if (res === "error") noteWriteFailure(TPL_KEY, "template changes", () => writeTemplatesEnvelope(candidate));
+    return false;
   }
   return false;
 }
@@ -356,10 +450,18 @@ function completeDeferredTemplateMigration() {
   let parsed; try { parsed = JSON.parse(templatesDeferredRaw); } catch (e) { parsed = null; }
   const arr = Array.isArray(parsed) ? parsed : [];
   const healthy = arr.filter(validTemplateEntry);
+  const droppedCount = arr.length - healthy.length;
   delete storageBlocks[TPL_KEY];
-  const ok = safeSet(TPL_KEY, JSON.stringify({ schemaVersion: 1, updatedAt: nowIso(), templates: canonTemplates(healthy.map(stripTemplateEntry)) }));
+  // M-014: this is a template-envelope write like any other — it goes through
+  // §5.5 merge-on-write, so a template another tab created post-migration is
+  // UNIONED in, never clobbered by this tab's old legacy subset.
+  const ok = writeTemplatesEnvelope({ schemaVersion: 1, updatedAt: nowIso(), templates: canonTemplates(healthy.map(stripTemplateEntry)) });
   if (!ok) { storageBlocks[TPL_KEY] = "migration-deferred"; return false; }
   templatesDeferredRaw = null;
+  // M-069: the drop is never silent — same count-notice as the normal path.
+  if (droppedCount > 0) {
+    storageNotices.push({ text: droppedCount + " damaged template(s) couldn't be kept. The originals are in your downloaded file." });
+  }
   try { window.dispatchEvent(new Event("sp-templates-migrated")); } catch (e) {}
   return true;
 }
@@ -408,21 +510,22 @@ function migrateTemplates() {
   // Legacy array → ordered migration contract (§6, round-14/15/16).
   const healthy = [], malformed = [];
   for (const t of parsed) (validTemplateEntry(t) ? healthy : malformed).push(t);
-  if (malformed.length > 0) {
-    // Verified stash REQUIRED before any drop.
-    const stashKey = TPL_KEY + "-premigration";
-    let stashed = false;
-    try { localStorage.setItem(stashKey, raw); stashed = localStorage.getItem(stashKey) === raw; } catch (e) { stashed = false; }
-    if (!stashed) {
-      // DEFER: read-only legacy mode for the session; raw stays untouched.
-      templatesDeferredRaw = raw;
-      storageBlocks[TPL_KEY] = "migration-deferred";
-      storageNotices.push(makeDeferredTemplatesNotice(raw));
-      return;
-    }
+  // M-021: the stash is attempted for EVERY legacy migration (Rev 16 letter);
+  // only a MALFORMED-entry migration defers on stash failure — an all-healthy
+  // one proceeds (nothing can be lost; the envelope carries every entry).
+  const stashKey = TPL_KEY + "-premigration";
+  let stashed = false;
+  try { localStorage.setItem(stashKey, raw); stashed = localStorage.getItem(stashKey) === raw; } catch (e) { stashed = false; }
+  if (malformed.length > 0 && !stashed) {
+    // DEFER: read-only legacy mode for the session; raw stays untouched.
+    templatesDeferredRaw = raw;
+    storageBlocks[TPL_KEY] = "migration-deferred";
+    storageNotices.push(makeDeferredTemplatesNotice(raw));
+    return;
   }
   const envelope = { schemaVersion: 1, updatedAt: nowIso(), templates: healthy.map(stripTemplateEntry) };
-  if (safeSet(TPL_KEY, JSON.stringify(envelope))) {
+  // M-014: migration writes are template-envelope writes — §5.5 merge-on-write.
+  if (writeTemplatesEnvelope(envelope)) {
     if (malformed.length > 0) {
       storageNotices.push({ text: malformed.length + " damaged template(s) couldn't be kept. The originals were preserved.", action: { label: "Save original template data", run: () => downloadRawText("templates-original.txt", raw) } });
     }
@@ -442,17 +545,36 @@ function migrateTemplates() {
 // a delete, because a deleted op could merge back in from a stale tab's copy
 // (the §5.5 resurrection defect pattern) while a cleared marker always wins.
 const OP_STATUS_RANK = { prepared: 0, committed: 1, cleared: 2 };
+// M-046: payload fields are WHITELISTED per op type — a parseable op must never
+// smuggle lifecycle/identity fields (deletedAt, restoredAt, playerId, rev,
+// createdAt…) through an edit payload. Enforced here AND at replay.
+const OP_PAYLOAD_FIELDS = {
+  editPlayer: ["name", "jersey", "rating", "color", "pos", "skills", "asthma", "foulProne"],
+  addPlayer: ["name", "jersey", "rating", "color", "pos", "skills", "asthma", "foulProne", "isGuest", "needsJersey"],
+  removePlayer: [],
+};
 function validRepairOp(o) {
-  return o && typeof o === "object" && typeof o.opId === "string" && o.opId &&
+  if (!(o && typeof o === "object" && typeof o.opId === "string" && o.opId &&
     (o.type === "editPlayer" || o.type === "addPlayer" || o.type === "removePlayer") &&
     typeof o.teamId === "string" && o.teamId && typeof o.targetPlayerId === "string" && o.targetPlayerId &&
-    o.payload && typeof o.payload === "object" &&
+    o.payload && typeof o.payload === "object" && !Array.isArray(o.payload) &&
     typeof o.rev === "number" && typeof o.ts === "string" &&
-    OP_STATUS_RANK[o.status] !== undefined && typeof o.statusAt === "string";
+    OP_STATUS_RANK[o.status] !== undefined && typeof o.statusAt === "string")) return false;
+  const allowed = OP_PAYLOAD_FIELDS[o.type];
+  return Object.keys(o.payload).every((k) => allowed.includes(k));
 }
 function validRepairEnvelope(env) {
-  return env && typeof env === "object" && typeof env.schemaVersion === "number" &&
+  // Exact-version check (M-018/M-037): only schemaVersion 1 is OUR format.
+  return env && typeof env === "object" && env.schemaVersion === 1 &&
     Array.isArray(env.ops) && env.ops.every(validRepairOp);
+}
+// Defensive pick at replay time (belt for the validator's braces).
+function pickOpPayload(op) {
+  const out = {};
+  for (const k of OP_PAYLOAD_FIELDS[op.type] || []) {
+    if (op.payload[k] !== undefined) out[k] = op.payload[k];
+  }
+  return out;
 }
 function canonOps(ops) {
   // (ts, opId) is both the canonical storage order AND the replay order (§5.5).
@@ -478,8 +600,10 @@ function mergeRepairEnvelopes(mine, theirs) {
 // Pass ONLY the changed/new ops — the union merge preserves the rest.
 function writeRepairEnvelope(changedOps) {
   for (let attempt = 0; attempt < 3; attempt++) {
+    const raw = safeGet(REPAIR_KEY);
     let stored = null;
-    try { const r = safeGet(REPAIR_KEY); stored = r ? JSON.parse(r) : null; } catch (e) { stored = null; }
+    let parseFailed = false;
+    try { stored = raw ? JSON.parse(raw) : null; } catch (e) { parseFailed = true; }
     if (stored && typeof stored.schemaVersion === "number" && stored.schemaVersion > 1) {
       if (!storageBlocks[REPAIR_KEY]) {
         storageBlocks[REPAIR_KEY] = "future-schema";
@@ -487,18 +611,29 @@ function writeRepairEnvelope(changedOps) {
       }
       return false;
     }
-    if (stored && !validRepairEnvelope(stored)) stored = null; // corrupt handled by migrateRepair
+    if (raw !== null && (parseFailed || (stored && !validRepairEnvelope(stored)))) {
+      // M-006 family: preserve-then-recover, never null-and-overwrite.
+      const healed = quarantineAndHeal(REPAIR_KEY, raw, JSON.stringify({ schemaVersion: 1, updatedAt: nowIso(), ops: [] }), "Pending team-edit data was damaged.");
+      if (healed !== "healed") return false;
+      try { stored = JSON.parse(safeGet(REPAIR_KEY)); } catch (e) { return false; }
+    }
     const merged = mergeRepairEnvelopes({ schemaVersion: 1, updatedAt: nowIso(), ops: changedOps }, stored);
     const out = JSON.stringify(merged);
-    if (!safeSet(REPAIR_KEY, out)) return false;
-    if (safeGet(REPAIR_KEY) === out) return true;
+    const res = safeSetDetailed(REPAIR_KEY, out);
+    if (res === "ok") return true;
+    if (res === "mismatch") continue; // M-015
+    if (res === "error") noteWriteFailure(REPAIR_KEY, "pending team edits", () => writeRepairEnvelope(changedOps));
+    return false;
   }
   return false;
 }
 function readRepairOps() {
+  // §5.2 on the READ path too (M-037): a blocked or future-version journal is
+  // never interpreted — banner-refused data must not be replayed.
+  if (storageBlocks[REPAIR_KEY]) return [];
   try {
     const env = JSON.parse(safeGet(REPAIR_KEY));
-    if (validRepairEnvelope(env)) return canonOps(env.ops.slice());
+    if (validRepairEnvelope(env)) return canonOps(env.ops.slice()); // validator pins sv === 1
   } catch (e) {}
   return [];
 }
@@ -539,7 +674,9 @@ function opTeamsPostcondition(op) {
   const p = team.players.find((x) => x.playerId === op.targetPlayerId);
   if (op.type === "addPlayer") return p ? "applied" : null;
   if (op.type === "removePlayer") {
-    if (!p) return "superseded";
+    // M-054: a record that is entirely ABSENT satisfies a removal — reporting
+    // "superseded" produced a spurious "a later edit replaced this" notice.
+    if (!p) return "applied";
     if (p.deletedAt) return "applied";
     if (p.restoredAt && p.restoredAt > op.ts) return "superseded";
     return p.rev >= op.rev ? "superseded" : null;
@@ -565,13 +702,14 @@ function replayCommittedOp(op) {
   const target = team.players.find((x) => x.playerId === op.targetPlayerId);
   let candidate;
   if (op.type === "addPlayer") {
-    candidate = { ...op.payload, playerId: op.targetPlayerId, rev: 1, createdAt: op.ts, updatedAt: op.ts, deletedAt: null, restoredAt: null };
+    // M-046: whitelisted pick — a payload can never mint lifecycle/identity fields.
+    candidate = { ...pickOpPayload(op), playerId: op.targetPlayerId, rev: 1, createdAt: op.ts, updatedAt: op.ts, deletedAt: null, restoredAt: null };
   } else if (!target) {
-    return "superseded";
+    return op.type === "removePlayer" ? "applied" : "superseded"; // M-054
   } else if (op.type === "removePlayer") {
     candidate = { ...target, deletedAt: op.ts, rev: op.rev, updatedAt: op.ts };
   } else {
-    candidate = { ...target, ...op.payload, rev: op.rev, updatedAt: op.ts };
+    candidate = { ...target, ...pickOpPayload(op), rev: op.rev, updatedAt: op.ts };
   }
   if (!validPlayer(candidate)) return "superseded"; // payload no longer forms a valid player
   // Candidate carries ONLY the affected player — the §5.5 union merge keeps the rest.
@@ -585,6 +723,14 @@ function runRepairOnLoad() {
   if (ops.length === 0) return;
   let snap = null;
   try { snap = JSON.parse(safeGet(GAME_KEY)); } catch (e) {}
+  // M-038: never trust an unvalidated or future-version snapshot for the
+  // roll-forward decision. If it isn't OUR readable shape, treat every effect
+  // as ABSENT (the rollback branch — the safe one; nothing user-visible changed).
+  if (snap && !(typeof snap === "object" &&
+      (snap.schemaVersion === undefined || (typeof snap.schemaVersion === "number" && snap.schemaVersion <= 2)) &&
+      Array.isArray(snap.gameRosterSnapshot))) {
+    snap = null;
+  }
   const updates = [];
   for (const op of ops) {
     if (op.status === "cleared") continue;
@@ -645,13 +791,48 @@ function readTeamsEnvelopeFresh() {
   } catch (e) {}
   return null;
 }
-function listActiveTeams() {
+// Landing/picker/selection read teams through THIS, which distinguishes WHY
+// nothing is readable (M-039/M-076):
+//   "ok"       — storage envelope valid; teams from storage.
+//   "future"   — saved by a NEWER app version: NEVER interpreted (§5.2 read-side);
+//                New Game and create-first are disabled with the banner reason.
+//   "fallback" — key is blocked/damaged (§5.1 blocked session): run the session
+//                on the IN-MEMORY seed so a game can still be started on game
+//                day (the game key itself is not blocked).
+//   "empty"    — genuinely zero active teams → create-first-team path.
+function teamsReadState() {
+  const raw = safeGet(TEAMS_KEY);
+  if (raw !== null) {
+    try {
+      const parsed = JSON.parse(raw);
+      if (parsed && ((typeof parsed.schemaVersion === "number" && parsed.schemaVersion > 1) ||
+          (Array.isArray(parsed.teams) && parsed.teams.some((t) => t && typeof t.schemaVersion === "number" && t.schemaVersion > 1)))) {
+        return { state: "future", teams: [] };
+      }
+    } catch (e) {}
+  }
   const env = readTeamsEnvelopeFresh();
-  return env ? env.teams.filter((t) => !t.deletedAt) : [];
+  if (env) {
+    const active = env.teams.filter((t) => !t.deletedAt);
+    return active.length > 0 ? { state: "ok", teams: active } : { state: "empty", teams: [] };
+  }
+  if (storageBlocks[TEAMS_KEY] === "storage-damaged" || (raw !== null && !env)) {
+    // Damaged and unhealed (or blocked): §5.1 says run in-memory for the session.
+    return { state: "fallback", teams: [getActiveTeam()] };
+  }
+  return { state: "empty", teams: [] };
+}
+function listActiveTeams() {
+  const st = teamsReadState();
+  return st.state === "ok" ? st.teams : [];
 }
 // The Manage-Teams availability + commit-time guard input (§4 W2 round-8/9):
 // a saved game snapshot — pending setup OR live — existing at all.
-function gameSnapshotExists() { return safeGet(GAME_KEY) !== null; }
+// M-078: a READ exception fails CLOSED (treat as "a game exists") — never
+// unlock destructive team edits because storage became unreadable.
+function gameSnapshotExists() {
+  try { return localStorage.getItem(GAME_KEY) !== null; } catch (e) { return true; }
+}
 
 // ── Teams / settings / history migrations (per-key, idempotent — spec W1.c/W1.e) ──
 function migrateTeams() {
@@ -700,9 +881,16 @@ function migrateSimpleKey(key, defaults, label, validator) {
 
 // Run all migrations before the app renders (localStorage is synchronous).
 migrateTeams();
+// M-019 (upgraded P3): the settings validator must enforce VALUE DOMAINS —
+// a string toggle or an Infinity half-length flowed into a pending game that
+// this same build then quarantined on reload (self-inflicted loss of the game).
 migrateSimpleKey(SETTINGS_KEY, SETTINGS_DEFAULTS, "Settings",
-  (s) => s.schemaVersion === 1 && typeof s.defaultHalfMins === "number" && s.defaultHalfMins > 0 &&
-    typeof s.defaultPlanMode === "string" && s.defaultTrackingToggles && typeof s.defaultTrackingToggles === "object");
+  (s) => s.schemaVersion === 1 &&
+    typeof s.defaultHalfMins === "number" && isFinite(s.defaultHalfMins) && s.defaultHalfMins >= 10 && s.defaultHalfMins <= 30 &&
+    typeof s.defaultPlanMode === "string" && ["balanced", "competitive", "development"].includes(s.defaultPlanMode) &&
+    s.defaultTrackingToggles && typeof s.defaultTrackingToggles === "object" &&
+    ["individualFouls", "teamFouls", "rebounds", "points", "gameNotes"].every((k) => typeof s.defaultTrackingToggles[k] === "boolean") &&
+    typeof s.updatedAt === "string");
 migrateSimpleKey(HISTORY_KEY, { schemaVersion: 1, updatedAt: SEED_TS, games: [] }, "Game history",
   (h) => h.schemaVersion === 1 && Array.isArray(h.games));
 migrateTemplates();
@@ -1793,8 +1981,14 @@ function App() {
         return Array.isArray(arr) ? arr.filter(validTemplateEntry).map(stripTemplateEntry) : [];
       } catch { return []; }
     }
+    // M-040 (§5.2 read-side): a FUTURE-version envelope is refused from listing
+    // too — banner-refused data must never be displayed or loadable. (The
+    // deferred-migration block above is different: loading stays allowed there
+    // by spec; only future-schema blocks reads.)
+    if (storageBlocks[TEMPLATES_KEY] === "future-schema") return [];
     try {
       const parsed = JSON.parse(localStorage.getItem(TEMPLATES_KEY));
+      if (parsed && !Array.isArray(parsed) && typeof parsed.schemaVersion === "number" && parsed.schemaVersion > 1) return [];
       // BOTH storage formats validate per entry — the envelope path previously
       // skipped validation, listing a corrupted entry that crashed loadTemplate
       // with grid.map-is-not-a-function (Codex W1-R3 probe).
@@ -1848,6 +2042,9 @@ function App() {
 
   function loadTemplate(template) {
     if (!template || !template.grid) return;
+    // M-040: future-version templates are refused from LOADING too, not merely
+    // from saving — never apply a newer version's data under old semantics.
+    if (storageBlocks[TEMPLATES_KEY] === "future-schema") { showToast("⚠ Templates were saved by a newer app version and can't be used here"); return; }
     // Defence in depth: never apply a structurally-invalid pattern even if one
     // slips into the visible list.
     if (!validTemplateEntry(template)) { showToast("This template is damaged and can't be loaded"); return; }
@@ -1887,18 +2084,34 @@ function App() {
       showToast("No templates to back up");
       return;
     }
-    // Export the FULL stored envelope (tombstones included) so restores honour deletes.
-    let envelope = { schemaVersion: 1, updatedAt: nowIso(), templates: savedTemplates };
+    // Export the stored envelope (tombstones included) so restores honour deletes.
+    // M-013: only VALIDATING entries are exported — one damaged record in storage
+    // used to poison the whole backup (all-or-nothing import refused the file,
+    // stranding every healthy template in it).
+    let allEntries = savedTemplates;
     try {
       const stored = JSON.parse(localStorage.getItem(TEMPLATES_KEY));
-      if (stored && Array.isArray(stored.templates)) envelope = stored;
+      if (stored && Array.isArray(stored.templates)) allEntries = stored.templates;
     } catch (e) {}
+    const exportable = allEntries.filter((t) => {
+      if (!t || typeof t !== "object") return false;
+      if (t.deletedAt) {
+        // Tombstones ride along when well-formed (minimal deletion record, or a
+        // complete record whose core validates) — same rule import enforces.
+        if (!(typeof t.deletedAt === "string" && t.id !== undefined)) return false;
+        const hasCore = t.name !== undefined || t.grid !== undefined || t.playerCount !== undefined || t.halfMins !== undefined;
+        return !hasCore || validTemplateEntry({ ...t, deletedAt: null });
+      }
+      return validTemplateEntry(t);
+    });
+    const skipped = allEntries.length - exportable.length;
+    if (skipped > 0) showToast(`⚠ ${skipped} damaged entr${skipped === 1 ? "y" : "ies"} not included in the backup`);
     const payload = {
       app: "coachk-subplanner",
       kind: "templates",
       schemaVersion: 1,
       exportedAt: new Date().toISOString(),
-      templates: envelope.templates,
+      templates: exportable,
     };
     try {
       const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
@@ -1953,6 +2166,26 @@ function App() {
             continue;
           }
           if (!validTemplateEntry(t)) { showToast("File contains damaged template data — nothing imported"); return; }
+        }
+        // M-048: metadata rides into merge freshness comparisons — junk rev
+        // ("invalid" is truthy!) or non-string timestamps corrupt ordering.
+        for (const t of entries) {
+          if (t.rev !== undefined && !(typeof t.rev === "number" && isFinite(t.rev) && t.rev >= 0)) { showToast("File contains damaged template data — nothing imported"); return; }
+          for (const f of ["createdAt", "updatedAt", "restoredAt", "deletedAt"]) {
+            if (t[f] !== undefined && t[f] !== null && typeof t[f] !== "string") { showToast("File contains damaged template data — nothing imported"); return; }
+          }
+        }
+        // M-022: two DIFFERENT records sharing one id inside a single file is a
+        // malformed backup (the app never produces one) — all-or-nothing reject,
+        // never a silent lexicographic collapse.
+        {
+          const seenIds = new Set();
+          for (const t of entries) {
+            if (t.id === undefined) continue;
+            const k = String(t.id);
+            if (seenIds.has(k)) { showToast("File contains duplicate template ids — nothing imported"); return; }
+            seenIds.add(k);
+          }
         }
 
         // Full stored set (incl. tombstones) for identity checks.
@@ -2040,9 +2273,13 @@ function App() {
     }
   }
 
+  // M-067: cancel the previous timer so an older toast's expiry can't wipe a
+  // newer message early (which could hide a storage/import error mid-read).
+  const toastTimerRef = useRef(null);
   function showToast(msg) {
     setTemplateToast(msg);
-    setTimeout(() => setTemplateToast(null), 3000);
+    if (toastTimerRef.current) clearTimeout(toastTimerRef.current);
+    toastTimerRef.current = setTimeout(() => { setTemplateToast(null); toastTimerRef.current = null; }, 3000);
   }
 
   // D-8: templates are anonymous slot patterns — "matching" means loadable for
@@ -2365,20 +2602,36 @@ function App() {
           };
         }
 
-        // ── Stage 2: v2 deep-shape validation (Codex W1-R4: identity, playerId, and
-        // toggle COMPLETENESS were unchecked — an empty toggles object hydrated fine).
+        // ── Stage 2: v2 deep-shape + DOMAIN validation (milestone audit fix-group B:
+        // M-008/M-009/M-011/M-043/M-060/M-064/M-087 and their run-verified variants —
+        // a save that passes here must be safe to render AND arithmetically sane;
+        // shapes, value domains, and cross-field consistency are all enforced).
+        const finiteNum = (v) => typeof v === "number" && isFinite(v);
+        const validSnapPlayer = (p) => p && typeof p === "object" &&
+          Number.isInteger(p.jersey) && p.jersey >= 0 && p.jersey <= 99 &&
+          typeof p.name === "string" && p.name.trim().length > 0 &&
+          typeof p.playerId === "string" && p.playerId &&
+          finiteNum(p.rating) && p.rating >= 1 && p.rating <= 5 &&
+          Array.isArray(p.pos) && p.pos.length > 0 && p.pos.every(x => POSITIONS.includes(x)) &&
+          Array.isArray(p.skills) && p.skills.length > 0 && p.skills.every(x => SKILL_SET.includes(x));
         if (!Array.isArray(s.gameRosterSnapshot) || s.gameRosterSnapshot.length === 0 ||
-            !s.gameRosterSnapshot.every(p => p && typeof p.jersey === "number" && typeof p.name === "string" && typeof p.playerId === "string" && p.playerId)) { fail("roster copy malformed"); break restoreattempt; }
+            !s.gameRosterSnapshot.every(validSnapPlayer)) { fail("roster copy malformed"); break restoreattempt; }
+        // M-009: duplicate identities/jerseys collapse jersey-keyed state — corruption.
+        {
+          const ids = new Set(s.gameRosterSnapshot.map(p => p.playerId));
+          const js = new Set(s.gameRosterSnapshot.map(p => p.jersey));
+          if (ids.size !== s.gameRosterSnapshot.length || js.size !== s.gameRosterSnapshot.length) { fail("duplicate roster identity"); break restoreattempt; }
+        }
         if (!(typeof s.selectedTeamId === "string" && s.selectedTeamId && typeof s.teamNameAtGameTime === "string" && s.teamNameAtGameTime)) { fail("game team identity malformed"); break restoreattempt; }
-        if (!s.gameConfig || typeof s.gameConfig.halfMins !== "number" || s.gameConfig.halfMins <= 0 ||
-            typeof s.gameConfig.planMode !== "string" || !s.gameConfig.trackingToggles ||
+        if (!s.gameConfig || !finiteNum(s.gameConfig.halfMins) || s.gameConfig.halfMins <= 0 ||
+            !["balanced", "competitive", "development"].includes(s.gameConfig.planMode) ||
+            !s.gameConfig.trackingToggles ||
             !["individualFouls", "teamFouls", "rebounds", "points", "gameNotes"].every(k => typeof s.gameConfig.trackingToggles[k] === "boolean")) { fail("game settings malformed"); break restoreattempt; }
 
         // Jersey arrays are sanitized against the SNAPSHOT'S OWN roster (never the
         // saved team, never PLAYERS_DB) — the game runs entirely on its copy.
+        // (M-056: the roster is NOT installed into state until every check passes.)
         const snapRoster = s.gameRosterSnapshot;
-        gameRosterSnapshotRef.current = snapRoster;
-        _setGameRosterState(snapRoster);
         const validJerseys = new Set(snapRoster.map(p => p.jersey));
         const sanitizeJerseyArray = (arr) =>
           Array.isArray(arr) ? arr.filter(j => validJerseys.has(j)) : [];
@@ -2391,11 +2644,100 @@ function App() {
         const sanSelected = [...new Set(sanitizeJerseyArray(s.selected))];
         if (sanSelected.length > MAX_PARTICIPANTS) { fail("too many participants"); break restoreattempt; }
         if (scr === "game" && sanSelected.length < 5) { fail("live game participant count impossible after sanitization"); break restoreattempt; }
+        const sanSelectedSet = new Set(sanSelected);
+        // M-087: starters are sanitized to ⊆ selected (ghost starters made a
+        // start5 screen that could never enable Generate).
+        s.starters = sanitizeJerseyArray(s.starters).filter(j => sanSelectedSet.has(j));
+        if (scr === "plan" || scr === "game") {
+          // M-010 hardening (beyond the frozen letter, documented): a grid that IS
+          // present must be rectangular, boolean-celled, and the right length —
+          // ragged rows silently misalign columns against gridPlayerOrder.
+          if (Array.isArray(s.editableGrid)) {
+            const width = Array.isArray(s.gridPlayerOrderJerseys) ? s.gridPlayerOrderJerseys.length
+              : (s.editableGrid[0] ? s.editableGrid[0].length : 0);
+            if (s.editableGrid.length !== s.gameConfig.halfMins * 2 ||
+                !s.editableGrid.every(row => Array.isArray(row) && row.length === width && row.every(c => typeof c === "boolean"))) { fail("plan grid malformed"); break restoreattempt; }
+          }
+        }
         if (scr === "plan") {
           const sanOrder = [...new Set(s.gridPlayerOrderJerseys.filter(j => validJerseys.has(j)))];
           const gridCols = Array.isArray(s.editableGrid) && s.editableGrid[0] ? s.editableGrid[0].length : 0;
           if (sanOrder.length !== s.gridPlayerOrderJerseys.length || sanOrder.length !== gridCols) { fail("plan player order does not match its grid"); break restoreattempt; }
         }
+        // ── M-011: a rotationPlan that is PRESENT must be internally valid — the
+        // old structural check silently DROPPED a malformed plan, flipping the
+        // game onto the fallback engine (the M-001 reachability chain).
+        if (s.rotationPlan !== undefined && s.rotationPlan !== null) {
+          const rp = s.rotationPlan;
+          const totalSecsCfg = s.gameConfig.halfMins * 2 * 60;
+          const rpOk = rp && typeof rp === "object" &&
+            Array.isArray(rp.starters) && rp.starters.every(j => validJerseys.has(j)) &&
+            Array.isArray(rp.segments) && rp.segments.length > 0 &&
+            rp.segments.every(seg => seg && typeof seg === "object" &&
+              typeof seg.id === "string" && seg.id.length > 0 &&
+              finiteNum(seg.startSecs) && finiteNum(seg.endSecs) &&
+              seg.startSecs >= 0 && seg.startSecs < seg.endSecs && seg.endSecs <= totalSecsCfg &&
+              Array.isArray(seg.onCourt) && seg.onCourt.length <= 5 && seg.onCourt.every(j => validJerseys.has(j))) &&
+            rp.targetMinutes && typeof rp.targetMinutes === "object" &&
+            Object.entries(rp.targetMinutes).every(([k, v]) => validJerseys.has(Number(k)) && finiteNum(v) && v >= 0);
+          if (!rpOk) { fail("rotation plan malformed"); break restoreattempt; }
+        }
+        if (scr === "game") {
+          // ── M-060 (the audit's largest class): live-game value domains and
+          // cross-field consistency. Short-handed (1-4 on court) is a LEGITIMATE
+          // live state — the rule is 1-5, unique, all participants; never "exactly 5".
+          const sanOnCourt = sanitizeJerseyArray(s.onCourt);
+          if (sanOnCourt.length !== s.onCourt.length) { fail("on-court list malformed"); break restoreattempt; }
+          if (new Set(sanOnCourt).size !== sanOnCourt.length) { fail("duplicate players on court"); break restoreattempt; }
+          if (sanOnCourt.length < 1 || sanOnCourt.length > 5) { fail("impossible on-court count"); break restoreattempt; }
+          if (!sanOnCourt.every(j => sanSelectedSet.has(j))) { fail("non-participant on court"); break restoreattempt; }
+          const numMapOk = (obj, max) => Object.entries(obj).every(([k, v]) =>
+            !validJerseys.has(Number(k)) || (finiteNum(v) && v >= 0 && (max === undefined || v <= max)));
+          if (!numMapOk(s.accumulated)) { fail("court-time totals malformed"); break restoreattempt; }
+          if (!numMapOk(s.stintStart, s.gameSecs)) { fail("stint starts malformed"); break restoreattempt; }
+          if (!Object.entries(s.fouls || {}).every(([k, v]) => !validJerseys.has(Number(k)) || (Number.isInteger(v) && v >= 0 && v <= 5))) { fail("foul counts malformed"); break restoreattempt; }
+          const sanFouledOut = new Set(sanitizeJerseyArray(s.fouledOut));
+          const sanInjured = new Set(sanitizeJerseyArray(s.injured));
+          if (sanOnCourt.some(j => sanFouledOut.has(j) || sanInjured.has(j))) { fail("unavailable player on court"); break restoreattempt; }
+          for (const info of [s.injuryInfo, s.fouloutInfo]) {
+            if (info && typeof info === "object" &&
+                !Object.values(info).every(e => e && typeof e === "object" &&
+                  ["startSecs", "remainingMins", "removedTargetMins"].every(f => e[f] === undefined || finiteNum(e[f])))) { fail("injury records malformed"); break restoreattempt; }
+          }
+          if (Array.isArray(s.subLog) && !s.subLog.every(e => e && typeof e === "object" && (e.timeout || e.skipped || Array.isArray(e.subs)))) { fail("substitution log malformed"); break restoreattempt; }
+          if (s.adjustedTargetMins && typeof s.adjustedTargetMins === "object" && !numMapOk(s.adjustedTargetMins)) { fail("target minutes malformed"); break restoreattempt; }
+          for (const f of ["scoreUs", "scoreOpponent", "timeoutsUs", "timeoutsOpponent"]) {
+            if (s[f] !== undefined && !(Number.isInteger(s[f]) && s[f] >= 0)) { fail("score state malformed"); break restoreattempt; }
+          }
+          // Executor/suppression fields (Codex r6/r7): corrupt values here don't
+          // crash — they silently MUTE due substitutions or fake emergencies.
+          if (s.lastSubTime !== undefined && !(finiteNum(s.lastSubTime) && s.lastSubTime <= s.gameSecs)) { fail("sub cooldown malformed"); break restoreattempt; }
+          if (s.shortHandedDismissedAt !== undefined && s.shortHandedDismissedAt !== null && !(finiteNum(s.shortHandedDismissedAt) && s.shortHandedDismissedAt <= s.gameSecs)) { fail("short-handed state malformed"); break restoreattempt; }
+          if (s.planDelayUntilSecs !== undefined && s.planDelayUntilSecs !== null && !(finiteNum(s.planDelayUntilSecs) && s.planDelayUntilSecs >= 0 && s.planDelayUntilSecs <= s.gameConfig.halfMins * 2 * 60 + 300)) { fail("plan delay malformed"); break restoreattempt; }
+          const segIds = s.rotationPlan ? new Set(s.rotationPlan.segments.map(seg => seg.id)) : new Set();
+          for (const f of ["lastExecutedSegId", "delayedSegId"]) {
+            if (s[f] !== undefined && s[f] !== null) {
+              if (typeof s[f] !== "string" || !segIds.has(s[f])) { fail("plan progress state malformed"); break restoreattempt; }
+            }
+          }
+          if (s.replacingJersey !== undefined && s.replacingJersey !== null) {
+            if (!validJerseys.has(s.replacingJersey) || sanOnCourt.includes(s.replacingJersey)) { fail("replacement state malformed"); break restoreattempt; }
+          }
+          // Strip unknown-jersey keys from the accounting maps (harmless residue).
+          const stripUnknown = (obj) => {
+            if (!obj || typeof obj !== "object") return obj;
+            const out = {};
+            for (const [k, v] of Object.entries(obj)) { if (validJerseys.has(Number(k))) out[k] = v; }
+            return out;
+          };
+          s.accumulated = stripUnknown(s.accumulated);
+          s.stintStart = stripUnknown(s.stintStart);
+          s.fouls = stripUnknown(s.fouls);
+          s.adjustedTargetMins = stripUnknown(s.adjustedTargetMins);
+        }
+        // Validation complete — NOW the roster may be installed (M-056).
+        gameRosterSnapshotRef.current = snapRoster;
+        _setGameRosterState(snapRoster);
         // Native-v2 identity/config are ADOPTED, not overwritten by the current team
         // (Codex W1-R1: re-save was stamping the seed team's id/name and default
         // toggles over a snapshot that claimed a different team/config).
@@ -2454,18 +2796,10 @@ function App() {
         if (typeof s.scoreOpponent === "number") setScoreOpponent(s.scoreOpponent);
         if (typeof s.timeoutsUs === "number") setTimeoutsUs(s.timeoutsUs);
         if (typeof s.timeoutsOpponent === "number") setTimeoutsOpponent(s.timeoutsOpponent);
-        // V3 plan-first state restore — validate structure before restoring
-        if (s.rotationPlan &&
-            Array.isArray(s.rotationPlan.starters) &&
-            Array.isArray(s.rotationPlan.segments) &&
-            s.rotationPlan.targetMinutes && typeof s.rotationPlan.targetMinutes === "object" &&
-            s.rotationPlan.segments.every(seg =>
-              typeof seg.startSecs === "number" &&
-              typeof seg.endSecs === "number" &&
-              Array.isArray(seg.onCourt)
-            )) {
-          setRotationPlan(s.rotationPlan);
-        }
+        // V3 plan-first state restore. Content was FULLY validated above (M-011)
+        // — a malformed plan quarantines the save; it is never silently dropped
+        // (silent drop flipped the game onto the fallback engine: the M-001 chain).
+        if (s.rotationPlan) setRotationPlan(s.rotationPlan);
         if (Array.isArray(s.gridPlayerOrderJerseys)) {
           const order = s.gridPlayerOrderJerseys
             .map(j => snapRoster.find(p => p.jersey === j))
@@ -2535,14 +2869,36 @@ function App() {
     };
     return { ...snapshot, ...overrides };
   }
+  // M-080: the future-schema shield must hold MID-SESSION, not just at boot.
+  // We track the last snapshot THIS tab wrote; any foreign value found in the
+  // key is parsed and version-checked before we overwrite it.
+  const lastWrittenSnapshotRef = useRef(null);
+  function foreignFutureSaveDetected() {
+    let raw = null;
+    try { raw = localStorage.getItem(STORAGE_KEY); } catch (e) { return false; }
+    if (raw === null || raw === lastWrittenSnapshotRef.current) return false;
+    try {
+      const f = JSON.parse(raw);
+      if (f && typeof f.schemaVersion === "number" && f.schemaVersion > 2) {
+        restoreBlockedRef.current = true;
+        setBlockedSave(true);
+        storageNotices.push({ text: "A game saved by a NEWER app version appeared — NOT SAVING games this session to protect it." });
+        return true;
+      }
+    } catch (e) {}
+    return false;
+  }
   // Synchronous persist + read-back verify — the §4 W2 persistence gates
   // (team selection, tip-off) must PROVE the write landed before proceeding.
   function persistSnapshotNow(overrides = {}) {
     if (restoreBlockedRef.current) return false;
+    if (foreignFutureSaveDetected()) return false;
     try {
       const out = JSON.stringify(buildSnapshotFromState(overrides));
       localStorage.setItem(STORAGE_KEY, out);
-      return localStorage.getItem(STORAGE_KEY) === out;
+      if (localStorage.getItem(STORAGE_KEY) !== out) return false;
+      lastWrittenSnapshotRef.current = out;
+      return true;
     } catch (e) { return false; }
   }
 
@@ -2553,9 +2909,13 @@ function App() {
     // exists until finish/discard. No game in flight → nothing may be written
     // (Manage Teams availability keys off snapshot existence).
     if (!gameInFlight) return;
+    // M-080: never clobber a newer-version save that appeared mid-session.
+    if (foreignFutureSaveDetected()) return;
     // Save every tick — state is small, reliability beats battery savings.
     try {
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(buildSnapshotFromState()));
+      const out = JSON.stringify(buildSnapshotFromState());
+      localStorage.setItem(STORAGE_KEY, out);
+      lastWrittenSnapshotRef.current = out;
       if (saveError) setSaveError(false);
     } catch (e) {
       // Quota / private-mode / serialization failure. Surface it so the coach
@@ -2570,7 +2930,17 @@ function App() {
       timeoutRemindersOn, lastExecutedSegId, planDelayUntilSecs, delayedSegId, shortHandedDismissedAt]);
 
   function discardSavedGame() {
-    try { localStorage.removeItem(STORAGE_KEY); } catch (e) {}
+    // M-045: the delete is VERIFIED before any protection is dropped — a failed
+    // removal must never leave a ghost save while the UI (and the future-schema
+    // lock) claim it's gone.
+    let removed = false;
+    try { localStorage.removeItem(STORAGE_KEY); removed = localStorage.getItem(STORAGE_KEY) === null; } catch (e) { removed = false; }
+    if (!removed) {
+      storageNotices.push({ text: "Couldn't discard the saved game — storage refused the delete. Nothing was changed." });
+      showToast("⚠ Couldn't discard the saved game — nothing was changed");
+      return false;
+    }
+    lastWrittenSnapshotRef.current = null;
     // Clear the future-schema lock so a fresh game on the same tab can save again.
     restoreBlockedRef.current = false;
     // §4 W2 lifecycle: discard ends the game entirely — no snapshot, no roster
@@ -2624,6 +2994,8 @@ function App() {
     setPlanDelayUntilSecs(null);
     setDelayedSegId(null);
     setRerouteBanner(null);
+    setPossessionLeft(true); // M-050: the arrow never carries into the next game
+    return true;
   }
 
   // ═══ WAVE 2 — landing / team selection / Manage Teams / reconciliation ═══
@@ -2635,21 +3007,48 @@ function App() {
   const [managePlayerEdit, setManagePlayerEdit] = useState(null); // { index|null, draft }
   const [manageDeleteConfirm, setManageDeleteConfirm] = useState(null); // team id
 
+  // M-019 consumer side: even values that slip past the settings validator are
+  // NORMALIZED here — a game snapshot must never be built from junk defaults
+  // (a string toggle / non-finite half-length previously poisoned the pending
+  // game, which this build then quarantined on reload).
   function readSettingsStored() {
-    try {
-      const s = JSON.parse(safeGet(SETTINGS_KEY));
-      if (s && s.schemaVersion === 1 && typeof s.defaultHalfMins === "number" && s.defaultHalfMins > 0 &&
-          typeof s.defaultPlanMode === "string" && s.defaultTrackingToggles) return s;
-    } catch (e) {}
-    return SETTINGS_DEFAULTS;
+    let s = null;
+    try { s = JSON.parse(safeGet(SETTINGS_KEY)); } catch (e) {}
+    if (!s || s.schemaVersion !== 1) s = SETTINGS_DEFAULTS;
+    const hm = (typeof s.defaultHalfMins === "number" && isFinite(s.defaultHalfMins))
+      ? Math.min(30, Math.max(10, Math.round(s.defaultHalfMins))) : 20;
+    const pm = ["balanced", "competitive", "development"].includes(s.defaultPlanMode) ? s.defaultPlanMode : "balanced";
+    const tt = {};
+    for (const k of Object.keys(SETTINGS_DEFAULTS.defaultTrackingToggles)) {
+      const v = s.defaultTrackingToggles ? s.defaultTrackingToggles[k] : undefined;
+      tt[k] = typeof v === "boolean" ? v : SETTINGS_DEFAULTS.defaultTrackingToggles[k];
+    }
+    return { defaultHalfMins: hm, defaultPlanMode: pm, defaultTrackingToggles: tt };
+  }
+  // M-073 (owner decision): each tip-off remembers the game's duration + mode as
+  // the defaults for the NEXT game (settings key is plain LWW per the spec).
+  function rememberGameDefaults(hm, pm) {
+    let s = null;
+    try { s = JSON.parse(safeGet(SETTINGS_KEY)); } catch (e) {}
+    const base = (s && s.schemaVersion === 1) ? s : { ...SETTINGS_DEFAULTS };
+    safeSet(SETTINGS_KEY, JSON.stringify({ ...base, defaultHalfMins: hm, defaultPlanMode: pm, updatedAt: nowIso() }));
   }
 
   // ── Team selection (the roster-copy capture event — frozen contract) ──────
   function selectTeamAndStart(teamId) {
+    // M-053: a snapshot may have appeared from another tab since this tab's
+    // landing rendered — a fresh existence check right before the capture write.
+    if (gameSnapshotExists() && !gameInFlight) {
+      setSelectionError({ teamId, reason: "foreign-game" });
+      setAppMode("landing");
+      return;
+    }
     // Fresh read at the SELECTION event: the picker list or landing state could
-    // be stale against another tab's Manage Teams edits.
-    const env = readTeamsEnvelopeFresh();
-    const team = env && env.teams.find((t) => t.id === teamId && !t.deletedAt);
+    // be stale against another tab's Manage Teams edits. M-076: when the teams
+    // key is blocked-with-data, the §5.1 in-memory session roster serves instead
+    // — game day must not be locked out (the game key itself still saves).
+    const tstate = teamsReadState();
+    const team = tstate.teams.find((t) => t.id === teamId && !t.deletedAt);
     if (!team) { setSelectionError({ teamId, reason: "missing" }); return; }
     // The game's roster COPY: active players with a jersey (needsJersey girls are
     // excluded from games until the coach assigns a free number — §5.5).
@@ -2684,6 +3083,10 @@ function App() {
       plannedTimeouts: [], dismissedTimeouts: [],
       lastExecutedSegId: null, planDelayUntilSecs: null, delayedSegId: null,
       shortHandedDismissedAt: null, planStale: false,
+      // M-063: the flag was added AFTER this override list was first written and
+      // a same-tick discard→select could persist the DISCARDED game's true.
+      gameStarted: false,
+      possessionLeft: true, // M-050
     });
     if (!ok) {
       // Persist-gate failure: there is NO path onto the setup screen without a
@@ -2695,6 +3098,7 @@ function App() {
     setSelected(new Set(selInit));
     setStarters(new Set());
     setHalfMins(hm); setPlanMode(pm);
+    setPossessionLeft(true);
     setPlan(null); setRotationPlan(null); setEditableGrid(null); setGridPlayerOrder([]);
     setPlanStale(false); setStaleChoiceNeeded(false); setTipoffError(false); setGameStarted(false);
     setCapMsg(roster.length > MAX_PARTICIPANTS ? `Pick up to ${MAX_PARTICIPANTS} girls for today` : null);
@@ -2706,16 +3110,20 @@ function App() {
   }
 
   function startNewGameTapped() {
-    // Parent-spec rule: never lose a game silently — a saved game (readable or
-    // future-schema-blocked) must be dealt with explicitly first.
-    if (gameInFlight || blockedSave) { setNewGamePrompt(true); return; }
+    // Parent-spec rule: never lose a game silently — a saved game (readable,
+    // future-schema-blocked, OR one another tab wrote after this tab booted —
+    // M-053) must be dealt with explicitly first. Existence is re-read FRESH.
+    if (gameInFlight || blockedSave || gameSnapshotExists()) { setNewGamePrompt(true); return; }
     proceedNewGame();
   }
   function proceedNewGame() {
     setNewGamePrompt(false);
-    const teams = listActiveTeams();
-    if (teams.length === 0) { openManageCreate(); return; } // empty-state bootstrap
-    if (teams.length === 1) { selectTeamAndStart(teams[0].id); return; } // D-4 skip
+    // M-039/M-076: route by the teams READ STATE, not a bare list — future data
+    // is never interpreted, and a blocked key falls back to the in-memory session.
+    const tstate = teamsReadState();
+    if (tstate.state === "future") { setSelectionError({ teamId: null, reason: "future" }); return; }
+    if (tstate.state === "empty") { openManageCreate(); return; } // empty-state bootstrap
+    if (tstate.teams.length === 1) { selectTeamAndStart(tstate.teams[0].id); return; } // D-4 skip
     setAppMode("picker");
   }
 
@@ -2724,11 +3132,21 @@ function App() {
     return gameSnapshotExists() ? "Finish or discard the current game first" : null;
   }
   function openManage() {
+    // M-082: a stale landing tab's in-memory state can lie — re-read existence
+    // at the click, and surface the reason instead of entering.
+    if (gameSnapshotExists() && !gameInFlight && !blockedSave) {
+      setSelectionError({ teamId: null, reason: "foreign-game" });
+      return;
+    }
     setManageView("list"); setManageDraft(null); setManageError(null);
     setManagePlayerEdit(null); setManageDeleteConfirm(null);
     setAppMode("manage");
   }
   function openManageCreate() {
+    if (gameSnapshotExists() && !gameInFlight && !blockedSave) {
+      setSelectionError({ teamId: null, reason: "foreign-game" });
+      return;
+    }
     setManageView("edit"); setManageError(null); setManagePlayerEdit(null);
     setManageDraft({ id: null, original: null, name: "", players: [] });
     setAppMode("manage");
@@ -2870,6 +3288,16 @@ function App() {
       });
       nextOrder = order;
       if (editableGrid) nextGrid = editableGrid.map((row) => keptIdx.map((i) => row[i]));
+      // M-041: a player ADDED after the grid exists gets an EMPTY column — she
+      // must be paintable if the coach keeps the grid; without this, "Keep"
+      // left a selected participant permanently unschedulable.
+      const inOrder = new Set(nextOrder.map((p) => p.playerId));
+      for (const np of newRoster) {
+        if (!inOrder.has(np.playerId)) {
+          nextOrder = [...nextOrder, np];
+          if (nextGrid) nextGrid = nextGrid.map((row) => [...row, false]);
+        }
+      }
     }
     let nextRotationPlan = rotationPlan;
     if (rotationPlan) {
@@ -2935,7 +3363,22 @@ function App() {
       if (!writeRepairEnvelope([op])) { showToast("⚠ Couldn't record the change — nothing was changed"); return false; }
       // Phase 2: pending snapshot updated (one setItem + verify).
       if (!persistSnapshotNow(reconciliationOverrides(rec))) {
-        // Broken half-edit: roll the prepared op back — nothing user-visible changed.
+        // M-062: a FALSE here can be a read-back false-negative on a write that
+        // actually landed. Before terminally rolling back, apply the same
+        // effect-present rule the load-time recovery uses: effect in the stored
+        // snapshot → the edit is real → roll FORWARD instead.
+        let snapNow = null;
+        try { snapNow = JSON.parse(localStorage.getItem(STORAGE_KEY)); } catch (e) {}
+        if (snapNow && Array.isArray(snapNow.gameRosterSnapshot) && opEffectInSnapshot(op, snapNow)) {
+          applyRosterReconciliation(rec);
+          const committedNow = { ...op, status: "committed", statusAt: nowIso() };
+          writeRepairEnvelope([committedNow]);
+          const postNow = replayCommittedOp(committedNow);
+          if (postNow === "applied") writeRepairEnvelope([{ ...committedNow, status: "cleared", statusAt: nowIso(), outcome: "applied" }]);
+          else if (postNow === "superseded") writeRepairEnvelope([{ ...committedNow, status: "cleared", statusAt: nowIso(), outcome: "superseded" }]);
+          return true;
+        }
+        // Genuinely broken half-edit: roll the prepared op back — nothing user-visible changed.
         writeRepairEnvelope([{ ...op, status: "cleared", statusAt: nowIso(), outcome: "rolledback" }]);
         showToast("⚠ Couldn't save the change — nothing was changed");
         return false;
@@ -3038,6 +3481,12 @@ function App() {
     let op = null;
     if (scope === "team") {
       const saved = savedTeamPlayer(target.playerId);
+      if (!saved && !target.isGuest) {
+        // M-023: NEVER silently degrade a confirmed permanent removal to a
+        // game-only one (mirrors the edit path's error for the same condition).
+        setSetupEdit({ ...setupEdit, error: "Couldn't find her on the saved team right now — try again, or use \"Out of today's game\"" });
+        return;
+      }
       if (saved) op = makeRepairOp("removePlayer", target.playerId, {}, saved.rev + 1);
     }
     if (applyPendingRosterChange(newRoster, { planningInput: true, op })) setSetupEdit(null);
@@ -3107,35 +3556,42 @@ function App() {
   // so the running interval doesn't snap the clock back to its old position.
   // Uses functional updater for setGameSecs so rapid taps see the correct
   // previous value and the full-time rewind correction only fires once.
+  // M-086/M-059 (conservation-safe rewind): moving the clock back to `clamped`
+  // from `prevSecs` must reduce each ON-COURT girl's court time by exactly the
+  // rewound amount and no more. The old code had TWO branches — a full-time one
+  // that corrected `accumulated`, and a general one that only snapped stintStart
+  // and left `accumulated` untouched — so a MULTI-tap rewind at the buzzer (the
+  // 2nd tap onward hit the general branch) permanently inflated every girl's
+  // minutes. This unified correction re-banks the true court time and re-seeds
+  // the stint from `clamped`, keeping the conservation invariant (Σ court secs
+  // ≡ 5 × clock in a full game) intact for both entry points.
+  function applyRewindCourtTime(prevSecs, clamped) {
+    if (clamped >= prevSecs || onCourt.length === 0) return;
+    const drop = prevSecs - clamped;
+    setAccumulated(prevAcc => {
+      const nextAcc = { ...prevAcc };
+      const nextStint = { ...stintStart };
+      let stintChanged = false;
+      onCourt.forEach(j => {
+        const banked = nextAcc[j] || 0;
+        const live = stintStart[j] != null ? Math.max(0, prevSecs - stintStart[j]) : 0;
+        const courtNow = banked + live;
+        const desired = Math.max(0, courtNow - drop); // reduce by exactly the rewind
+        nextAcc[j] = desired;
+        nextStint[j] = clamped; // stint restarts at the rewound clock → live part = 0
+        stintChanged = true;
+      });
+      if (stintChanged) setStintStart(nextStint);
+      return nextAcc;
+    });
+  }
+
   const setClockSecs = (nextSecs) => {
     const clamped = Math.max(0, Math.min(totalGameSecs, nextSecs));
     setGameSecs(prevSecs => {
-      // If rewinding out of game-over state, re-seed stintStart for players on court
-      // so their live court time resumes ticking correctly.
-      // Uses prevSecs (not closed-over gameSecs) to prevent double-subtraction on rapid taps.
-      if (prevSecs >= totalGameSecs && clamped < totalGameSecs && onCourt.length > 0) {
-        // Full-time effect already flushed stints to accumulated. Subtract the
-        // over-flushed portion (totalGameSecs - clamped) so it isn't double-counted
-        // when the clock resumes ticking from the rewound position.
-        const overFlush = totalGameSecs - clamped;
-        setAccumulated(prev => {
-          const next = { ...prev };
-          onCourt.forEach(j => {
-            next[j] = Math.max(0, (next[j] || 0) - overFlush);
-          });
-          return next;
-        });
-        setStintStart(prev => {
-          const next = { ...prev };
-          onCourt.forEach(j => { next[j] = clamped; });
-          return next;
-        });
-      } else if (clamped < prevSecs) {
-        // General rewind (not from full-time): if the clock is moved back past
-        // a player's stintStart, snap that stintStart down to the new clock so
-        // gameSecs - stintStart never goes negative (which would corrupt
-        // accumulated minutes when that player is later subbed out / fouled
-        // out / used in a reroute calculation).
+      if (clamped < prevSecs) {
+        applyRewindCourtTime(prevSecs, clamped);
+      } else if (false) {
         setStintStart(prev => {
           let changed = false;
           const next = { ...prev };
@@ -3160,36 +3616,9 @@ function App() {
     setGameSecs(prevSecs => {
       const lower = halftimeDone ? halfMins * 60 : 0;
       const clamped = Math.max(lower, Math.min(totalGameSecs, prevSecs + delta));
-      // Full-time rewind correction (same logic as setClockSecs)
-      if (prevSecs >= totalGameSecs && clamped < totalGameSecs && onCourt.length > 0) {
-        const overFlush = totalGameSecs - clamped;
-        setAccumulated(prev => {
-          const next = { ...prev };
-          onCourt.forEach(j => { next[j] = Math.max(0, (next[j] || 0) - overFlush); });
-          return next;
-        });
-        setStintStart(prev => {
-          const next = { ...prev };
-          onCourt.forEach(j => { next[j] = clamped; });
-          return next;
-        });
-      } else if (clamped < prevSecs) {
-        // General rewind: snap any stintStart that now sits in the future down
-        // to the new clock so subsequent stint-duration math stays non-negative.
-        // (Without this, rewinding -10s across a recent sub corrupts accumulated
-        //  minutes when the sub-in player is later subbed/fouled out.)
-        setStintStart(prev => {
-          let changed = false;
-          const next = { ...prev };
-          Object.keys(next).forEach(j => {
-            if (next[j] != null && next[j] > clamped) {
-              next[j] = clamped;
-              changed = true;
-            }
-          });
-          return changed ? next : prev;
-        });
-      }
+      // M-086: ONE conservation-safe rewind correction for every case (incl.
+      // multi-tap at the buzzer) — no separate full-time vs general branch.
+      if (clamped < prevSecs) applyRewindCourtTime(prevSecs, clamped);
       if (running) {
         clockBaseRef.current = { wallMs: Date.now(), secs: clamped };
       }
@@ -3226,6 +3655,18 @@ function App() {
     if (!(screen === "game" || (gameSecs > 0 && !gameOver)) && (rotationPlan || editableGrid)) setPlanStale(true);
   }
 
+  // M-012/M-035/M-075/M-083: half duration is a PLANNING INPUT. Changing it
+  // marks an existing plan stale and prunes now-out-of-range timeout reminders;
+  // the range is clamped to 10-30 (below 10 the locked 4-min opener/closer
+  // blocks swallow the half; the old unbounded "+" allowed absurd grids).
+  function changeHalfMins(delta) {
+    const next = Math.min(30, Math.max(10, halfMins + delta));
+    if (next === halfMins) return;
+    if (rotationPlan || editableGrid) setPlanStale(true);
+    setPlannedTimeouts((prev) => new Set([...prev].filter((m) => m < next * 2)));
+    setHalfMins(next);
+  }
+
   function handlePickStarters() {
     setStarters(new Set());
     setScreen("start5");
@@ -3239,6 +3680,9 @@ function App() {
       next.add(jersey);
       return next;
     });
+    // M-042 (beyond-letter hardening): a different starting five is a planning
+    // input too — an existing grid built around the old five goes stale.
+    if (!(screen === "game" || (gameSecs > 0 && !gameOver)) && (rotationPlan || editableGrid)) setPlanStale(true);
   }
 
   // Build editable grid from rotation plan segments.
@@ -3454,6 +3898,13 @@ function App() {
     // §4 W2 plan staleness is a progression checkpoint: the coach must choose
     // Regenerate or Keep explicitly before tip-off (no silent regeneration).
     if (planStale) { setStaleChoiceNeeded(true); return; }
+    // M-012 hard gate: a kept grid must MATCH the game length — starting a
+    // 25-min-half game on a 20-min grid leaves the final minutes planless (and
+    // the reverse silently remaps painted H1 minutes into H2).
+    if (editableGrid && editableGrid.length !== halfMins * 2) {
+      alert(`This rotation grid is for ${editableGrid.length / 2}-minute halves, but the game is set to ${halfMins}-minute halves.\n\nRegenerate the plan, or set the half duration back.`);
+      return;
+    }
     // Pre-game: a kept grid may still contain a girl the coach has since
     // unticked — starting would put a non-participant on court.
     const availSet = new Set(available.map(p => p.jersey));
@@ -3506,6 +3957,9 @@ function App() {
     });
     if (!persisted) { setTipoffError(true); return; }
     setTipoffError(false);
+    // M-073 (owner decision): this game's duration + mode become the defaults
+    // for the next new game.
+    rememberGameDefaults(halfMins, planMode);
     setGameStarted(true);
     setOnCourt(courtJerseys);
     setAccumulated(acc);
@@ -4517,8 +4971,11 @@ function App() {
     const config = rosterForCadence > 5 ? getRotationConfig(rosterForCadence) : getRotationConfig(6); // fallback config for mandatory checks
     const inStartBlock = half === 1 && gameSecs < START_BLOCK_SECS;
 
+    // M-001: the reactive (fallback) engine reads the GAME'S roster copy, never
+    // the hardcoded PLAYERS_DB — a custom team's jerseys don't exist in the seed
+    // list, so this used to empty the court or drive suggestions off wrong girls.
     const onCourtPlayers = onCourt
-      .map(j => PLAYERS_DB.find(p => p.jersey === j))
+      .map(j => gameRoster.find(p => p.jersey === j))
       .filter(Boolean);
     const benchAvail = available.filter(p =>
       !onCourt.includes(p.jersey) && !unavailableJerseys.has(p.jersey));
@@ -5115,7 +5572,7 @@ function App() {
       setSubLog(prev => [...prev, {
         time: gameSecs, half, timeInHalf,
         timeout: true,
-        team: team === "us" ? "Roadies" : "Opponent",
+        team: team === "us" ? (gameIdentityRef.current.teamNameAtGameTime || "Our Team") : "Opponent",
       }]);
       // Dismiss matching planned timeout reminder
       const currentGameMin = Math.floor(gameSecs / 60);
@@ -5126,6 +5583,19 @@ function App() {
   }
 
   // ── SETUP SCREEN ────────────────────────────────────────────────────────────
+  // M-074: the "NOT SAVING" warning belongs on EVERY persisted screen, not just
+  // the live game — storage can fail while the coach is painting a grid on the
+  // plan screen, and a refresh would lose the unsaved work with no warning.
+  const saveErrorBanner = saveError ? (
+    <div style={{ background: "#7f1d1d", border: "2px solid #ef4444", borderRadius: 12, padding: "10px 14px", marginBottom: 10, display: "flex", alignItems: "center", gap: 10 }}>
+      <span style={{ fontSize: 18 }}>⚠</span>
+      <div>
+        <div style={{ color: "#fecaca", fontSize: 12, fontWeight: 700 }}>NOT SAVING TO THIS DEVICE</div>
+        <div style={{ color: "#fca5a5", fontSize: 11 }}>Storage failed — do NOT refresh or close the tab. Unsaved work will be lost.</div>
+      </div>
+    </div>
+  ) : null;
+
   // ═══ WAVE 2 SCREENS (app-level, never persisted as snapshot screens) ═══
   const pageStyle = { minHeight: "100vh", backgroundColor: "#0f172a", padding: "16px", fontFamily: "system-ui, sans-serif" };
   const cardStyle = { background: "#1e293b", borderRadius: 16, padding: 16, marginBottom: 12 };
@@ -5138,7 +5608,10 @@ function App() {
 
   // ── LANDING SCREEN — the boot screen, always (§4 W2) ────────────────────────
   if (appMode === "landing") {
-    const activeTeams = listActiveTeams();
+    // M-039/M-076: the landing routes by teams READ STATE — future-version data
+    // is never interpreted; a blocked/damaged key runs the §5.1 in-memory session.
+    const tstate = teamsReadState();
+    const activeTeams = tstate.teams;
     const snapExists = gameInFlight || blockedSave;
     return (
       <div style={pageStyle}>
@@ -5158,12 +5631,22 @@ function App() {
                   ? "⚠ Couldn't save the new game — nothing was started."
                   : selectionError.reason === "empty"
                     ? "⚠ That team has no players with jersey numbers yet — add them in Manage Teams."
-                    : "⚠ That team isn't available any more."}
+                    : selectionError.reason === "foreign-game"
+                      ? "⚠ A saved game just appeared (another tab?) — reload to pick it up, or deal with it before starting anything new."
+                      : selectionError.reason === "future"
+                        ? "⚠ Team data was saved by a newer app version — update the app to use it."
+                        : "⚠ That team isn't available any more."}
               </div>
               {selectionError.reason === "save" && (
                 <button onClick={() => selectTeamAndStart(selectionError.teamId)} style={smallBtn("#b91c1c")}>Try again</button>
               )}
               <button onClick={() => setSelectionError(null)} style={{ ...smallBtn(), marginLeft: 8 }}>Dismiss</button>
+            </div>
+          )}
+          {tstate.state === "fallback" && (
+            <div style={{ ...cardStyle, border: "1px solid #f59e0b" }}>
+              <div style={{ color: "#fbbf24", fontSize: 13, fontWeight: 700 }}>Team storage needs attention — running from memory this session.</div>
+              <div style={{ color: "#fde68a", fontSize: 12, marginTop: 4 }}>You can still start and play a game today; team edits are off until storage recovers.</div>
             </div>
           )}
 
@@ -5178,7 +5661,12 @@ function App() {
               <div style={{ color: "#fde68a", fontSize: 12, marginTop: 4 }}>It can't be continued in this version. Start a new game to discard it, or update the app.</div>
             </div>
           )}
-          {activeTeams.length > 0 ? (
+          {tstate.state === "future" ? (
+            <div style={{ ...cardStyle, border: "1px solid #f59e0b" }}>
+              <div style={{ color: "#fbbf24", fontSize: 13, fontWeight: 700 }}>Team data was saved by a NEWER app version.</div>
+              <div style={{ color: "#fde68a", fontSize: 12, marginTop: 4 }}>It won't be touched or used here — update the app to keep coaching with it.</div>
+            </div>
+          ) : activeTeams.length > 0 ? (
             <button onClick={startNewGameTapped} style={bigBtn("linear-gradient(135deg,#1d4ed8,#7c3aed)")}>
               🏀 New Game
             </button>
@@ -5207,7 +5695,7 @@ function App() {
                   ▶ Keep playing that game
                 </button>
               )}
-              <button onClick={() => { discardSavedGame(); proceedNewGame(); }} style={{ ...bigBtn("#b91c1c"), padding: "12px" }}>
+              <button onClick={() => { if (discardSavedGame()) proceedNewGame(); else setNewGamePrompt(false); }} style={{ ...bigBtn("#b91c1c"), padding: "12px" }}>
                 🗑 Discard it and start a new game
               </button>
               <button onClick={() => setNewGamePrompt(false)} style={{ ...bigBtn("#334155"), padding: "12px", marginBottom: 0 }}>
@@ -5407,12 +5895,13 @@ function App() {
     <div style={{ minHeight: "100vh", backgroundColor: "#0f172a", padding: "16px", fontFamily: "system-ui, sans-serif" }}>
       <div style={{ maxWidth: 400, margin: "0 auto" }}>
         <StorageNoticesBanner />
+        {saveErrorBanner}
         <div style={{ background: "linear-gradient(135deg,#1e3a8a,#1d4ed8)", borderRadius: 20, padding: "20px 20px 16px", marginBottom: 16, textAlign: "center" }}>
           <div style={{ display: "flex", justifyContent: "center", marginBottom: 10 }}>
             <CoachKLogo size={88} />
           </div>
           <div style={{ color: "#fff", fontSize: 16, fontWeight: 700, letterSpacing: 0.3 }}>Coach K Sub Planner</div>
-          <div style={{ color: "#93c5fd", fontSize: 11, marginTop: 2 }}>Roadies 005</div>
+          <div style={{ color: "#93c5fd", fontSize: 11, marginTop: 2 }}>{gameIdentityRef.current.teamNameAtGameTime || "Coach K"}</div>
         </div>
 
         <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 12 }}>
@@ -5445,14 +5934,14 @@ function App() {
         <div style={{ background: "#1e293b", borderRadius: 16, padding: 16, marginBottom: 12 }}>
           <div style={{ color: "#94a3b8", fontSize: 12, fontWeight: 700, marginBottom: 10, letterSpacing: 1 }}>HALF DURATION</div>
           <div style={{ display: "flex", alignItems: "center", gap: 16 }}>
-            <button onClick={() => setHalfMins(m => Math.max(5, m - 5))}
+            <button onClick={() => changeHalfMins(-5)}
               style={{ width: 44, height: 44, borderRadius: "50%", background: "#334155", border: "none", color: "#fff", fontSize: 22, cursor: "pointer" }}>−</button>
             <div style={{ flex: 1, textAlign: "center" }}>
               <span style={{ color: "#fff", fontSize: 32, fontWeight: 800 }}>{halfMins}</span>
               <span style={{ color: "#64748b", fontSize: 16 }}> min halves</span>
               <div style={{ color: "#64748b", fontSize: 12 }}>Total: {halfMins * 2} min game</div>
             </div>
-            <button onClick={() => setHalfMins(m => m + 5)}
+            <button onClick={() => changeHalfMins(+5)}
               style={{ width: 44, height: 44, borderRadius: "50%", background: "#334155", border: "none", color: "#fff", fontSize: 22, cursor: "pointer" }}>+</button>
           </div>
         </div>
@@ -5623,6 +6112,7 @@ function App() {
     <div style={{ minHeight: "100vh", backgroundColor: "#0f172a", padding: "16px", fontFamily: "system-ui, sans-serif" }}>
       <div style={{ maxWidth: 400, margin: "0 auto" }}>
         <StorageNoticesBanner />
+        {saveErrorBanner}
         <div style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 16 }}>
           <button onClick={() => setScreen("setup")}
             style={{ background: "#334155", border: "none", color: "#fff", borderRadius: 10, padding: "8px 14px", cursor: "pointer", fontSize: 14 }}>← Back</button>
@@ -5701,7 +6191,7 @@ function App() {
                       { id: "competitive", label: "Compete", desc: "Best players, more time" },
                       { id: "development", label: "Develop", desc: "Weaker players get a boost" },
                     ].map(m => (
-                      <button key={m.id} onClick={() => setPlanMode(m.id)}
+                      <button key={m.id} onClick={() => { setPlanMode(m.id); if (rotationPlan || editableGrid) setPlanStale(true); }}
                         style={{ flex: 1, padding: "8px 4px", borderRadius: 10, border: `2px solid ${planMode === m.id ? "#3b82f6" : "#334155"}`,
                           background: planMode === m.id ? "#1e3a8a" : "#0f172a", cursor: "pointer", textAlign: "center" }}>
                         <div style={{ color: planMode === m.id ? "#60a5fa" : "#94a3b8", fontSize: 12, fontWeight: 700 }}>{m.label}</div>
@@ -5734,11 +6224,23 @@ function App() {
       onPointerLeave={() => { gridPainting.current = false; }}>
       <div style={{ maxWidth: 700, margin: "0 auto" }}>
         <StorageNoticesBanner />
+        {saveErrorBanner}
         {/* Header */}
         <h1 style={{ textAlign: "center", fontSize: "1.3rem", marginBottom: 12, color: "#f8fafc" }}>
           🏀 Rotation Planner
         </h1>
 
+        {/* M-012: grid/game length mismatch — starting is blocked until they match */}
+        {editableGrid && !gameIsLive && editableGrid.length !== halfMins * 2 && (
+          <div style={{ background: "#7f1d1d", border: "1px solid #ef4444", borderRadius: 12, padding: 12, marginBottom: 12, maxWidth: 500, marginLeft: "auto", marginRight: "auto" }}>
+            <div style={{ color: "#fecaca", fontSize: 13, fontWeight: 700 }}>
+              ⚠ This grid is for {editableGrid.length / 2}-minute halves, but the game is set to {halfMins}-minute halves.
+            </div>
+            <div style={{ color: "#fca5a5", fontSize: 12, marginTop: 4 }}>
+              Regenerate the plan, or set the half duration back — the game can't start until they match.
+            </div>
+          </div>
+        )}
         {/* §4 W2 plan staleness — explicit choice, never silent regeneration */}
         {planStale && !gameIsLive && (
           <div style={{ background: "#422006", border: "1px solid #f59e0b", borderRadius: 12, padding: 12, marginBottom: 12, maxWidth: 500, marginLeft: "auto", marginRight: "auto" }}>
@@ -5940,7 +6442,11 @@ function App() {
                         OTHER TEMPLATES
                       </div>
                       {others.map(t => (
-                        <div key={t.id} style={{ display: "flex", alignItems: "center", gap: 8, padding: "8px 10px", borderRadius: 8, background: "#0f172a", border: "1px solid #1e293b", marginBottom: 4, opacity: 0.6 }}>
+                        // M-077: a mismatched template is tappable and shows the
+                        // frozen §6 block message naming both values (it was dead
+                        // to the tap before — the coach got silence).
+                        <div key={t.id} onClick={() => loadTemplate(t)}
+                          style={{ display: "flex", alignItems: "center", gap: 8, padding: "8px 10px", borderRadius: 8, background: "#0f172a", border: "1px solid #1e293b", marginBottom: 4, opacity: 0.6, cursor: "pointer" }}>
                           <div style={{ flex: 1 }}>
                             <div style={{ color: "#94a3b8", fontSize: 13 }}>{t.name}</div>
                             <div style={{ color: "#475569", fontSize: 10 }}>{t.playerCount}p • {t.halfMins * 2}m</div>
@@ -5981,6 +6487,14 @@ function App() {
           const totalMins = halfMins * 2;
           const players = gridPlayerOrder;
           const grid = editableGrid;
+          // M-012: the GRID's own row count is the rendering truth — iterating
+          // the configured game length painted phantom rows when the duration
+          // changed after planning (tapping one threw an uncaught TypeError).
+          // A mismatch renders every real row plus a blocking notice; Start
+          // Game is hard-gated on the same condition.
+          const gridRows = grid.length;
+          const gridHalfRows = Math.floor(gridRows / 2);
+          const gridLengthMismatch = gridRows !== totalMins;
           // Prefer live adjusted targets (post foul-out / injury redistribution)
           // and fall back to the plan's original targets so the grid display
           // matches what the game screen shows the coach.
@@ -5989,13 +6503,13 @@ function App() {
           // Compute per-player totals
           const playerTotals = players.map((p, pIdx) => {
             let total = 0;
-            for (let m = 0; m < totalMins; m++) { if (grid[m] && grid[m][pIdx]) total++; }
+            for (let m = 0; m < gridRows; m++) { if (grid[m] && grid[m][pIdx]) total++; }
             return total;
           });
 
           // Compute per-row court count
           const rowCounts = [];
-          for (let m = 0; m < totalMins; m++) {
+          for (let m = 0; m < gridRows; m++) {
             rowCounts[m] = grid[m] ? grid[m].filter(Boolean).length : 0;
           }
 
@@ -6111,18 +6625,18 @@ function App() {
                     </tr>
                   </thead>
                   <tbody>
-                    {Array.from({ length: totalMins }, (_, m) => {
-                      // Halftime row
-                      const htRow = m === halfMins ? (
+                    {Array.from({ length: gridRows }, (_, m) => {
+                      // Halftime row (the GRID's halfway point — see gridLengthMismatch)
+                      const htRow = m === gridHalfRows ? (
                         <tr key="ht" style={{ height: 6 }}>
-                          <td style={{ background: "transparent", color: "#fbbf24", fontSize: "0.6rem", fontWeight: 700, textAlign: "right", paddingRight: 4, cursor: "default", border: "none" }}>HT</td>
+                          <td style={{ position: "sticky", left: 0, zIndex: 2, background: "#0f172a", color: "#fbbf24", fontSize: "0.6rem", fontWeight: 700, textAlign: "right", paddingRight: 4, cursor: "default", border: "none" }}>HT</td>
                           {players.map(p => <td key={p.jersey} style={{ background: "#fbbf24", border: "none", cursor: "default" }}></td>)}
                           <td style={{ background: "#fbbf24", border: "none", cursor: "default" }}></td>
                         </tr>
                       ) : null;
 
-                      const displayMin = m < halfMins ? m + 1 : m - halfMins + 1;
-                      const halfLabel = m < halfMins ? "H1" : "H2";
+                      const displayMin = m < gridHalfRows ? m + 1 : m - gridHalfRows + 1;
+                      const halfLabel = m < gridHalfRows ? "H1" : "H2";
                       const rowCount = rowCounts[m];
                       const hasTimeout = plannedTimeouts.has(m);
 
@@ -6137,7 +6651,10 @@ function App() {
                               });
                             }}
                             style={{ cursor: "pointer", fontSize: "0.7rem", color: hasTimeout ? "#f59e0b" : "#64748b", border: "none", textAlign: "right", paddingRight: 8, width: 40, minWidth: 40,
-                              background: hasTimeout ? "#78350f" : "transparent", borderRadius: hasTimeout ? 3 : 0, fontWeight: hasTimeout ? 700 : 400 }}>
+                              // M-084: the minute labels stay pinned while the 10-girl
+                              // grid scrolls sideways (D-9 usability).
+                              position: "sticky", left: 0, zIndex: 2,
+                              background: hasTimeout ? "#78350f" : "#0f172a", borderRadius: hasTimeout ? 3 : 0, fontWeight: hasTimeout ? 700 : 400 }}>
                             {hasTimeout ? "⏱ " : ""}{halfLabel} {displayMin}
                           </td>
                           {players.map((p, pIdx) => {
@@ -6165,7 +6682,7 @@ function App() {
 
                     {/* TOTALS row */}
                     <tr>
-                      <td style={{ cursor: "default", fontSize: "0.75rem", fontWeight: 700, color: "#e2e8f0", border: "none", textAlign: "right", paddingRight: 8 }}>
+                      <td style={{ cursor: "default", fontSize: "0.75rem", fontWeight: 700, color: "#e2e8f0", border: "none", textAlign: "right", paddingRight: 8, position: "sticky", left: 0, zIndex: 2, background: "#0f172a" }}>
                         TOTAL
                       </td>
                       {players.map((p, pIdx) => {
@@ -6181,7 +6698,7 @@ function App() {
                         );
                       })}
                       <td style={{ cursor: "default", fontSize: "0.65rem", fontWeight: 700, border: "1px solid #334155", background: "#1e293b", textAlign: "center",
-                        color: totalCourtMins === 5 * totalMins ? "#4ade80" : "#fbbf24" }}>
+                        color: totalCourtMins === 5 * gridRows ? "#4ade80" : "#fbbf24" }}>
                         {totalCourtMins}
                       </td>
                     </tr>
@@ -6298,6 +6815,14 @@ function App() {
               <button onClick={handleStartSecondHalf}
                 style={{ background: "linear-gradient(135deg,#1d4ed8,#7c3aed)", border: "none", color: "#fff", borderRadius: 14, padding: "14px 32px", fontSize: 16, fontWeight: 700, cursor: "pointer", width: "100%" }}>
                 Start 2nd Half ▶
+              </button>
+              {/* M-033 (backlog pull-in): an escape from an ACCIDENTAL halftime —
+                  a stray +10s tap near the end of H1 used to trap the coach here
+                  with only the destructive "Start 2nd Half". This backs the clock
+                  out of the halftime boundary and reopens H1. */}
+              <button onClick={() => { setShowHalftime(false); adjustClock(-10); }}
+                style={{ background: "transparent", border: "1px solid #475569", color: "#94a3b8", borderRadius: 12, padding: "10px", fontSize: 13, fontWeight: 600, cursor: "pointer", width: "100%", marginTop: 8 }}>
+                ↩ Not yet — back to the 1st half
               </button>
             </div>
           </div>
@@ -6423,7 +6948,7 @@ function App() {
             <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 6 }}>
               {/* Us score */}
               <div style={{ flex: 1, textAlign: "center" }}>
-                <div style={{ color: "#4ade80", fontSize: 10, fontWeight: 700, letterSpacing: 1 }}>ROADIES</div>
+                <div style={{ color: "#4ade80", fontSize: 10, fontWeight: 700, letterSpacing: 1, textTransform: "uppercase", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{gameIdentityRef.current.teamNameAtGameTime || "Our Team"}</div>
                 <div style={{ color: "#fff", fontSize: 28, fontWeight: 800, lineHeight: 1.1 }}>{scoreUs}</div>
                 <div style={{ display: "flex", gap: 4, justifyContent: "center", marginTop: 4 }}>
                   <button onClick={() => addScore("us", 1)} style={{ padding: "4px 8px", borderRadius: 6, border: "none", background: "#166534", color: "#4ade80", fontSize: 11, fontWeight: 700, cursor: "pointer" }}>+1</button>
@@ -7182,9 +7707,10 @@ function App() {
 
           function buildClipboard() {
             const lines = [];
+            const teamLabel = gameIdentityRef.current.teamNameAtGameTime || "Our Team";
             lines.push("=== GAME SUMMARY ===");
-            if (scoreUs > 0 || scoreOpponent > 0) lines.push(`Score: Roadies ${scoreUs} – ${scoreOpponent} Opponent`);
-            if (timeoutsUs > 0 || timeoutsOpponent > 0) lines.push(`Timeouts: Roadies ${timeoutsUs}, Opponent ${timeoutsOpponent}`);
+            if (scoreUs > 0 || scoreOpponent > 0) lines.push(`Score: ${teamLabel} ${scoreUs} – ${scoreOpponent} Opponent`);
+            if (timeoutsUs > 0 || timeoutsOpponent > 0) lines.push(`Timeouts: ${teamLabel} ${timeoutsUs}, Opponent ${timeoutsOpponent}`);
             lines.push("");
             lines.push(`Targets: planned/adjusted rotation targets (${rosterSize} players)`);
             lines.push("");
@@ -7237,12 +7763,12 @@ function App() {
                 <div style={{ color: "#fbbf24", fontSize: 20, fontWeight: 800, marginBottom: 4 }}>🏆 Full Time!</div>
                 {(scoreUs > 0 || scoreOpponent > 0) && (
                   <div style={{ color: "#93c5fd", fontSize: 16, fontWeight: 700 }}>
-                    Roadies {scoreUs} – {scoreOpponent} Opponent
+                    {gameIdentityRef.current.teamNameAtGameTime || "Our Team"} {scoreUs} – {scoreOpponent} Opponent
                   </div>
                 )}
                 {(timeoutsUs > 0 || timeoutsOpponent > 0) && (
                   <div style={{ color: "#94a3b8", fontSize: 12, marginTop: 2 }}>
-                    Timeouts: Roadies {timeoutsUs} · Opponent {timeoutsOpponent}
+                    Timeouts: {gameIdentityRef.current.teamNameAtGameTime || "Our Team"} {timeoutsUs} · Opponent {timeoutsOpponent}
                   </div>
                 )}
               </div>
@@ -7336,7 +7862,7 @@ function App() {
                   📋 Copy Summary
                 </button>
                 <button onClick={discardSavedGame} style={{ flex: 1, padding: "12px", borderRadius: 12, border: "none", background: "#1d4ed8", color: "#fff", fontSize: 14, fontWeight: 700, cursor: "pointer" }}>
-                  New Game
+                  Finish &amp; New Game
                 </button>
               </div>
             </div>

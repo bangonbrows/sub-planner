@@ -62,9 +62,9 @@ const CASES = [
     mustFail: "S-105",
   },
   {
-    id: "MUT-105", mutates: "team selection reads the hardcoded seed, not the stored team (ignores edits)",
-    find: "    // Fresh read at the SELECTION event: the picker list or landing state could\n    // be stale against another tab's Manage Teams edits.\n    const env = readTeamsEnvelopeFresh();",
-    replace: "    const env = buildSeedEnvelope();",
+    id: "MUT-105", mutates: "team selection's roster copy reads the hardcoded seed, not the stored team (ignores edits)",
+    find: "    const roster = team.players\n      .filter((p) => !p.deletedAt && !p.needsJersey && p.jersey !== null)",
+    replace: "    const roster = buildSeedEnvelope().teams[0].players\n      .filter((p) => !p.deletedAt && !p.needsJersey && p.jersey !== null)",
     mustFail: "S-102",
   },
   {
@@ -86,13 +86,14 @@ const CASES = [
     mustFail: "S-111",
   },
   {
-    // NOTE: removing the STAGE-1 order check alone is an equivalent mutant — the
-    // post-sanitization layer still quarantines the same states (defence in depth,
-    // verified 19 Jul). This case therefore targets the sanitized-check layer,
-    // whose removal IS observable (S-117).
-    id: "MUT-109", mutates: "post-sanitization order/grid mismatch check removed",
-    find: "          if (sanOrder.length !== s.gridPlayerOrderJerseys.length || sanOrder.length !== gridCols) { fail(\"plan player order does not match its grid\"); break restoreattempt; }",
-    replace: "          if (false) { fail(\"plan player order does not match its grid\"); break restoreattempt; }",
+    // NOTE: the milestone fix added a grid-SHAPE check (M-010) that now ALSO
+    // catches S-117's ragged-order-vs-grid state, so removing the older
+    // post-sanitization order check alone is an equivalent mutant (defence in
+    // depth). This case targets the grid-shape check, which uniquely fires for
+    // S-117's scenario (a 2-entry order against a wider grid).
+    id: "MUT-109", mutates: "grid-shape validation removed (ragged/wrong-width grid hydrates)",
+    find: "            if (s.editableGrid.length !== s.gameConfig.halfMins * 2 ||\n                !s.editableGrid.every(row => Array.isArray(row) && row.length === width && row.every(c => typeof c === \"boolean\"))) { fail(\"plan grid malformed\"); break restoreattempt; }",
+    replace: "            if (false) { fail(\"plan grid malformed\"); break restoreattempt; }",
     mustFail: "S-117",
   },
   {
@@ -175,8 +176,8 @@ const CASES = [
   },
   {
     id: "MUT-123", mutates: "roster playerId requirement removed from v2 validation",
-    find: "            !s.gameRosterSnapshot.every(p => p && typeof p.jersey === \"number\" && typeof p.name === \"string\" && typeof p.playerId === \"string\" && p.playerId)) { fail(\"roster copy malformed\"); break restoreattempt; }",
-    replace: "            !s.gameRosterSnapshot.every(p => p && typeof p.jersey === \"number\" && typeof p.name === \"string\")) { fail(\"roster copy malformed\"); break restoreattempt; }",
+    find: "          typeof p.playerId === \"string\" && p.playerId &&\n          finiteNum(p.rating) && p.rating >= 1 && p.rating <= 5 &&",
+    replace: "          finiteNum(p.rating) && p.rating >= 1 && p.rating <= 5 &&",
     mustFail: "S-126",
   },
   // ── Wave 2 cases (one planted bug per new behaviour — spec §4 Wave 2) ──
@@ -271,7 +272,7 @@ const CASES = [
   },
   {
     id: "MUT-215", mutates: "availability toggles stop marking the plan stale",
-    find: "    if (!(screen === \"game\" || (gameSecs > 0 && !gameOver)) && (rotationPlan || editableGrid)) setPlanStale(true);",
+    find: "    // §4 W2 plan staleness: an availability toggle changes the participating\n    // count — a pre-game plan built on the old count is stale (round-5 widening).\n    if (!(screen === \"game\" || (gameSecs > 0 && !gameOver)) && (rotationPlan || editableGrid)) setPlanStale(true);",
     replace: "    ;",
     mustFail: "S-215",
   },
@@ -289,13 +290,13 @@ const CASES = [
   },
   {
     id: "MUT-218", mutates: "empty state lost — New Game offered with zero active teams",
-    find: "          {activeTeams.length > 0 ? (",
-    replace: "          {true ? (",
+    find: "          ) : activeTeams.length > 0 ? (",
+    replace: "          ) : true ? (",
     mustFail: "S-218",
   },
   {
     id: "MUT-219", mutates: "New Game silently discards the saved game (no save/discard prompt)",
-    find: "    if (gameInFlight || blockedSave) { setNewGamePrompt(true); return; }",
+    find: "    if (gameInFlight || blockedSave || gameSnapshotExists()) { setNewGamePrompt(true); return; }",
     replace: "    if (false) { setNewGamePrompt(true); return; }",
     mustFail: "S-219",
   },
@@ -329,6 +330,85 @@ const CASES = [
     find: "        else setGameStarted(Array.isArray(s.onCourt) && s.onCourt.length > 0);",
     replace: "        else setGameStarted(false);",
     mustFail: "S-223",
+  },
+  // ── Milestone audit fix cases (MUT-225+) ──
+  {
+    id: "MUT-225", mutates: "M-006: merge writer nulls a corrupt stored value and overwrites it (no quarantine)",
+    find: "    if (raw !== null && (parseFailed || (stored && !validTeamsEnvelope(stored)))) {\n      // Mid-session corruption: preserve-then-recover, never null-and-overwrite.\n      const healed = quarantineAndHeal(TEAMS_KEY, raw, JSON.stringify(canonicalizeEnvelope(buildSeedEnvelope())), \"Saved team data was damaged.\");\n      if (healed !== \"healed\") return false; // key blocked; §5.1 banner is up\n      try { stored = JSON.parse(safeGet(TEAMS_KEY)); } catch (e) { return false; }\n    }",
+    replace: "    if (stored && !validTeamsEnvelope(stored)) stored = null;",
+    mustFail: "S-224",
+  },
+  {
+    id: "MUT-226", mutates: "M-037: repair envelope validator accepts any schemaVersion (future journal replays)",
+    find: "  return env && typeof env === \"object\" && env.schemaVersion === 1 &&\n    Array.isArray(env.ops) && env.ops.every(validRepairOp);",
+    replace: "  return env && typeof env === \"object\" && typeof env.schemaVersion === \"number\" &&\n    Array.isArray(env.ops) && env.ops.every(validRepairOp);",
+    mustFail: "S-225",
+  },
+  {
+    id: "MUT-227", mutates: "M-046: repair op payload not whitelisted (tombstone-via-edit smuggling)",
+    find: "  const allowed = OP_PAYLOAD_FIELDS[o.type];\n  return Object.keys(o.payload).every((k) => allowed.includes(k));",
+    replace: "  return true;",
+    mustFail: "S-226",
+  },
+  {
+    id: "MUT-228", mutates: "M-039: teams read state stops refusing future-version envelopes",
+    find: "      if (parsed && ((typeof parsed.schemaVersion === \"number\" && parsed.schemaVersion > 1) ||\n          (Array.isArray(parsed.teams) && parsed.teams.some((t) => t && typeof t.schemaVersion === \"number\" && t.schemaVersion > 1)))) {\n        return { state: \"future\", teams: [] };\n      }",
+    replace: "      if (false) { return { state: \"future\", teams: [] }; }",
+    mustFail: "S-227",
+  },
+  {
+    id: "MUT-229", mutates: "M-076: teams read state has no in-memory fallback (blocked key locks out games)",
+    find: "    return { state: \"fallback\", teams: [getActiveTeam()] };",
+    replace: "    return { state: \"empty\", teams: [] };",
+    mustFail: "S-228",
+  },
+  {
+    id: "MUT-230", mutates: "M-060: live hydration accepts duplicate/NaN/non-participant accounting state",
+    find: "          if (new Set(sanOnCourt).size !== sanOnCourt.length) { fail(\"duplicate players on court\"); break restoreattempt; }",
+    replace: "          if (false) { fail(\"duplicate players on court\"); break restoreattempt; }",
+    mustFail: "S-229",
+  },
+  {
+    id: "MUT-231", mutates: "M-011: rotationPlan content validation removed (malformed plan hydrates)",
+    find: "          if (!rpOk) { fail(\"rotation plan malformed\"); break restoreattempt; }",
+    replace: "          if (false) { fail(\"rotation plan malformed\"); break restoreattempt; }",
+    mustFail: "S-230",
+  },
+  {
+    id: "MUT-232", mutates: "M-053: New Game skips the fresh snapshot-existence re-read",
+    find: "    if (gameInFlight || blockedSave || gameSnapshotExists()) { setNewGamePrompt(true); return; }",
+    replace: "    if (gameInFlight || blockedSave) { setNewGamePrompt(true); return; }",
+    mustFail: "S-231",
+  },
+  {
+    id: "MUT-233", mutates: "M-012: half-length change no longer marks an existing plan stale",
+    find: "    if (rotationPlan || editableGrid) setPlanStale(true);\n    setPlannedTimeouts((prev) => new Set([...prev].filter((m) => m < next * 2)));",
+    replace: "    if (false) setPlanStale(true);\n    setPlannedTimeouts((prev) => new Set([...prev].filter((m) => m < next * 2)));",
+    mustFail: "S-232",
+  },
+  {
+    id: "MUT-234", mutates: "M-041: added player gets no grid column (kept plan leaves her unschedulable)",
+    find: "      const inOrder = new Set(nextOrder.map((p) => p.playerId));\n      for (const np of newRoster) {\n        if (!inOrder.has(np.playerId)) {\n          nextOrder = [...nextOrder, np];\n          if (nextGrid) nextGrid = nextGrid.map((row) => [...row, false]);\n        }\n      }",
+    replace: "      ;",
+    mustFail: "S-233",
+  },
+  {
+    id: "MUT-235", mutates: "M-049: score panel reverts to hardcoded ROADIES",
+    find: "                <div style={{ color: \"#4ade80\", fontSize: 10, fontWeight: 700, letterSpacing: 1, textTransform: \"uppercase\", overflow: \"hidden\", textOverflow: \"ellipsis\", whiteSpace: \"nowrap\" }}>{gameIdentityRef.current.teamNameAtGameTime || \"Our Team\"}</div>",
+    replace: "                <div style={{ color: \"#4ade80\", fontSize: 10, fontWeight: 700, letterSpacing: 1 }}>ROADIES</div>",
+    mustFail: "S-234",
+  },
+  {
+    id: "MUT-236", mutates: "M-086: rewind correction reverts to snap-without-accumulated (phantom minutes)",
+    find: "  function applyRewindCourtTime(prevSecs, clamped) {\n    if (clamped >= prevSecs || onCourt.length === 0) return;",
+    replace: "  function applyRewindCourtTime(prevSecs, clamped) {\n    if (true || clamped >= prevSecs || onCourt.length === 0) return;",
+    mustFail: "S-235",
+  },
+  {
+    id: "MUT-237", mutates: "M-013: export stops filtering out damaged entries (un-restorable backup)",
+    find: "      return validTemplateEntry(t);\n    });\n    const skipped = allEntries.length - exportable.length;",
+    replace: "      return true;\n    });\n    const skipped = allEntries.length - exportable.length;",
+    mustFail: "S-236",
   },
 ];
 
